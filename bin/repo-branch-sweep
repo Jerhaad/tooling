@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Report branches and worktrees whose work is already on the trunk.
+#
+# `git branch --merged` answers the wrong question here: a rebase- or
+# squash-merge rewrites the commits, so a branch whose work is fully landed
+# shares no commit with the trunk and reports as unmerged forever. Subjects
+# survive that rewrite, so subjects are what this matches on.
+#
+# Reports by default. --prune deletes only what it could prove: local branch,
+# its worktree, and the remote branch behind it.
+set -euo pipefail
+
+REPO=${1:-$PWD}
+PRUNE=0
+[[ "${2:-}" == "--prune" || "${1:-}" == "--prune" ]] && PRUNE=1
+[[ "${1:-}" == "--prune" ]] && REPO=$PWD
+
+cd "$REPO"
+git fetch --prune --quiet origin
+
+TRUNK=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || echo origin/main)
+SUBJECTS=$(mktemp)
+git log --format=%s "$TRUNK" -500 >"$SUBJECTS"
+trap 'rm -f "$SUBJECTS"' EXIT
+
+landed=() unlanded=()
+while read -r branch; do
+	[[ -z "$branch" ]] && continue
+	[[ "$branch" == "$(basename "$TRUNK")" ]] && continue
+
+	# Commits the branch has that the trunk does not, by SHA. A branch whose
+	# every subject is already on the trunk has landed, however it was merged.
+	mapfile -t subjects < <(git log --format=%s "$TRUNK..$branch" 2>/dev/null)
+	if [[ ${#subjects[@]} -eq 0 ]]; then
+		landed+=("$branch (no commits of its own)")
+		continue
+	fi
+
+	missing=0
+	for subject in "${subjects[@]}"; do
+		grep -qxF "$subject" "$SUBJECTS" || missing=$((missing + 1))
+	done
+	if [[ "$missing" -eq 0 ]]; then
+		landed+=("$branch (${#subjects[@]} commit(s), all on $TRUNK by subject)")
+	else
+		unlanded+=("$branch (${#subjects[@]} commit(s), $missing not on $TRUNK)")
+	fi
+done < <(git for-each-ref --format='%(refname:short)' refs/heads/)
+
+echo "== landed, safe to delete =="
+printf '%s\n' "${landed[@]:-(none)}"
+echo
+echo "== still carrying work =="
+printf '%s\n' "${unlanded[@]:-(none)}"
+
+# A worktree whose branch is gone leaves an administrative file behind, which is
+# what makes `git worktree add` refuse a path that looks free.
+echo
+echo "== worktrees =="
+git worktree list
+
+if [[ "$PRUNE" -eq 1 && ${#landed[@]} -gt 0 ]]; then
+	echo
+	for entry in "${landed[@]}"; do
+		branch=${entry%% *}
+		wt=$(git worktree list --porcelain | awk -v b="refs/heads/$branch" '
+			/^worktree /{path=$2} /^branch /{if ($2==b) print path}')
+		[[ -n "$wt" ]] && git worktree remove --force "$wt"
+		git branch -D "$branch"
+		git push --quiet origin --delete "$branch" 2>/dev/null && echo "deleted origin/$branch" || true
+	done
+	git worktree prune
+fi

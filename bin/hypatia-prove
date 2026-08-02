@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Prove a branch's new tests actually test its change.
+#
+# Reverts the source and keeps the tests, then runs them and requires a
+# failure. A test that passes without the fix is not a test, and it is the
+# failure mode that survives every other gate: the compiler is happy, the suite
+# is green, and the assertion encodes the bug.
+#
+# Seen twice in one night. A pagination fix capped offsets at 500 and shipped
+# two tests asserting exactly that. A readiness fix pointed its "healthy" pool
+# at the same dead address as the broken one, so it passed against the
+# unmodified handler.
+#
+# Inline `#[cfg(test)]` tests cannot be checked this way: they live in the file
+# being reverted, so reverting takes the test with it. Those are reported as
+# unprovable rather than silently passed.
+set -euo pipefail
+
+BASE=${HYPATIA_PROVE_BASE:-origin/main}
+
+usage() { echo "usage: hypatia-prove <worktree> [-- cargo test args]" >&2; exit 2; }
+[ $# -ge 1 ] || usage
+SRC=$(cd "$1" && git rev-parse --show-toplevel)
+shift
+[ "${1:-}" = "--" ] && shift
+
+cd "$SRC"
+git rev-parse --verify --quiet "$BASE" >/dev/null || { echo "no such ref: $BASE" >&2; exit 2; }
+
+# This reverts tracked files and restores them from HEAD, so anything not
+# committed is destroyed rather than restored -- and the restore runs from a
+# trap, where there is nothing left to report it. Refusing a dirty tree is the
+# only honest option: "revert the change" has no meaning against work that is
+# not yet a commit.
+if ! git diff --quiet HEAD; then
+	echo "refusing to run against a dirty tree: commit first, or the revert will discard uncommitted work" >&2
+	git status --short >&2
+	exit 2
+fi
+
+mapfile -t CHANGED < <(git diff --name-only "$BASE"...HEAD)
+[ ${#CHANGED[@]} -gt 0 ] || { echo "no changes against $BASE" >&2; exit 2; }
+
+TESTS=() SOURCES=() INLINE=()
+for f in "${CHANGED[@]}"; do
+	case "$f" in
+	*/tests/*.rs | tests/*.rs) TESTS+=("$f") ;;
+	*.rs)
+		SOURCES+=("$f")
+		# A reverted file takes its own tests with it, so a change that adds
+		# both a fix and an inline test cannot be split.
+		git show "HEAD:$f" 2>/dev/null | grep -q '#\[cfg(test)\]' && INLINE+=("$f")
+		;;
+	esac
+done
+
+if [ ${#TESTS[@]} -eq 0 ]; then
+	echo "FAIL: no test file changed against $BASE" >&2
+	[ ${#INLINE[@]} -gt 0 ] && printf '  inline tests only, cannot be proven: %s\n' "${INLINE[@]}" >&2
+	exit 1
+fi
+if [ ${#SOURCES[@]} -eq 0 ]; then
+	echo "FAIL: tests changed but no source did; nothing to revert" >&2
+	exit 1
+fi
+
+# Restored on every exit path, including the failure that is the expected
+# outcome: leaving a half-reverted tree behind would be worse than any answer
+# this gives.
+# From HEAD, not from the index: `git checkout $BASE -- <paths>` stages the base
+# version as well as writing it, so restoring from the index would restore the
+# reverted copy and leave the branch looking like the fix was never made.
+restore() { git checkout --quiet HEAD -- "${SOURCES[@]}" 2>/dev/null || true; }
+trap restore EXIT
+
+printf '==> reverting %d source file(s), keeping %d test file(s)\n' "${#SOURCES[@]}" "${#TESTS[@]}"
+# New files (not present at BASE) cannot be checked out — remove them instead.
+for f in "${SOURCES[@]}"; do
+    if git show "$BASE:$f" >/dev/null 2>&1; then
+        git checkout --quiet "$BASE" -- "$f"
+    else
+        rm -f "$f"
+        git rm --quiet --cached "$f" 2>/dev/null || true
+    fi
+done
+
+# A revert that changed nothing means the sources already match the base --
+# almost always because the branch has since been merged. Running the suite here
+# would pass and be reported as "your tests do not test the change", which is
+# both wrong and the most discouraging thing this could say.
+if git diff --quiet HEAD -- "${SOURCES[@]}"; then
+	echo "SKIP: source already matches $BASE; nothing to revert." >&2
+	echo "      The branch is probably merged. Re-run against an earlier base," >&2
+	echo "      e.g. HYPATIA_PROVE_BASE=HEAD~1." >&2
+	exit 2
+fi
+
+set +e
+if [ $# -gt 0 ]; then
+	"$@"
+else
+	hypatia-bench "$SRC"
+fi
+rc=$?
+set -e
+
+if [ $rc -eq 0 ]; then
+	echo
+	echo "FAIL: the suite passes with the change reverted." >&2
+	echo "      The new tests do not distinguish the fix from the bug." >&2
+	exit 1
+fi
+
+echo
+echo "==> proven: the suite fails without the change (exit $rc)"
+[ ${#INLINE[@]} -gt 0 ] && printf '    note: inline tests in %s were reverted too and are not covered\n' "${INLINE[@]}"
+exit 0

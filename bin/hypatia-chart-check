@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Run the repository's own chart check, on the box that has helm.
+#
+# It runs scripts/helm-chart-check.sh rather than a local copy of what that
+# script does. A local copy passes while CI fails: hypatia-compose-check kept
+# its own spelling of a compose command and reported the path healthy while the
+# workflow was broken on a misplaced flag.
+#
+# This host has no helm; the k3s box does, and has no docker or rsync, so the
+# transport is tar over ssh.
+set -euo pipefail
+
+# Host addresses belong to whoever runs this, not to the scripts. Set them in
+# ~/.config/hermes-tools/env (see hosts.env.example); sourced here rather than
+# left to the shell profile so cron jobs and agent subprocesses get them too.
+ENV_FILE=${HERMES_TOOLS_ENV:-$HOME/.config/hermes-tools/env}
+# An if, not `[ -r ] &&`: under `set -e` the && chain returns 1 when the file is
+# absent and takes the whole script with it.
+if [ -r "$ENV_FILE" ]; then
+	# shellcheck source=/dev/null
+	. "$ENV_FILE"
+fi
+
+REMOTE=${KUBEADM_SSH:?set KUBEADM_SSH to an ssh target for the cluster host: helm and terraform live there}
+CHART=${HYPATIA_CHART_PATH:-deploy/charts/hypatia}
+SCRIPT=scripts/helm-chart-check.sh
+
+SRC=$(cd "${1:-$PWD}" && git rev-parse --show-toplevel)
+NAME=$(basename "$SRC" | tr -c 'A-Za-z0-9_' '_' | tr -s '_' | sed 's/_$//')
+DEST="chartcheck/$NAME"
+
+[ -d "$SRC/$CHART" ] || { echo "no chart at $SRC/$CHART" >&2; exit 1; }
+[ -f "$SRC/$SCRIPT" ] || { echo "no $SCRIPT in $SRC" >&2; exit 1; }
+
+ssh "$REMOTE" "rm -rf $DEST && mkdir -p $DEST"
+tar -C "$SRC" -cf - "$CHART" "$SCRIPT" | ssh "$REMOTE" "tar -C $DEST -xf -"
+ssh "$REMOTE" "cd $DEST && bash $SCRIPT"

@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# Run Hypatia's pre-merge Rust gates on ai-serv, which has the toolchain and a
+# postgres this host does not.
+#
+# The gate list mirrors .github/workflows/ci.yaml's rust-tests job, so a green
+# run here predicts a green run on the pull request. Each source tree gets its
+# own remote directory (target/ survives between runs) and its own database.
+set -euo pipefail
+
+# Host addresses belong to whoever runs this, not to the scripts. Set them in
+# ~/.config/hermes-tools/env (see hosts.env.example); sourced here rather than
+# left to the shell profile so cron jobs and agent subprocesses get them too.
+ENV_FILE=${HERMES_TOOLS_ENV:-$HOME/.config/hermes-tools/env}
+# An if, not `[ -r ] &&`: under `set -e` the && chain returns 1 when the file is
+# absent and takes the whole script with it.
+if [ -r "$ENV_FILE" ]; then
+	# shellcheck source=/dev/null
+	. "$ENV_FILE"
+fi
+
+REMOTE=${AI_SERV_SSH:?set AI_SERV_SSH to an ssh target for the build host: a Rust toolchain, docker and postgres}
+PG_CONTAINER=${HYPATIA_BENCH_PG:-hypatia-ci-pg}
+PG_PORT=${HYPATIA_BENCH_PG_PORT:-55432}
+
+# --full adds the two gates that cargo cannot see and that have each cost a red
+# run: the image build, which copies a different subset of the tree than the
+# workspace does, and the SQL linter, which has no home on either host.
+FULL=0
+ARGS=()
+for arg in "$@"; do
+	case "$arg" in
+	--full) FULL=1 ;;
+	*) ARGS+=("$arg") ;;
+	esac
+done
+set -- "${ARGS[@]+"${ARGS[@]}"}"
+
+SRC=$(cd "${1:-$PWD}" && git rev-parse --show-toplevel)
+NAME=$(basename "$SRC" | tr -c 'A-Za-z0-9_' '_' | tr -s '_' | sed 's/_$//')
+DEST="bench/$NAME"
+DB="hypatia_$NAME"
+
+echo "==> syncing $SRC to $REMOTE:$DEST"
+ssh "$REMOTE" "mkdir -p $DEST"
+rsync -a --delete --exclude 'target/' --exclude '.git/' --exclude 'node_modules/' \
+	"$SRC/" "$REMOTE:$DEST/"
+
+echo "==> resetting database $DB"
+ssh "$REMOTE" "docker exec -i $PG_CONTAINER psql -U hypatia_ci -d postgres -v ON_ERROR_STOP=1 \
+	-c 'DROP DATABASE IF EXISTS $DB WITH (FORCE)' -c 'CREATE DATABASE $DB'"
+
+ssh "$REMOTE" "bash -euo pipefail -s" <<EOF
+cd $DEST
+export DATABASE_URL="postgres://hypatia_ci@localhost:$PG_PORT/$DB"
+export HYPATIA_REPORT_URL="\$DATABASE_URL"
+# One cache for every branch: a per-tree target/ costs 4.5G apiece and rebuilds
+# the same dependency graph.
+export CARGO_TARGET_DIR="\$HOME/bench/.target"
+
+# Every tree here is the same five packages at a different commit, and cargo
+# reuses their artifacts across trees rather than keying them per source path:
+# a bench run once compiled one branch's `db` against another branch's
+# `hypatia-core` and reported errors belonging to both. Dropping the
+# first-party fingerprints costs one rebuild of our own crates -- which the
+# tree under test was going to do anyway -- and leaves the expensive
+# third-party graph cached.
+for p in hypatia-core db api-rest junit-ingest hypatia-migrate hypatia-reporter; do
+	rm -rf "\$CARGO_TARGET_DIR"/debug/.fingerprint/\$p-*
+done
+
+echo "==> cargo check (SQLX_OFFLINE: validates the committed .sqlx cache)"
+SQLX_OFFLINE=true cargo check --workspace --all-targets
+
+echo "==> migrations"
+# sqlx::migrate! embeds the directory at compile time and nothing here declares
+# it a build input, so a warm target/ from an earlier branch replays that
+# branch's migrations. CI never sees this; a bench that reuses target/ does.
+touch crates/hypatia-migrate/src/main.rs
+cargo run -q -p hypatia-migrate
+
+# ci.yaml's Schema & Seeds job asserts an exact table count, so any migration
+# that adds or drops a table fails a job no amount of cargo output predicts.
+echo "==> table count matches ci.yaml"
+EXPECTED=\$(grep -oP "\) = \K[0-9]+(?=, 'table count mismatch')" .github/workflows/ci.yaml)
+ACTUAL=\$(docker exec $PG_CONTAINER psql -U hypatia_ci -d $DB -tAc \
+	"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' \
+	 AND table_type = 'BASE TABLE' AND table_name <> '_sqlx_migrations'")
+if [ "\$EXPECTED" != "\$ACTUAL" ]; then
+	echo "ci.yaml expects \$EXPECTED tables, the schema has \$ACTUAL" >&2
+	exit 1
+fi
+
+echo "==> register integration test cases"
+docker exec -i $PG_CONTAINER psql -U hypatia_ci -d $DB -v ON_ERROR_STOP=1 \
+	< examples/hypatia/ci-integration-tests.sql > /dev/null
+
+echo "==> cargo test"
+cargo test -p hypatia-core --lib
+cargo test -p db
+cargo test -p junit-ingest
+cargo test -p api-rest --lib
+cargo test -p api-rest --test integration
+EOF
+
+# cargo resolves a new dependency into the lock file where it builds, which is
+# not where the commit is made.
+rsync -a "$REMOTE:$DEST/Cargo.lock" "$SRC/Cargo.lock"
+
+if [[ "$FULL" -eq 1 ]]; then
+	echo "==> sqlfluff"
+	ssh "$REMOTE" "cd $DEST && docker run --rm -v \"\$PWD\":/sql -w /sql python:3.12-slim \
+		sh -c 'pip install -q sqlfluff >/dev/null 2>&1 && sqlfluff lint migrations/'" | tee /dev/stderr |
+		grep -q '^All Finished' || { echo "sqlfluff reported violations" >&2; exit 1; }
+
+	# The release image copies crates/, migrations/ and .sqlx -- not examples/,
+	# not the workspace root's extras. A build script or include! that reads
+	# outside that set passes every cargo gate and fails here.
+	echo "==> image build (Dockerfile.api)"
+	ssh "$REMOTE" "cd $DEST && docker build -q -f docker/Dockerfile.api -t hypatia-api-bench:$NAME . >/dev/null"
+fi
+
+echo "==> PASS ($NAME)"

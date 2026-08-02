@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Fail a branch that carries an agent's redaction artifact into the source.
+#
+# hermes rewrites secret-shaped text as `***` while it works, and on 2026-08-01
+# it committed that rewrite: `Authorization: Bearer <token>` became
+# `Authorization: Bearer ***` in three doc lines across two READMEs. Nothing
+# else can see it -- the file still parses, the tests still pass, and the
+# sentence still reads like prose until someone tries to follow it.
+#
+# Only added lines are checked. A `***` already on the trunk is somebody's
+# deliberate emphasis, not this.
+set -euo pipefail
+
+BASE=${HYPATIA_VERIFY_BASE:-origin/main}
+SRC=$(cd "${1:-$PWD}" && git rev-parse --show-toplevel)
+cd "$SRC"
+
+# Three consecutive asterisks. Markdown bold is two and italic-bold is three, so
+# a prose file can legitimately contain it -- but bold-italic is rare enough
+# that a hit is worth a human's eye either way.
+HITS=$(git diff "$BASE"...HEAD -- . |
+	grep -nE '^\+[^+].*\*\*\*' || true)
+
+if [ -n "$HITS" ]; then
+	echo "redaction artifact in added lines -- an agent's *** reached the source:" >&2
+	printf '%s\n' "$HITS" >&2
+	echo "If the asterisks are deliberate emphasis, say so and skip this gate." >&2
+	exit 1
+fi
+echo "==> no redaction artifacts in added lines"

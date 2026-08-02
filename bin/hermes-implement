@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# Hand a GitHub issue to the local Hermes agent's swe-updater skill.
+#
+# Hermes writes the change in a worktree this script does not create: the
+# caller decides the branch point, so a failed run is thrown away by deleting
+# the tree rather than by unwinding commits.
+set -euo pipefail
+
+HERMES=${HERMES_PYTHON:-${HERMES_HOME:-$HOME/.hermes}/hermes-agent/venv/bin/python}
+TIMEOUT=${HERMES_IMPLEMENT_TIMEOUT:-5400}
+
+usage() {
+	cat <<'EOF'
+usage: hermes-implement --issue N --worktree PATH [--repo OWNER/NAME]
+                        [--verify CMD] [--extra TEXT] [--profile NAME]
+
+--profile selects the hermes profile, which chooses both the model and the host:
+
+  (omitted)  Logan, dense 27B on dual-c -- the root default. 54.8 tok/s at
+             256K. The quality lane: correcting a bad diff costs more than the
+             extra minutes, so this is what unspecified work gets.
+  fast       Logan, 35B MoE on dual-a. 142 tok/s at 256K, for small or
+             mechanical work where latency matters more than judgement.
+  athens     Athens, 64K. Extra-small work, and the only way to run a second
+             stream: each host serves one request at a time, so two runs on one
+             host queue rather than overlap.
+
+--verify defaults to `hypatia-verify <worktree>`, which picks its gates from the
+diff rather than from whoever wrote the dispatch. TRIAL, 2026-08-01: drop the
+default back to empty if it proves worse than choosing by hand.
+
+Prints the transcript directory on stdout.
+EOF
+}
+
+# Empty means the root profile, which is the dense 27B quality lane.
+ISSUE="" WORKTREE="" REPO="" EXTRA="" VERIFY="" PROFILE=""
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--issue) ISSUE="$2"; shift 2 ;;
+	--worktree) WORKTREE="$2"; shift 2 ;;
+	--repo) REPO="$2"; shift 2 ;;
+	--verify) VERIFY="$2"; shift 2 ;;
+	--extra) EXTRA="$2"; shift 2 ;;
+	--profile) PROFILE="$2"; shift 2 ;;
+	-h | --help) usage; exit 0 ;;
+	*) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
+	esac
+done
+
+# Chosen from the diff rather than by the caller. Picking a gate by hand is how
+# a Helm template passed on Rust compiling and a misplaced --no-build reached
+# CI: both times the gate was green and had not looked at the change.
+: "${VERIFY:=hypatia-verify $WORKTREE}"
+
+# -p rather than HERMES_PROFILE: the environment variable is read too late to
+# pick the profile's model, so a run exported into it still talks to the default
+# host.
+PROFILE_ARGS=()
+[[ -n "$PROFILE" ]] && PROFILE_ARGS=(-p "$PROFILE")
+[[ -n "$ISSUE" && -n "$WORKTREE" ]] || { usage >&2; exit 2; }
+
+cd "$WORKTREE"
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+WORK=$(mktemp -d -t hermes-implement-XXXXXX)
+
+GH_ARGS=(issue view "$ISSUE")
+[[ -n "$REPO" ]] && GH_ARGS+=(--repo "$REPO")
+gh "${GH_ARGS[@]}" >"$WORK/issue.txt"
+
+PROMPT=$(
+	cat <<EOF
+Implement one issue in the repository checked out at $WORKTREE.
+
+Follow the swe-updater skill. The branch and worktree already exist: you are on
+$BRANCH, based on the remote default branch. Skip the skill's ingest phase --
+the work item is the issue below, not a REVIEW_NOTES.md file -- and do not
+create, switch, or push any branch. Commit your work on $BRANCH and stop.
+
+**Every file you touch and every git command you run belongs to $WORKTREE.**
+That directory is a git worktree of the same repository your project settings
+point at, and it is not the same checkout. Editing the other one puts your
+commit on a branch someone else is reading and leaves their checkout switched
+underneath them. If a git command needs a repository, pass git's -C option and
+this path. Do not cd elsewhere, and do not trust a remembered working directory
+over this path.
+
+The issue text is at $WORK/issue.txt. Read it in full before editing anything.
+
+Verification command (the skill's Phase 4 -- run it yourself, read its output,
+fix what it reports, and run it again until it passes):
+
+    $VERIFY
+
+$EXTRA
+
+When you are done, write $WORK/HANDOVER.md: what you changed and why, what you
+could not verify, and anything you deliberately left out.
+EOF
+)
+
+BASE=$(git rev-parse HEAD)
+ATTEMPTS=${HERMES_IMPLEMENT_ATTEMPTS:-4}
+
+# A model that answers with prose instead of a tool call ends the run, so an
+# abandoned task and a finished one both exit 0. The branch is the only
+# trustworthy completion signal: keep resuming the session until it carries a
+# commit that BASE did not.
+run() {
+	local label="$1" prompt="$2"
+	shift 2
+	set +e
+	# --no-restore-cwd: a resumed session otherwise returns to the directory it
+	# recorded, which for this agent is its bound project folder rather than the
+	# worktree it was handed. It has committed in the wrong repository that way.
+	timeout "$TIMEOUT" "$HERMES" -m hermes_cli.main ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} "$@" --no-restore-cwd -z "$prompt" --skills swe-updater --yolo \
+		>"$WORK/$label.stdout" 2>"$WORK/$label.stderr"
+	local rc=$?
+	set -e
+	echo "$label: hermes exited $rc" >&2
+	tail -3 "$WORK/$label.stdout" >&2
+}
+
+run attempt1 "$PROMPT"
+
+# Resuming asks for the whole remaining task, never just the commit: a nudge
+# that names committing as the goal gets an unverified commit, which is the one
+# outcome worse than no commit at all -- it satisfies every check the caller can
+# cheaply make.
+REMAINING="The task is not finished. Resume it with tool calls, not with a plan.
+It is done when '$VERIFY' has passed on the tree you are about to commit, that
+commit is on $BRANCH, and $WORK/HANDOVER.md exists. Run the verification even if
+you believe the code is correct: the last run of this task committed code that
+did not compile."
+
+for ((i = 2; i <= ATTEMPTS; i++)); do
+	[[ "$(git rev-parse HEAD)" != "$BASE" ]] && break
+	run "attempt$i" "$REMAINING" --continue
+done
+
+if [[ "$(git rev-parse HEAD)" == "$BASE" ]]; then
+	echo "FAILED: $ATTEMPTS attempts left $BRANCH at $BASE" >&2
+elif [[ ! -s "$WORK/HANDOVER.md" ]]; then
+	echo "WARNING: $BRANCH has a commit but no handover was written" >&2
+fi
+
+echo "$WORK"

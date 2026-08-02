@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""Grade open Hypatia issues by how much work and how much context they need.
+
+The point is routing, not estimation. Athens serves a 64K context against a
+20 GiB model on a 32 GiB box and cannot be given more, so the implement stream
+that runs there needs the small end of the queue and Logan needs the rest. Logan
+then splits again: a dense 27B for work worth the wait, a fast MoE for the rest.
+Without a grade the two streams race for whatever is top of the list and Athens
+draws issues it cannot hold.
+
+Talks to the model directly rather than through `hermes`: this is a pure
+classification with no tool use, and an agent loop per issue would spend more
+time starting up than thinking. Requests are sequential because llama-swap runs
+--parallel 1 -- concurrency here would queue on the server and gain nothing.
+
+Grades from the issue text alone, the way a human does at triage. That is a
+hint, not a gate: an issue graded small that turns out large produces a run with
+no commit, which the nightly script already reports.
+"""
+import argparse
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+# The grading model's endpoint belongs to whoever runs this. Same variable the
+# shell tools read from ~/.config/hermes-tools/env.
+ATHENS = os.environ.get("ATHENS_URL")
+MODEL = "qwen3.6-35b-a3b"
+OUT = pathlib.Path.home() / "queue" / "size"
+
+# Anchored to this repository so the grades mean the same thing run to run. An
+# unanchored "small/medium/large" drifts every time the model is asked.
+PROMPT = """Grade this GitHub issue for an implementation agent working on Hypatia, a
+Rust workspace (axum API, sqlx/Postgres, a React SPA) with a plain-SQL migrations
+directory.
+
+Answer with exactly four lines and nothing else:
+
+Size: XS|S|M|L
+Context: low|medium|high
+Files: <integer>
+Reason: <one line, under 20 words>
+
+Size is the edit itself:
+  XS  one file, or a comment/config/doc change
+  S   one migration plus threading a field through existing structs and queries
+  M   a new endpoint, a new table with its repository layer, or a multi-crate change
+  L   a new subsystem, a breaking contract change, or anything needing a design decision
+
+Context is how much of the repository must be read to do it correctly:
+  low     the issue names the files, or the change is local to one module
+  medium  a few call sites must be found first
+  high    the change depends on how several subsystems already fit together
+
+Judge only from the text below. If the issue does not say enough to place it,
+answer Size: L and Context: high, because an agent cannot safely guess either.
+
+--- issue #{number}: {title} ---
+{body}
+"""
+
+FIELDS = {
+    "Size": re.compile(r"^\s*(?:\*\*)?Size(?:\*\*)?\s*:\s*(XS|S|M|L)\b", re.I | re.M),
+    "Context": re.compile(r"^\s*(?:\*\*)?Context(?:\*\*)?\s*:\s*(low|medium|high)\b", re.I | re.M),
+    "Files": re.compile(r"^\s*(?:\*\*)?Files(?:\*\*)?\s*:\s*(\d+)", re.I | re.M),
+    "Reason": re.compile(r"^\s*(?:\*\*)?Reason(?:\*\*)?\s*:\s*(.+)$", re.I | re.M),
+}
+
+
+def route(size, context):
+    """Which hermes profile should implement an issue of this shape.
+
+    Names a `hermes-implement --profile` value; "default" means passing none,
+    which is the root profile and the dense 27B.
+
+    Three lanes, and the axes do not weigh the same. Context decides the host --
+    Athens serves 64K and cannot be given more, so anything needing to read
+    around the repository is off it whatever its size. Size then decides which
+    Logan model: the dense 27B is ~2.6x slower than the MoE and better at the
+    judgement calls that small mechanical work does not involve.
+    """
+    if size == "XS" and context == "low":
+        return "athens"
+    if size in ("XS", "S") and context in ("low", "medium"):
+        return "fast"
+    return "default"
+
+
+def issues(repo):
+    out = subprocess.run(
+        ["gh", "issue", "list", "--repo", repo, "--state", "open", "--limit", "300",
+         "--json", "number,title,body,updatedAt,labels"],
+        capture_output=True, text=True, check=True).stdout
+    return json.loads(out)
+
+
+def grade(issue, retries=2):
+    body = (issue.get("body") or "").strip()[:6000]
+    prompt = PROMPT.format(number=issue["number"], title=issue["title"], body=body)
+    payload = json.dumps({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 150,
+        "temperature": 0,
+        # Without this the model reasons before answering, and the reasoning
+        # lands in `reasoning_content` while `content` comes back empty --
+        # indistinguishable from a broken model unless you read the raw
+        # response. It also spends roughly three times the tokens to reach the
+        # same four lines. `/no_think` and `reasoning_effort` are both ignored
+        # by this llama.cpp build; only the template kwarg works.
+        "chat_template_kwargs": {"enable_thinking": False},
+    }).encode()
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(
+                ATHENS, data=payload, headers={"Content-Type": "application/json"})
+            text = json.loads(urllib.request.urlopen(req, timeout=300).read()
+                              )["choices"][0]["message"]["content"]
+        except (urllib.error.URLError, TimeoutError, KeyError) as e:
+            if attempt == retries:
+                return None, f"unreachable: {e}"
+            time.sleep(5 * (attempt + 1))
+            continue
+        parsed = {k: (m.group(1).strip() if (m := rx.search(text)) else None)
+                  for k, rx in FIELDS.items()}
+        if parsed["Size"] and parsed["Context"]:
+            parsed["Size"] = parsed["Size"].upper()
+            parsed["Context"] = parsed["Context"].lower()
+            return parsed, None
+        if attempt == retries:
+            return None, f"unparseable: {text.strip()[:120]!r}"
+    return None, "exhausted"
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--repo", default=os.environ.get("HYPATIA_REPO"),
+                    help="owner/name; defaults to $HYPATIA_REPO, else the "
+                         "current checkout's origin remote")
+    ap.add_argument("--force", action="store_true",
+                    help="re-grade issues whose grade is already current")
+    ap.add_argument("--limit", type=int, default=0, help="grade at most N issues")
+    args = ap.parse_args()
+    if not ATHENS:
+        sys.exit("set ATHENS_URL to an OpenAI-compatible chat-completions endpoint")
+    if not args.repo:
+        args.repo = subprocess.run(
+            ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
+            capture_output=True, text=True, check=True).stdout.strip()
+
+    OUT.mkdir(parents=True, exist_ok=True)
+    graded = skipped = failed = 0
+
+    for issue in issues(args.repo):
+        n = issue["number"]
+        path = OUT / f"issue-{n}.json"
+        # Re-grade only when the issue changed after it was last graded: the
+        # text is the whole input, so an unchanged issue grades the same.
+        if not args.force and path.exists():
+            try:
+                if json.loads(path.read_text()).get("updatedAt") == issue["updatedAt"]:
+                    skipped += 1
+                    continue
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        parsed, err = grade(issue)
+        if err:
+            print(f"#{n}: {err}", file=sys.stderr)
+            failed += 1
+            continue
+
+        record = {
+            "number": n,
+            "title": issue["title"],
+            "updatedAt": issue["updatedAt"],
+            "labels": [lbl["name"] for lbl in issue.get("labels", [])],
+            "size": parsed["Size"],
+            "context": parsed["Context"],
+            "files": int(parsed["Files"]) if parsed["Files"] else None,
+            "reason": parsed["Reason"],
+            "profile": route(parsed["Size"], parsed["Context"]),
+        }
+        path.write_text(json.dumps(record, indent=2) + "\n")
+        graded += 1
+        print(f"#{n}: {record['size']}/{record['context']} -> {record['profile']}  {record['reason']}")
+        if args.limit and graded >= args.limit:
+            break
+
+    # A closed issue is never iterated again, so its grade would otherwise sit
+    # here forever and keep routing work that no longer exists.
+    live = {i["number"] for i in issues(args.repo)}
+    pruned = 0
+    for stale in OUT.glob("issue-*.json"):
+        if int(stale.stem.split("-")[1]) not in live:
+            stale.unlink()
+            pruned += 1
+
+    print(f"\ngraded {graded}, unchanged {skipped}, failed {failed}, "
+          f"pruned {pruned} -> {OUT}")
+    return 1 if failed and not graded else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Regenerate the committed .sqlx offline cache on ai-serv and copy it back.
+#
+# The macros in this workspace are compile-checked against a live database, so
+# any change to their SQL invalidates the cache that CI's SQLX_OFFLINE check and
+# the docker image build both read. Neither the toolchain nor a database exists
+# on the editing host.
+set -euo pipefail
+
+# Host addresses belong to whoever runs this, not to the scripts. Set them in
+# ~/.config/hermes-tools/env (see hosts.env.example); sourced here rather than
+# left to the shell profile so cron jobs and agent subprocesses get them too.
+ENV_FILE=${HERMES_TOOLS_ENV:-$HOME/.config/hermes-tools/env}
+# An if, not `[ -r ] &&`: under `set -e` the && chain returns 1 when the file is
+# absent and takes the whole script with it.
+if [ -r "$ENV_FILE" ]; then
+	# shellcheck source=/dev/null
+	. "$ENV_FILE"
+fi
+
+REMOTE=${AI_SERV_SSH:?set AI_SERV_SSH to an ssh target for the build host: a Rust toolchain, docker and postgres}
+PG_CONTAINER=${HYPATIA_BENCH_PG:-hypatia-ci-pg}
+PG_PORT=${HYPATIA_BENCH_PG_PORT:-55432}
+
+SRC=$(cd "${1:-$PWD}" && git rev-parse --show-toplevel)
+NAME=$(basename "$SRC" | tr -c 'A-Za-z0-9_' '_' | tr -s '_' | sed 's/_$//')
+DEST="bench/$NAME"
+DB="hypatia_$NAME"
+
+ssh "$REMOTE" "mkdir -p $DEST"
+rsync -a --delete --exclude 'target/' --exclude '.git/' --exclude 'node_modules/' \
+	"$SRC/" "$REMOTE:$DEST/"
+
+ssh "$REMOTE" "docker exec -i $PG_CONTAINER psql -U hypatia_ci -d postgres -v ON_ERROR_STOP=1 \
+	-c 'DROP DATABASE IF EXISTS $DB WITH (FORCE)' -c 'CREATE DATABASE $DB'"
+
+ssh "$REMOTE" "bash -euo pipefail -s" <<EOF
+cd $DEST
+export DATABASE_URL="postgres://hypatia_ci@localhost:$PG_PORT/$DB"
+export PATH="\$HOME/.cargo/bin:\$PATH"
+export CARGO_TARGET_DIR="\$HOME/bench/.target"
+
+# Every tree here is the same five packages at a different commit, and cargo
+# reuses their artifacts across trees rather than keying them per source path:
+# a bench run once compiled one branch's `db` against another branch's
+# `hypatia-core` and reported errors belonging to both. Dropping the
+# first-party fingerprints costs one rebuild of our own crates -- which the
+# tree under test was going to do anyway -- and leaves the expensive
+# third-party graph cached.
+for p in hypatia-core db api-rest junit-ingest hypatia-migrate hypatia-reporter; do
+	rm -rf "\$CARGO_TARGET_DIR"/debug/.fingerprint/\$p-*
+done
+# sqlx-cli rather than the workspace's own migrator: a new column is exactly
+# what the macros cannot compile against yet, and hypatia-migrate cannot build
+# until they do.
+cargo sqlx migrate run --source migrations
+cargo sqlx prepare --workspace -- --all-targets
+EOF
+
+rsync -a --delete "$REMOTE:$DEST/.sqlx/" "$SRC/.sqlx/"
+echo "==> .sqlx refreshed in $SRC"

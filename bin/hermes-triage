@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# Triage one issue, or every open one, on the Athens-backed `triage` profile.
+#
+# Runs alongside an implement loop rather than behind it: the two profiles point
+# at different hosts, so the only thing they share is this machine's patience.
+set -euo pipefail
+
+HERMES=${HERMES_PYTHON:-${HERMES_HOME:-$HOME/.hermes}/hermes-agent/venv/bin/python}
+PROFILE=${HERMES_TRIAGE_PROFILE:-triage}
+TIMEOUT=${HERMES_TRIAGE_TIMEOUT:-2400}
+ATTEMPTS=${HERMES_TRIAGE_ATTEMPTS:-3}
+QUEUE=${HERMES_TRIAGE_QUEUE:-$HOME/queue}
+LOCK=/tmp/hermes-athens.lock
+
+usage() {
+	cat <<'EOF'
+usage: hermes-triage --repo PATH (--issue N | --all-open | --since-merge REF)
+
+  --issue N        Triage one issue.
+  --all-open       Triage every open issue with no triage file newer than the
+                   repository's HEAD.
+  --since-merge    Triage the open issues whose labels or bodies name a path
+                   the diff REF..HEAD touched -- a merge is what makes an issue
+                   stale, so that is what is worth re-checking.
+
+Writes $QUEUE/issue-<N>.md. Prints each path written.
+EOF
+}
+
+REPO="" ISSUE="" MODE=""
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--repo) REPO="$2"; shift 2 ;;
+	--issue) ISSUE="$2"; MODE=one; shift 2 ;;
+	--all-open) MODE=all; shift ;;
+	--since-merge) MODE=merge; SINCE="$2"; shift 2 ;;
+	-h | --help) usage; exit 0 ;;
+	*) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
+	esac
+done
+[[ -n "$REPO" && -n "$MODE" ]] || { usage >&2; exit 2; }
+
+cd "$REPO"
+mkdir -p "$QUEUE"
+
+# One issue per run, never the queue in one context: Athens holds 64K, and a
+# triage that runs out of room silently drops the evidence it was asked for.
+triage_one() {
+	local n="$1"
+	local out="$QUEUE/issue-$n.md"
+	local work
+	work=$(mktemp -d -t hermes-triage-XXXXXX)
+	gh issue view "$n" >"$work/issue.txt"
+
+	local prompt
+	prompt=$(
+		cat <<EOF
+Triage one issue of the repository at $REPO, following the swe-triage skill.
+
+The issue is at $work/issue.txt. Read it, then read the current tree at $REPO to
+decide whether it is still real. The tree is the authority; the issue text is a
+claim about a tree that may be months old.
+
+Write your triage to $out in the skill's output shape. Do not modify anything in
+$REPO, and do not touch the issue tracker.
+EOF
+	)
+
+	for ((i = 1; i <= ATTEMPTS; i++)); do
+		[[ -s "$out" ]] && break
+		local nudge="$prompt"
+		[[ $i -gt 1 ]] && nudge="You have not written $out yet, so the task is unfinished. Resume it with tool calls: read the issue and the tree, then write the file."
+		flock "$LOCK" timeout "$TIMEOUT" "$HERMES" -m hermes_cli.main -p "$PROFILE" \
+			-z "$nudge" --skills swe-triage --yolo \
+			>"$work/attempt$i.stdout" 2>"$work/attempt$i.stderr" || true
+	done
+
+	if [[ -s "$out" ]]; then
+		echo "$out"
+	else
+		echo "FAILED: issue $n produced no triage after $ATTEMPTS attempts ($work)" >&2
+		return 1
+	fi
+}
+
+case "$MODE" in
+one) triage_one "$ISSUE" ;;
+all)
+	for n in $(gh issue list --state open --limit 100 --json number --jq '.[].number' | sort -n); do
+		[[ -f "$QUEUE/issue-$n.md" ]] && continue
+		triage_one "$n" || true
+	done
+	;;
+merge)
+	# A merge is what makes an issue stale, so re-triage only what it could have
+	# touched: any open issue whose body names a path in the diff.
+	paths=$(git diff --name-only "$SINCE..HEAD")
+	[[ -z "$paths" ]] && { echo "no paths changed in $SINCE..HEAD" >&2; exit 0; }
+	for n in $(gh issue list --state open --limit 100 --json number --jq '.[].number' | sort -n); do
+		body=$(gh issue view "$n" --json body --jq .body)
+		while read -r path; do
+			[[ -z "$path" ]] && continue
+			if grep -qF "$path" <<<"$body"; then
+				rm -f "$QUEUE/issue-$n.md"
+				triage_one "$n" || true
+				break
+			fi
+		done <<<"$paths"
+	done
+	;;
+esac

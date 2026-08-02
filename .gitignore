@@ -1,0 +1,9 @@
+# Third-party binaries that happen to live in ~/bin. They are installs, not
+# work, and terraform alone is 112 MB.
+bin/helm
+bin/terraform
+
+# The filled-in copy of hosts.env.example. Belongs in ~/.config, never here.
+hosts.env
+*.env
+!hosts.env.example
