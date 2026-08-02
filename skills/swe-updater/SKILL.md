@@ -1,7 +1,7 @@
 ---
 name: swe-updater
 description: Implements one work item — a GitHub issue or a REVIEW_NOTES.md entry — on a branch the caller names, verifies it by running the caller's verification command until it passes, and commits only what passed. Never touches a trunk.
-version: 3.2.0
+version: 3.3.0
 metadata:
   hermes:
     tags: [software-engineering, git, automation, refactoring]
@@ -141,6 +141,14 @@ reviewer has to agree with, so name them rather than leaving them to be found.
 - **Nothing dead.** A returned column nobody reads, a parameter nobody passes, a
   branch nothing reaches, a file nothing loads — delete it. Noting a dead
   artifact in the handover does not earn it a place in the commit.
+- **Nothing outside the worktree is yours to edit, and the tooling least of
+  all.** The gates, the driver that dispatched you, anything on `PATH` — if one
+  of them is broken, that is the most valuable thing you can put in the
+  handover, and it is not a thing to fix in passing. Patching the gate that
+  judges your work is the single edit that can make a bad change look good, and
+  it does so silently: the run goes green, the report says so, and the evidence
+  that it should not have is gone. Say what broke, what you would change, and
+  stop.
 - **A claim about something outside this repository is a guess until you run
   it.** An API on a cloud provider, a flag on a CLI, a resource a Terraform
   provider offers, a default inside a framework — none of these can be settled
