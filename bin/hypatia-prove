@@ -74,14 +74,15 @@ restore() { git checkout --quiet HEAD -- "${SOURCES[@]}" 2>/dev/null || true; }
 trap restore EXIT
 
 printf '==> reverting %d source file(s), keeping %d test file(s)\n' "${#SOURCES[@]}" "${#TESTS[@]}"
-# New files (not present at BASE) cannot be checked out — remove them instead.
+# A file the branch adds has no version at BASE to check out, so reverting it
+# means deleting it. The restore trap puts it back from HEAD either way.
 for f in "${SOURCES[@]}"; do
-    if git show "$BASE:$f" >/dev/null 2>&1; then
-        git checkout --quiet "$BASE" -- "$f"
-    else
-        rm -f "$f"
-        git rm --quiet --cached "$f" 2>/dev/null || true
-    fi
+	if git show "$BASE:$f" >/dev/null 2>&1; then
+		git checkout --quiet "$BASE" -- "$f"
+	else
+		rm -f "$f"
+		git rm --quiet --cached "$f" 2>/dev/null || true
+	fi
 done
 
 # A revert that changed nothing means the sources already match the base --
