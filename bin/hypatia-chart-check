@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Run the repository's own chart check, on the box that has helm.
 #
-# It runs scripts/helm-chart-check.sh rather than a local copy of what that
-# script does. A local copy passes while CI fails: hypatia-compose-check kept
-# its own spelling of a compose command and reported the path healthy while the
-# workflow was broken on a misplaced flag.
+# It runs the repository's `just chart-check` rather than a local copy of what
+# that recipe does. A local copy passes while CI fails: hypatia-compose-check
+# kept its own spelling of a compose command and reported the path healthy while
+# the workflow was broken on a misplaced flag.
 #
 # This host has no helm; the k3s box does, and has no docker or rsync, so the
 # transport is tar over ssh.
@@ -23,15 +23,21 @@ fi
 
 REMOTE=${KUBEADM_SSH:?set KUBEADM_SSH to an ssh target for the cluster host: helm and terraform live there}
 CHART=${HYPATIA_CHART_PATH:-deploy/charts/hypatia}
-SCRIPT=scripts/helm-chart-check.sh
+RECIPE=chart-check
+
+# mise puts just on PATH from an interactive profile; this arrives over ssh as a
+# non-interactive shell, which reads none of that.
+REMOTE_PATH='$HOME/.local/share/mise/shims:$HOME/.local/bin:$PATH'
 
 SRC=$(cd "${1:-$PWD}" && git rev-parse --show-toplevel)
 NAME=$(basename "$SRC" | tr -c 'A-Za-z0-9_' '_' | tr -s '_' | sed 's/_$//')
 DEST="chartcheck/$NAME"
 
 [ -d "$SRC/$CHART" ] || { echo "no chart at $SRC/$CHART" >&2; exit 1; }
-[ -f "$SRC/$SCRIPT" ] || { echo "no $SCRIPT in $SRC" >&2; exit 1; }
+[ -f "$SRC/justfile" ] || { echo "no justfile in $SRC" >&2; exit 1; }
 
 ssh "$REMOTE" "rm -rf $DEST && mkdir -p $DEST"
-tar -C "$SRC" -cf - "$CHART" "$SCRIPT" | ssh "$REMOTE" "tar -C $DEST -xf -"
-ssh "$REMOTE" "cd $DEST && bash $SCRIPT"
+tar -C "$SRC" -cf - "$CHART" justfile | ssh "$REMOTE" "tar -C $DEST -xf -"
+ssh "$REMOTE" "export PATH=$REMOTE_PATH
+command -v just >/dev/null || { echo 'no just on $REMOTE: mise use -g just' >&2; exit 1; }
+cd $DEST && CHART_DIR=$CHART just $RECIPE"

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Run the repository's own terraform check, on the box that has terraform.
 #
-# Runs scripts/terraform-check.sh rather than a local copy of what it does, for
-# the reason the compose checker learned the hard way: a copy passes while the
-# workflow fails, because the copy is not the thing CI runs.
+# Runs the repository's `just terraform-check` rather than a local copy of what
+# it does, for the reason the compose checker learned the hard way: a copy passes
+# while the workflow fails, because the copy is not the thing CI runs.
 #
 # This host has no terraform; the k3s box does. Transport is tar over ssh --
 # that box has no rsync.
@@ -26,15 +26,21 @@ fi
 
 REMOTE=${KUBEADM_SSH:?set KUBEADM_SSH to an ssh target for the cluster host: helm and terraform live there}
 TF_DIR=${HYPATIA_TF_PATH:-deploy/terraform}
-SCRIPT=scripts/terraform-check.sh
+RECIPE=terraform-check
+
+# mise puts just on PATH from an interactive profile; this arrives over ssh as a
+# non-interactive shell, which reads none of that.
+REMOTE_PATH='$HOME/.local/share/mise/shims:$HOME/.local/bin:$PATH'
 
 SRC=$(cd "${1:-$PWD}" && git rev-parse --show-toplevel)
 NAME=$(basename "$SRC" | tr -c 'A-Za-z0-9_' '_' | tr -s '_' | sed 's/_$//')
 DEST="tfcheck/$NAME"
 
 [ -d "$SRC/$TF_DIR" ] || { echo "no terraform at $SRC/$TF_DIR" >&2; exit 1; }
-[ -f "$SRC/$SCRIPT" ] || { echo "no $SCRIPT in $SRC" >&2; exit 1; }
+[ -f "$SRC/justfile" ] || { echo "no justfile in $SRC" >&2; exit 1; }
 
 ssh "$REMOTE" "rm -rf $DEST && mkdir -p $DEST"
-tar -C "$SRC" -cf - "$TF_DIR" "$SCRIPT" | ssh "$REMOTE" "tar -C $DEST -xf -"
-ssh "$REMOTE" "cd $DEST && bash $SCRIPT"
+tar -C "$SRC" -cf - "$TF_DIR" justfile | ssh "$REMOTE" "tar -C $DEST -xf -"
+ssh "$REMOTE" "export PATH=$REMOTE_PATH
+command -v just >/dev/null || { echo 'no just on $REMOTE: mise use -g just' >&2; exit 1; }
+cd $DEST && TERRAFORM_DIR=$TF_DIR just $RECIPE"
