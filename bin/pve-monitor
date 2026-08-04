@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""Proxmox monitoring that the cluster's own notification system does not cover.
+
+Two tiers, matching how PVE's matchers are configured:
+
+  health  — conditions PVE never emits a notification for at all (Ceph state,
+            a node dropping out). Runs often, alerts only on change.
+  digest  — a periodic pull-based roll-up. PVE can filter notifications but not
+            batch them, and anything push-based goes silent in exactly the weeks
+            worth reporting on.
+
+  backups — the digest's backup section alone, findings-only, for ad-hoc use.
+"""
+
+import hashlib
+import json
+import os
+import ssl
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+CONFIG = os.path.expanduser("~/.config/pve-monitor/env")
+STATE_DIR = os.path.expanduser("~/.local/state/pve-monitor")
+TELEGRAM_LIMIT = 4000
+
+# PG states that mean data is at risk, as opposed to the transient ones a
+# rebalance or a scrub produces.
+PG_BAD = ("down", "incomplete", "inconsistent", "stale", "undersized")
+
+
+def load_config():
+    cfg = {}
+    with open(CONFIG) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[7:]
+            key, _, value = line.partition("=")
+            cfg[key.strip()] = value.strip().strip("'\"")
+    return cfg
+
+
+CFG = load_config()
+# PVE's API certificate is self-signed; the fingerprint is pinned in the
+# cluster's own storage config, not in any trust store reachable from here.
+SSL_CTX = ssl.create_default_context()
+SSL_CTX.check_hostname = False
+SSL_CTX.verify_mode = ssl.CERT_NONE
+
+
+def pve(path):
+    req = urllib.request.Request(
+        CFG["PVE_API_URL"] + path,
+        headers={
+            "Authorization": "PVEAPIToken=%s=%s"
+            % (CFG["PVE_TOKEN_ID"], CFG["PVE_TOKEN_SECRET"])
+        },
+    )
+    with urllib.request.urlopen(req, context=SSL_CTX, timeout=30) as resp:
+        return json.load(resp)["data"]
+
+
+def telegram(text):
+    if len(text) > TELEGRAM_LIMIT:
+        text = text[:TELEGRAM_LIMIT] + "\n[truncated]"
+    body = urllib.parse.urlencode(
+        {"chat_id": CFG["TELEGRAM_CHAT_ID"], "text": text}
+    ).encode()
+    url = "https://api.telegram.org/bot%s/sendMessage" % CFG["TELEGRAM_BOT_TOKEN"]
+    with urllib.request.urlopen(url, data=body, timeout=30) as resp:
+        return json.load(resp)
+
+
+def emit(text, dry_run):
+    if dry_run:
+        print(text)
+    else:
+        telegram(text)
+
+
+def backup_ages():
+    """Newest backup age in days per guest, None when there is no backup."""
+    storage = CFG.get("BACKUP_STORAGE", "cluster_backup")
+    resources = pve("/cluster/resources")
+    guests = [r for r in resources if r["type"] in ("qemu", "lxc")]
+    node = next(
+        r["node"]
+        for r in resources
+        if r["type"] == "storage" and r.get("storage") == storage
+    )
+    newest = {}
+    for vol in pve("/nodes/%s/storage/%s/content" % (node, storage)) or []:
+        vmid = str(vol.get("vmid"))
+        newest[vmid] = max(newest.get(vmid, 0), vol.get("ctime", 0))
+
+    now = time.time()
+    out = []
+    for g in sorted(guests, key=lambda g: g["vmid"]):
+        vmid = str(g["vmid"])
+        label = "%s %s (%s)" % (vmid, g.get("name", "?"), g["node"])
+        ts = newest.get(vmid)
+        out.append((label, None if not ts else (now - ts) / 86400))
+    return out
+
+
+def vzdump_tasks(days):
+    now = time.time()
+    tasks = []
+    for t in pve("/cluster/tasks") or []:
+        if t.get("type") != "vzdump":
+            continue
+        age = (now - t.get("starttime", now)) / 86400
+        if age <= days:
+            tasks.append((t.get("node"), age, t.get("status") or "running"))
+    return tasks
+
+
+def ceph_problems():
+    """Conditions worth waking someone for. RECENT_CRASH is deliberately not
+    one: it stays set until an operator archives it, so it would alert forever."""
+    try:
+        st = pve("/cluster/ceph/status")
+    except Exception as exc:
+        return ["ceph status unreachable: %s" % exc]
+
+    problems = []
+    health = st.get("health", {})
+    if health.get("status") == "HEALTH_ERR":
+        problems.append("Ceph HEALTH_ERR")
+    for name, chk in sorted(health.get("checks", {}).items()):
+        if name == "RECENT_CRASH":
+            continue
+        if chk.get("severity") == "HEALTH_ERR":
+            problems.append("Ceph %s: %s" % (name, chk.get("summary", {}).get("message")))
+
+    osd = st.get("osdmap", {})
+    total, up, ins = osd.get("num_osds"), osd.get("num_up_osds"), osd.get("num_in_osds")
+    if total is not None and (up != total or ins != total):
+        problems.append("Ceph OSDs %s/%s up, %s/%s in" % (up, total, ins, total))
+
+    for pg in st.get("pgmap", {}).get("pgs_by_state", []):
+        state = pg.get("state_name", "")
+        if any(bad in state for bad in PG_BAD):
+            problems.append("Ceph PGs %s: %s" % (state, pg.get("count")))
+    return problems
+
+
+def node_problems():
+    return [
+        "Node %s is %s" % (r["node"], r.get("status"))
+        for r in pve("/cluster/resources")
+        if r["type"] == "node" and r.get("status") != "online"
+    ]
+
+
+def cmd_health(dry_run):
+    problems = node_problems() + ceph_problems()
+    os.makedirs(STATE_DIR, exist_ok=True)
+    state_file = os.path.join(STATE_DIR, "health")
+    fingerprint = hashlib.sha256("\n".join(problems).encode()).hexdigest()
+    previous = ""
+    if os.path.exists(state_file):
+        with open(state_file) as fh:
+            previous = fh.read().strip()
+
+    if fingerprint == previous:
+        return 1 if problems else 0
+    # A dry run must not consume the state transition it is being used to test.
+    if not dry_run:
+        with open(state_file, "w") as fh:
+            fh.write(fingerprint)
+
+    if problems:
+        emit("Proxmox health\n\n" + "\n".join("  " + p for p in problems), dry_run)
+        return 1
+    # Only announce recovery when there was something to recover from.
+    if previous:
+        emit("Proxmox health recovered — no outstanding conditions.", dry_run)
+    return 0
+
+
+def backup_section(max_age):
+    ages = backup_ages()
+    missing = [label for label, age in ages if age is None]
+    stale = [(label, age) for label, age in ages if age is not None and age > max_age]
+    lines = []
+    if missing:
+        lines += ["No backup at all:"] + ["  " + m for m in missing]
+    if stale:
+        lines += ["Older than %.0f days:" % max_age] + [
+            "  %s — %.0fd" % (l, a) for l, a in sorted(stale, key=lambda x: -x[1])
+        ]
+    return ages, missing, stale, lines
+
+
+def cmd_backups(dry_run):
+    max_age = float(CFG.get("MAX_AGE_DAYS", 9))
+    _, missing, stale, lines = backup_section(max_age)
+    failed = [
+        "%s %.0fd ago — %s" % (n, a, s) for n, a, s in vzdump_tasks(max_age) if s != "OK"
+    ]
+    if failed:
+        lines += ["vzdump job errors:"] + ["  " + f for f in failed]
+    if not lines:
+        return 0
+    emit("Proxmox backup check\n\n" + "\n".join(lines), dry_run)
+    return 1
+
+
+def cmd_digest(dry_run):
+    max_age = float(CFG.get("MAX_AGE_DAYS", 9))
+    ages, missing, stale, problem_lines = backup_section(max_age)
+    lines = ["Proxmox weekly digest", ""]
+
+    ok = len(ages) - len(missing) - len(stale)
+    lines.append("Backups: %d guests, %d current" % (len(ages), ok))
+    dated = [a for _, a in ages if a is not None]
+    if dated:
+        lines.append("  newest %.0fd, oldest %.0fd" % (min(dated), max(dated)))
+    lines += ["  " + l for l in problem_lines]
+
+    tasks = vzdump_tasks(8)
+    lines += ["", "vzdump runs (8d): %d" % len(tasks)]
+    for node, age, status in sorted(tasks, key=lambda t: t[1]):
+        lines.append("  %s %.0fd ago — %s" % (node, age, status))
+
+    ceph = ceph_problems()
+    try:
+        st = pve("/cluster/ceph/status")
+        health = st.get("health", {}).get("status", "?")
+        checks = ", ".join(sorted(st.get("health", {}).get("checks", {}))) or "none"
+        lines += ["", "Ceph: %s (%s)" % (health, checks)]
+    except Exception as exc:
+        lines += ["", "Ceph: unreachable (%s)" % exc]
+    lines += ["  " + c for c in ceph]
+
+    lines += ["", "Nodes:"]
+    for r in sorted(
+        [r for r in pve("/cluster/resources") if r["type"] == "node"],
+        key=lambda r: r["node"],
+    ):
+        lines.append(
+            "  %-7s %-7s mem %.0f/%.0fG  disk %.0f/%.0fG"
+            % (
+                r["node"],
+                r.get("status"),
+                r.get("mem", 0) / 2**30,
+                r.get("maxmem", 1) / 2**30,
+                r.get("disk", 0) / 2**30,
+                r.get("maxdisk", 1) / 2**30,
+            )
+        )
+
+    emit("\n".join(lines), dry_run)
+    return 0
+
+
+COMMANDS = {"health": cmd_health, "digest": cmd_digest, "backups": cmd_backups}
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    dry_run = "--dry-run" in sys.argv
+    if len(args) != 1 or args[0] not in COMMANDS:
+        print("usage: pve-monitor {%s} [--dry-run]" % "|".join(COMMANDS))
+        return 2
+    return COMMANDS[args[0]](dry_run)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
