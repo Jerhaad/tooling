@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Provision the Proxmox side of the two-tier alerting: a Telegram webhook
+# target, and matchers deciding what is worth interrupting someone for.
+#
+# PVE matchers filter but never buffer, so the periodic half of the split
+# cannot live here — that is pve-monitor's `digest`, which pulls from the API on
+# a timer. What this sets up is only the immediate tier.
+set -euo pipefail
+
+# Credentials belong to whoever runs this. See pve-monitor.env.example.
+ENV_FILE=${PVE_MONITOR_ENV:-$HOME/.config/pve-monitor/env}
+# An if, not `[ -r ] &&`: under `set -e` the && chain returns 1 when the file is
+# absent and takes the whole script with it.
+if [ -r "$ENV_FILE" ]; then
+	# shellcheck source=/dev/null
+	. "$ENV_FILE"
+fi
+
+: "${PVE_API_URL:?set PVE_API_URL}"
+: "${PVE_TOKEN_ID:?set PVE_TOKEN_ID}"
+: "${PVE_TOKEN_SECRET:?set PVE_TOKEN_SECRET}"
+: "${TELEGRAM_BOT_TOKEN:?set TELEGRAM_BOT_TOKEN}"
+: "${TELEGRAM_CHAT_ID:?set TELEGRAM_CHAT_ID}"
+
+TARGET=${PVE_NOTIFY_TARGET:-telegram}
+
+api() {
+	local method=$1 path=$2
+	shift 2
+	# The API certificate is self-signed and pinned in the cluster's own config.
+	curl -sk -X "$method" \
+		-H "Authorization: PVEAPIToken=${PVE_TOKEN_ID}=${PVE_TOKEN_SECRET}" \
+		"$@" "${PVE_API_URL}${path}"
+}
+
+# Telegram accepts its bot token only in the URL path, and PVE substitutes
+# {{ secret.name }} into a webhook's body and headers but *not* its URL. A
+# templated URL ships the literal braces and Telegram answers 404, which reads
+# exactly like a bad token. So the token goes in the URL and `secret` is unused.
+URL="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
+BODY=$(printf '{"chat_id":"%s","text":"{{ escape title }}\\n\\n{{ escape message }}"}' "$TELEGRAM_CHAT_ID")
+B64_BODY=$(printf '%s' "$BODY" | base64 -w0)
+B64_CT=$(printf '%s' 'application/json' | base64 -w0)
+
+echo "endpoint $TARGET"
+# POST creates and fails on an existing target; PUT updates one and fails when
+# absent. Try in that order so the script is re-runnable.
+api POST /cluster/notifications/endpoints/webhook \
+	--data-urlencode "name=${TARGET}" \
+	--data-urlencode "url=${URL}" \
+	--data-urlencode "method=post" \
+	--data-urlencode "header=name=Content-Type,value=${B64_CT}" \
+	--data-urlencode "body=${B64_BODY}" >/dev/null 2>&1 ||
+	api PUT "/cluster/notifications/endpoints/webhook/${TARGET}" \
+		--data-urlencode "url=${URL}" \
+		--data-urlencode "method=post" \
+		--data-urlencode "header=name=Content-Type,value=${B64_CT}" \
+		--data-urlencode "body=${B64_BODY}" >/dev/null
+
+# Severity error covers vzdump, replication, fencing and ACME failures.
+# Everything at info/notice — package updates, successful backups — is left to
+# reach nobody, which is what stops the daily update nag.
+echo "matcher default-matcher (severity=error)"
+api PUT /cluster/notifications/matchers/default-matcher \
+	--data-urlencode "target=${TARGET}" \
+	--data-urlencode "mode=all" \
+	--data-urlencode "match-severity=error" \
+	--data-urlencode "comment=Immediate: job and system errors" >/dev/null
+
+# smartd and mdadm reach the notification system as forwarded root mail, at a
+# severity that varies, so they need matching on type instead. Separate matchers
+# OR together.
+echo "matcher system-mail"
+api POST /cluster/notifications/matchers \
+	--data-urlencode "name=system-mail" \
+	--data-urlencode "target=${TARGET}" \
+	--data-urlencode "mode=all" \
+	--data-urlencode "match-field=exact:type=system-mail" \
+	--data-urlencode "comment=Immediate: smartd, mdadm, cron output" >/dev/null 2>&1 ||
+	api PUT /cluster/notifications/matchers/system-mail \
+		--data-urlencode "target=${TARGET}" \
+		--data-urlencode "mode=all" \
+		--data-urlencode "match-field=exact:type=system-mail" >/dev/null
+
+echo "test"
+api POST "/cluster/notifications/targets/${TARGET}/test"
+echo

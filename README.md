@@ -28,11 +28,17 @@ configuration rather than keeping a copy that can drift.
 
 ## Layout
 
-    bin/     the gates, and the driver that dispatches an issue to the agent
-    skills/  the agent-side procedures the driver invokes
+    bin/      the gates, the driver that dispatches an issue to the agent, and
+              the `pve-*` monitors
+    skills/   the agent-side procedures the driver invokes
+    install/  unit files and the privileged steps a script cannot take
 
-Start at `bin/hypatia-verify`: it decides which gates a branch needs. Everything
-else in `bin/` is either one of those gates or the dispatcher that calls them.
+Start at `bin/hypatia-verify`: it decides which gates a branch needs. The rest
+of the `hypatia-*` names are the gates it calls.
+
+The `pve-*` pair is unrelated to any of that: `pve-monitor` reports on a Proxmox
+cluster's backups and Ceph state, and `pve-notify-setup` configures where its
+alerts go. See `install/pve-monitor/README.md`.
 
 ## Setup
 
