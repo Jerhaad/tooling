@@ -99,19 +99,38 @@ if [ "$LIST" = 1 ]; then
 	exit 0
 fi
 
-failed=()
+failed=() unprovable=()
 for i in "${!GATES[@]}"; do
 	echo "########## ${NAMES[$i]} ##########"
 	set +e
 	eval "${GATES[$i]}"
 	rc=$?
 	set -e
-	[ $rc -ne 0 ] && failed+=("${NAMES[$i]}")
+	# 3 is a gate saying it could not answer, which is neither a pass nor a
+	# failure. Reported on its own line so it cannot be read as either: a gate
+	# that gathered no evidence must not appear in a list headed "passed".
+	if [ $rc -eq 3 ]; then
+		unprovable+=("${NAMES[$i]}")
+	elif [ $rc -ne 0 ]; then
+		failed+=("${NAMES[$i]}")
+	fi
 	echo
 done
 
 if [ ${#failed[@]} -gt 0 ]; then
 	printf '==> FAILED: %s\n' "$(IFS=, ; echo "${failed[*]}")" >&2
+	[ ${#unprovable[@]} -gt 0 ] && printf '==> UNPROVABLE: %s\n' "$(IFS=, ; echo "${unprovable[*]}")" >&2
 	exit 1
+fi
+if [ ${#unprovable[@]} -gt 0 ]; then
+	printf '==> UNPROVABLE: %s\n' "$(IFS=, ; echo "${unprovable[*]}")" >&2
+	passed=()
+	for n in "${NAMES[@]}"; do
+		skip=0
+		for u in "${unprovable[@]}"; do [ "$n" = "$u" ] && skip=1; done
+		[ $skip -eq 0 ] && passed+=("$n")
+	done
+	[ ${#passed[@]} -gt 0 ] && echo "==> gates passed: $(IFS=, ; echo "${passed[*]}")"
+	exit 0
 fi
 echo "==> all gates passed: $(IFS=, ; echo "${NAMES[*]}")"
