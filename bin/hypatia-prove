@@ -14,6 +14,8 @@
 # Inline `#[cfg(test)]` tests cannot be checked this way: they live in the file
 # being reverted, so reverting takes the test with it. Those are reported as
 # unprovable rather than silently passed.
+#
+# Exit codes: 0 proven, 1 not proven, 2 misuse, 3 unprovable.
 set -euo pipefail
 
 BASE=${HYPATIA_PROVE_BASE:-origin/main}
@@ -86,14 +88,15 @@ for f in "${SOURCES[@]}"; do
 done
 
 # A revert that changed nothing means the sources already match the base --
-# almost always because the branch has since been merged. Running the suite here
-# would pass and be reported as "your tests do not test the change", which is
-# both wrong and the most discouraging thing this could say.
+# usually because the branch's change reached main by another route while the
+# branch sat. Neither answer is true here: calling it a failure blames tests
+# that are fine, and calling it a pass claims evidence that was never gathered.
+# Exit 3 says so, and hypatia-verify reports it as its own outcome.
 if git diff --quiet HEAD -- "${SOURCES[@]}"; then
-	echo "SKIP: source already matches $BASE; nothing to revert." >&2
-	echo "      The branch is probably merged. Re-run against an earlier base," >&2
-	echo "      e.g. HYPATIA_PROVE_BASE=HEAD~1." >&2
-	exit 2
+	echo "UNPROVABLE: source already matches $BASE, so there is nothing to revert." >&2
+	echo "            Re-run against an earlier base to prove these tests," >&2
+	echo "            e.g. HYPATIA_PROVE_BASE=HEAD~1." >&2
+	exit 3
 fi
 
 set +e
