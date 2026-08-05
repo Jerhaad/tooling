@@ -99,7 +99,7 @@ cargo test -p hypatia-core --lib
 cargo test -p db
 cargo test -p junit-ingest
 cargo test -p api-rest --lib
-cargo test -p api-rest --test integration
+cargo test -p api-rest
 EOF
 
 # cargo resolves a new dependency into the lock file where it builds, which is

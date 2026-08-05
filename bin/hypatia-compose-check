@@ -51,14 +51,19 @@ echo "==> from ci.yaml: $COMPOSE_CMD"
 # from empty, and a volume surviving from the last run hides a migration that
 # only applies to a fresh database.
 #
+# Torn down with the same file set the run uses, derived from the command read
+# out of ci.yaml. Naming the base file alone stopped working the moment that
+# file grew `:?` guards -- it refuses without an --env-file, `|| true` swallowed
+# the refusal, and the volume it was supposed to drop survived every run.
+#
 # The build is separate because CI builds the image in its own step; running the
 # compose command with nothing built would only ever test the fallback.
 ssh "$REMOTE" "bash -euo pipefail -s" <<EOF
 cd $DEST
-docker compose -f docker/docker-compose.yaml down -v >/dev/null 2>&1 || true
+${COMPOSE_CMD% up*} down -v >/dev/null 2>&1 || true
 docker build -f docker/Dockerfile.api -t hypatia-api:latest . >/dev/null
 $COMPOSE_CMD
-docker compose -f docker/docker-compose.yaml down -v >/dev/null 2>&1 || true
+${COMPOSE_CMD% up*} down -v >/dev/null 2>&1 || true
 EOF
 
 echo "==> compose migrate path OK ($NAME)"
