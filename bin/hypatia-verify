@@ -62,8 +62,13 @@ changed '^(docker/docker-compose|\.github/workflows/ci\.yaml)' &&
 
 # The SPA. Type errors are invisible to vitest, which strips types rather than
 # checking them, so both run.
+#
+# The recipe rather than the command it runs: web/tsconfig.json is
+# solution-style, `"files": []` plus references, so a bare `tsc` checks nothing
+# and exits 0. `just web-typecheck` is what CI invokes, and invoking it here
+# means the flag it needs -- `-b` today -- cannot drift out of sync with CI.
 if changed '^web/'; then
-	add "web types" "sh -c 'cd $SRC/web && npx tsc --noEmit'"
+	add "web types" "sh -c 'cd $SRC && just web-typecheck'"
 	add "web tests" "sh -c 'cd $SRC/web && npx vitest run'"
 fi
 
