@@ -47,6 +47,11 @@ TESTS=() SOURCES=() INLINE=()
 for f in "${CHANGED[@]}"; do
 	case "$f" in
 	*/tests/*.rs | tests/*.rs) TESTS+=("$f") ;;
+	# A migration is source: schema and seed data are behaviour, and reverting
+	# one runs the suite against the schema that existed without it. Counting
+	# only .rs here made every seed change unprovable, which is how a seeded
+	# table missing two of its rows passed a green build.
+	migrations/*.sql) SOURCES+=("$f") ;;
 	*.rs)
 		SOURCES+=("$f")
 		# A reverted file takes its own tests with it, so a change that adds
