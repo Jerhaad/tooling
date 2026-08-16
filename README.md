@@ -26,6 +26,13 @@ So `hypatia-verify` picks its gates from the diff rather than from whoever wrote
 the dispatch, and the gates read their commands out of the project's own CI
 configuration rather than keeping a copy that can drift.
 
+**Draft is the interlock between agent work and human review.** A pull request
+stays draft for as long as an agent is still working it, so a branch whose
+findings are still open cannot be merged by someone who did not know they were
+open. `hypatia-pr-ready` owns that transition and refuses it while the tree is
+dirty, the head is unpushed, CI is red or unfinished, or `hypatia-verify` fails
+— each of which has promoted a branch that then broke.
+
 ## Layout
 
     bin/      the gates, the driver that dispatches an issue to the agent, and
@@ -34,7 +41,8 @@ configuration rather than keeping a copy that can drift.
     install/  unit files and the privileged steps a script cannot take
 
 Start at `bin/hypatia-verify`: it decides which gates a branch needs. The rest
-of the `hypatia-*` names are the gates it calls.
+of the `hypatia-*` names are the gates it calls, except `hypatia-pr-ready`,
+which calls it.
 
 The `pve-*` pair is unrelated to any of that: `pve-monitor` reports on a Proxmox
 cluster's backups and Ceph state, and `pve-notify-setup` configures where its
