@@ -17,6 +17,11 @@ here is hardcoded.
 > **Scope: the caller's branch only.** Never commit to or merge into `main` or
 > any trunk, and never push unless the caller asked for a push. The maintainer's
 > review is the gate that decides what lands.
+>
+> **Never take a pull request out of draft.** Draft is what tells the maintainer
+> that an agent is still working the branch, so promoting one claims the work is
+> finished when only your part of it is. Leave the state alone and say in the
+> handover that the branch is ready for the caller to check.
 
 ## Done means a verified commit
 
