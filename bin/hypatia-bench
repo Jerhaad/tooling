@@ -49,7 +49,12 @@ echo "==> resetting database $DB"
 ssh "$REMOTE" "docker exec -i $PG_CONTAINER psql -U hypatia_ci -d postgres -v ON_ERROR_STOP=1 \
 	-c 'DROP DATABASE IF EXISTS $DB WITH (FORCE)' -c 'CREATE DATABASE $DB'"
 
-ssh "$REMOTE" "bash -euo pipefail -s" <<EOF
+# Every tree shares one CARGO_TARGET_DIR and each run deletes the first-party
+# fingerprints out of it, so two runs overlapping produce the cross-branch link
+# that deletion exists to prevent. Queue on the build host rather than here:
+# the contended resource is remote, and runs are dispatched from more than one
+# agent.
+ssh "$REMOTE" "flock \$HOME/bench/.target.lock bash -euo pipefail -s" <<EOF
 cd $DEST
 export DATABASE_URL="postgres://hypatia_ci@localhost:$PG_PORT/$DB"
 export HYPATIA_REPORT_URL="\$DATABASE_URL"

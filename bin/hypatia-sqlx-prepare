@@ -34,7 +34,8 @@ rsync -a --delete --exclude 'target/' --exclude '.git/' --exclude 'node_modules/
 ssh "$REMOTE" "docker exec -i $PG_CONTAINER psql -U hypatia_ci -d postgres -v ON_ERROR_STOP=1 \
 	-c 'DROP DATABASE IF EXISTS $DB WITH (FORCE)' -c 'CREATE DATABASE $DB'"
 
-ssh "$REMOTE" "bash -euo pipefail -s" <<EOF
+# Shares CARGO_TARGET_DIR with hypatia-bench, so it takes the same lock.
+ssh "$REMOTE" "flock \$HOME/bench/.target.lock bash -euo pipefail -s" <<EOF
 cd $DEST
 export DATABASE_URL="postgres://hypatia_ci@localhost:$PG_PORT/$DB"
 export PATH="\$HOME/.cargo/bin:\$PATH"
