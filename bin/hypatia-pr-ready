@@ -19,7 +19,7 @@ set -euo pipefail
 
 usage() {
 	cat <<'EOF'
-usage: hypatia-pr-ready <PR> [worktree] [--check] [--no-verify]
+usage: hypatia-pr-ready <PR> [worktree] [--check] [--no-verify] [--no-condense]
 
 Marks PR ready for review, but only if all of these hold:
 
@@ -29,10 +29,12 @@ Marks PR ready for review, but only if all of these hold:
   - GitHub reports the PR mergeable, not conflicting
   - every CI check has finished and passed
   - hypatia-verify passes on the worktree
+  - condense-prose flags nothing in the diff
 
 --check reports the verdict and changes nothing; exit 1 if it would refuse.
 --no-verify skips the hypatia-verify run when CI has already covered it. It does
 not skip anything else.
+--no-condense skips the condense-prose pass, for prose you have read and kept.
 
 worktree defaults to the current directory.
 EOF
@@ -43,16 +45,23 @@ EOF
 PR="$1"; shift
 [[ "$PR" =~ ^[0-9]+$ ]] || usage
 
-WORKTREE="" CHECK=0 VERIFY=1
+WORKTREE="" CHECK=0 VERIFY=1 CONDENSE=1
+BASE_REF=${HYPATIA_PR_READY_BASE:-origin/main}
+FIND_PROSE=${CONDENSE_PROSE:-$HOME/.claude/skills/condense-prose/find_prose.py}
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--check) CHECK=1; shift ;;
 	--no-verify) VERIFY=0; shift ;;
+	--no-condense) CONDENSE=0; shift ;;
 	-h | --help) usage ;;
 	*) [ -z "$WORKTREE" ] || usage; WORKTREE="$1"; shift ;;
 	esac
 done
 SRC=$(cd "${WORKTREE:-$PWD}" && git rev-parse --show-toplevel)
+# Everything below asks a question about that worktree: gh resolves the
+# repository from the directory it runs in, and the prose finder resolves --diff
+# the same way. Standing anywhere else silently asks about another repository.
+cd "$SRC"
 
 FAILED=()
 refuse() { FAILED+=("$1"); }
@@ -111,6 +120,25 @@ if [ "$VERIFY" -eq 1 ]; then
 	echo "==> hypatia-verify $SRC" >&2
 	hypatia-verify "$SRC" >&2 || refuse "hypatia-verify failed"
 	[ ${#FAILED[@]} -eq 0 ] || report
+fi
+
+# Last, because it is the only step asking about the writing rather than the
+# code, and the writing is what a reviewer meets first. Its own exit status is
+# always 0 -- the skill's position is that a finding is a question, not a
+# failure -- so the refusal is this script's, and answering "I looked and I am
+# keeping it" is what --no-condense is for.
+if [ "$CONDENSE" -eq 1 ]; then
+	if [ -x "$FIND_PROSE" ]; then
+		echo "==> condense-prose" >&2
+		FLAGGED=$("$FIND_PROSE" --diff "$BASE_REF" --json 2>/dev/null | jq 'length')
+		if [ "${FLAGGED:-0}" -gt 0 ]; then
+			"$FIND_PROSE" --diff "$BASE_REF" >&2 || true
+			refuse "condense-prose flagged $FLAGGED block(s); cut them or pass --no-condense"
+			report
+		fi
+	else
+		echo "note: condense-prose not installed at $FIND_PROSE, skipping" >&2
+	fi
 fi
 
 if [ "$CHECK" -eq 1 ]; then
