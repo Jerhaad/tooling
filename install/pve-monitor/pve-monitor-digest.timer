@@ -4,7 +4,7 @@ Description=Proxmox weekly digest, Monday morning
 [Timer]
 # The host runs UTC; the zone is named so the digest tracks local mornings
 # across the DST shift. Sunday 01:00 vzdump has finished and been verified.
-OnCalendar=Mon 08:00:00 America/Los_Angeles
+OnCalendar=Mon 07:00:00 America/Los_Angeles
 Persistent=true
 
 [Install]

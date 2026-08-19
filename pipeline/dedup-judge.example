@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Example PIPELINE_DEDUP_JUDGE. Copy, point it at whatever you run, chmod +x.
+#
+# One argument in, one line out: print the number of the issue that is the same
+# finding, or NONE. Anything else is treated as NONE, and the finding is filed --
+# a duplicate issue is visible and closable, one dropped by a confused judge is
+# not.
+#
+# Use the smallest model you have. This compares two sentences and never sees
+# code; a large or metered model is wasted here, and a slow one delays every
+# filing run by its latency times the number of ambiguous findings.
+set -uo pipefail
+exec your-model-cli --prompt "$1"

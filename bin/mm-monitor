@@ -1,0 +1,181 @@
+#!/bin/bash
+# MagicMirror health checks, run from somewhere other than the mirror.
+#
+#   health  - run often; alerts only when a check changes state
+#   digest  - periodic summary; always sends
+#   status  - print current state, send nothing
+#
+# This used to run on the mirror itself, which meant it could report the mirror
+# degraded but never report it gone: a box that loses power stops alerting and
+# silence reads exactly like health. Running from elsewhere makes reachability
+# the first thing checked rather than the one thing that cannot be.
+#
+# It also makes two checks honest. `page` and `api_auth` probed 127.0.0.1 while
+# api_auth's own comment worried about the API "leaking config to the LAN" --
+# loopback cannot answer that question. Both now cross the network they are
+# claims about.
+set -uo pipefail
+
+CONF="${MM_MONITOR_ENV:-$HOME/.config/mm-monitor/env}"
+[ -r "$CONF" ] || { echo "mm-monitor: no readable config at $CONF" >&2; exit 1; }
+# shellcheck source=/dev/null
+. "$CONF"
+
+: "${MM_SSH:?mm-monitor: set MM_SSH to the mirror's ssh target}"
+: "${MM_HTTP:?mm-monitor: set MM_HTTP to the mirror's base URL}"
+
+STATE_DIR="${MM_STATE_DIR:-$HOME/.local/state/mm-monitor}"
+NOTIFY="${MM_NOTIFY:-$(dirname "$(readlink -f "$0")")/mm-notify}"
+MAX_TEMP=${MAX_TEMP:-75}
+MAX_DISK_PCT=${MAX_DISK_PCT:-85}
+MAX_BACKUP_AGE_DAYS=${MAX_BACKUP_AGE_DAYS:-8}
+SSH_TIMEOUT=${MM_SSH_TIMEOUT:-15}
+
+DRY_RUN=0
+CMD="${1:-health}"
+[ "${2:-}" = "--dry-run" ] && DRY_RUN=1
+[ "$CMD" = "--dry-run" ] && { DRY_RUN=1; CMD="health"; }
+mkdir -p "$STATE_DIR"
+
+names=(); states=(); details=()
+record() { names+=("$1"); states+=("$2"); details+=("$3"); }
+check() {
+	local name="$1" detail="$2" ok="$3"
+	if [ "$ok" = "0" ]; then record "$name" ok "$detail"; else record "$name" fail "$detail"; fi
+}
+
+# One round trip for everything only the mirror can answer. One trip rather than
+# eight so a flaky link fails once, as "unreachable", instead of scattering
+# itself across half the checks as unrelated red.
+remote_facts() {
+	ssh -o BatchMode=yes -o ConnectTimeout="$SSH_TIMEOUT" "$MM_SSH" \
+		MM_BACKUP_LATEST="${MM_BACKUP_LATEST:-}" MM_CONFIG_JS="${MM_CONFIG_JS:-}" '
+		export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+		export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/bus}"
+		echo "service=$(systemctl --user is-active magicmirror.service 2>&1)"
+		echo "temp=$(vcgencmd measure_temp 2>/dev/null | tr -dc "0-9.")"
+		echo "throttled=$(vcgencmd get_throttled 2>/dev/null | cut -d= -f2)"
+		echo "disk=$(df --output=pcent / | tail -1 | tr -dc "0-9")"
+		echo "uptime=$(uptime -p)"
+		echo "load=$(cut -d" " -f1-3 /proc/loadavg)"
+		b=${MM_BACKUP_LATEST:-$HOME/backup/latest.tgz}
+		if [ -e "$b" ]; then echo "backup_epoch=$(stat -Lc %Y "$b")"; else echo "backup_epoch="; fi
+		node -e "
+			const c = require(process.env.MM_CONFIG_JS || process.env.HOME + \"/git/MagicMirror/config/config.js\");
+			const rc = c.modules.find(m => m.module === \"MMM-Remote-Control\");
+			const is = c.modules.find(m => m.module === \"MMM-ImmichSlideShow\");
+			const ic = is && is.config.immichConfigs[is.config.activeImmichConfigIndex || 0];
+			console.log(\"apiKey=\" + ((rc && rc.config && rc.config.apiKey) || \"\"));
+			console.log(\"immichUrl=\" + ((ic && ic.url) || \"\"));
+			console.log(\"immichKey=\" + ((ic && ic.apiKey) || \"\"));
+		" 2>/dev/null
+	' 2>/dev/null
+}
+
+http_code() { curl -s -o /dev/null -w '%{http_code}' --max-time "${2:-10}" "${@:3}" "$1" 2>/dev/null; }
+
+run_checks() {
+	local facts out
+	facts=$(remote_facts)
+	if [ -z "$facts" ]; then
+		# The check the old design could not make. Everything below needs the
+		# mirror to answer, so there is nothing else worth reporting.
+		check reachable "no ssh response in ${SSH_TIMEOUT}s" 1
+		return
+	fi
+	check reachable "ssh ok" 0
+
+	local service temp throttled disk backup_epoch apiKey immichUrl immichKey
+	while IFS='=' read -r k v; do
+		case "$k" in
+		service|temp|throttled|disk|uptime|load|backup_epoch|apiKey|immichUrl|immichKey)
+			printf -v "$k" '%s' "$v" ;;
+		esac
+	done <<<"$facts"
+
+	check service "$service" $([ "$service" = "active" ] && echo 0 || echo 1)
+
+	out=$(http_code "$MM_HTTP/")
+	check page "HTTP $out" $([ "$out" = "200" ] && echo 0 || echo 1)
+
+	if [ -n "${apiKey:-}" ]; then
+		out=$(http_code "$MM_HTTP/api/module" 10 -H "Authorization: Bearer ${apiKey}")
+		check modules "HTTP $out" $([ "$out" = "200" ] && echo 0 || echo 1)
+		out=$(http_code "$MM_HTTP/api/module")
+		check api_auth "unauth HTTP $out" $([ "$out" = "403" ] && echo 0 || echo 1)
+	fi
+
+	if [ -n "${immichUrl:-}" ]; then
+		out=$(http_code "${immichUrl}/api/server/version" 15 -H "x-api-key: ${immichKey:-}")
+		check immich "HTTP $out" $([ "$out" = "200" ] && echo 0 || echo 1)
+	fi
+
+	if [ -n "${temp:-}" ]; then
+		check temp "${temp}C" $(awk -v t="$temp" -v m="$MAX_TEMP" 'BEGIN{exit !(t<m)}' && echo 0 || echo 1)
+	fi
+	check throttling "${throttled:-unknown}" $([ "${throttled:-}" = "0x0" ] && echo 0 || echo 1)
+	check disk "${disk:-?}% used" $([ -n "${disk:-}" ] && [ "$disk" -lt "$MAX_DISK_PCT" ] && echo 0 || echo 1)
+
+	if [ -n "${backup_epoch:-}" ]; then
+		local age_days=$(( ( $(date +%s) - backup_epoch ) / 86400 ))
+		check backup "${age_days}d old" $([ "$age_days" -le "$MAX_BACKUP_AGE_DAYS" ] && echo 0 || echo 1)
+	else
+		check backup "no archive found" 1
+	fi
+}
+
+send() {
+	# Assembled with %0A for a line break; mm-notify sends it through curl
+	# --data-urlencode, which encodes the % too, so Telegram printed a literal
+	# "%0A". Decode once here, so the dry run and the real send are the same
+	# string -- they were not, which is why this looked correct in testing.
+	local body=${1//%0A/$'\n'}
+	if [ "$DRY_RUN" = "1" ]; then
+		printf '%s\n' "would send:" "$body"
+	else
+		"$NOTIFY" "$body" || echo "mm-monitor: notify failed" >&2
+	fi
+}
+
+run_checks
+
+case "$CMD" in
+health)
+	changes=""
+	for i in "${!names[@]}"; do
+		n=${names[$i]}; s=${states[$i]}; d=${details[$i]}
+		f="$STATE_DIR/$n"
+		prev=$(cat "$f" 2>/dev/null || echo unknown)
+		if [ "$s" != "$prev" ]; then
+			if [ "$s" = "fail" ]; then
+				changes="${changes}🔴 <b>${n}</b> — ${d}%0A"
+			else
+				changes="${changes}🟢 <b>${n}</b> recovered — ${d}%0A"
+			fi
+			[ "$DRY_RUN" = "1" ] || printf '%s\n' "$s" > "$f"
+		fi
+	done
+	# An if, not `[ -n ] && send`: that form is the last statement in the case,
+	# so a quiet run -- the normal one -- made the script exit 1 and every
+	# healthy check reported as a failed job.
+	if [ -n "$changes" ]; then
+		send "<b>MagicMirror</b> (${MM_SSH})%0A${changes}"
+	fi
+	;;
+digest)
+	body="<b>MagicMirror digest</b> (${MM_SSH})%0A"
+	for i in "${!names[@]}"; do
+		icon=$([ "${states[$i]}" = "ok" ] && echo 🟢 || echo 🔴)
+		body="${body}${icon} ${names[$i]}: ${details[$i]}%0A"
+	done
+	body="${body}%0Auptime: ${uptime:-unknown}%0A"
+	body="${body}load: ${load:-unknown}%0A"
+	send "$body"
+	;;
+status)
+	for i in "${!names[@]}"; do
+		printf '%-10s %-5s %s\n' "${names[$i]}" "${states[$i]}" "${details[$i]}"
+	done
+	;;
+*) echo "usage: mm-monitor [health|digest|status] [--dry-run]" >&2; exit 2 ;;
+esac

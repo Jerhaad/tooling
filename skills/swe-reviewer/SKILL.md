@@ -23,12 +23,16 @@ by the caller (a cron prompt); this skill hardcodes no repository or credential.
 
 ## Procedure
 
-### Phase 1: Isolated review branch
-1. `git fetch --prune origin`.
-2. `git checkout <default-branch> && git pull` (detect the default from
-   `git symbolic-ref refs/remotes/origin/HEAD`; do not assume `main`).
-3. `git checkout -b reviewer-<YYYY-MM-DD>` (delete a same-named local branch
-   first if a prior run left one).
+### Phase 1: The branch is already yours
+The caller has fetched, reset the working directory to the default branch,
+removed anything untracked, created `reviewer-<YYYY-MM-DD>` and checked it out.
+It also tells you the reviewed commit and which files moved since the last
+review.
+
+Do not run `git checkout`, `git branch`, `git commit`, `git push`, or clone
+anything. Deciding whether there is anything to review is a SHA comparison the
+caller has already made: five of fourteen reviews on record re-reviewed a commit
+an earlier review had covered, because that decision used to live here.
 
 ### Phase 2: Static analysis
 Detect the stack from its manifests (`Cargo.toml`, `package.json`,
@@ -62,11 +66,11 @@ successive runs read as a progress signal. Each finding carries:
    never "improve the security." Downstream automation applies these verbatim,
    so vagueness forces it to guess.
 
-### Phase 5: Commit and push the review branch
-**Before committing, verify you are on the review branch:** `git branch --show-current` must print `reviewer-<YYYY-MM-DD>`. If it prints anything else, abort — the review commit would land on a trunk branch.
+### Phase 5: Stop
+Writing `REVIEW_NOTES.md` finishes the job. The caller commits it, pushes the
+branch, and records the reviewed commit; it commits that file and nothing else,
+so anything else you leave in the tree is discarded.
 
-Then: `git add REVIEW_NOTES.md && git commit -m "review: <YYYY-MM-DD>"` then
-`git push origin reviewer-<YYYY-MM-DD>`. Only `REVIEW_NOTES.md` may be committed.
 
 ## Pitfalls
 - **Touching source or a trunk.** The tree must be identical to the reviewed
