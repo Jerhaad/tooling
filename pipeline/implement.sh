@@ -97,6 +97,15 @@ is a repair, not a second attempt at the feature.
 
 $(tail -60 "/tmp/nightly-resume-$n.log")" >/dev/null 2>&1 || true
 
+		# The agent fixes; committing the fix is mechanism, and it does not
+		# reliably do it -- the first repair corrected the file and stopped,
+		# leaving the gate to refuse a dirty tree and the fix to read as a
+		# failure. Amend, because a repair belongs to the commit it repairs.
+		if [ -n "$(git -C "$wt" status --porcelain)" ]; then
+			echo "  issue $n: repair left $(git -C "$wt" status --porcelain | wc -l) path(s) uncommitted; amending"
+			git -C "$wt" add -A
+			git -C "$wt" commit --quiet --amend --no-edit
+		fi
 		if ! $VERIFY "$wt" >"/tmp/nightly-resume-$n.log" 2>&1; then
 			echo "  issue $n: repair did not take; see /tmp/nightly-resume-$n.log"
 			continue
