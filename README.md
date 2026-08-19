@@ -33,16 +33,70 @@ open. `hypatia-pr-ready` owns that transition and refuses it while the tree is
 dirty, the head is unpushed, CI is red or unfinished, or `hypatia-verify` fails
 — each of which has promoted a branch that then broke.
 
+**Review, triage and implement are one pipeline, not three jobs.** Review finds,
+triage verifies against the tree, implement fixes; each phase hands the next a
+file rather than a conclusion. Findings that survive triage become issues, and
+the branch that fixes one opens a draft PR saying `Closes #N`, so the issue
+burns down when a human merges it and not before.
+
+**A phase does the deciding; the model does the judging.** Every phase is a
+script that establishes state, decides whether there is work, and hands the model
+exactly that work. Left to the agent, "has anything changed?" produced five
+duplicate reviews out of fourteen and three stray clones of the repository
+inside its own working directory. Judging code is the only part that needs a
+model.
+
 ## Layout
 
     bin/      the gates, the driver that dispatches an issue to the agent, and
               the `pve-*` monitors
+    pipeline/ the phases, run by any scheduler: review -> triage -> implement
+              overnight, cleanup at midday. Configured entirely from
+              `pipeline.env.example`; they name no project and no path.
     skills/   the agent-side procedures the driver invokes
     install/  unit files and the privileged steps a script cannot take
+
+`~/.hermes/scripts` is a symlink to `pipeline/`, so the scheduled jobs run the
+reviewed copy. It has to be the directory, not per-file links: `hermes cron`
+rejects a script whose path resolves outside that directory. That symlink is
+why the scripts resolve their own location with `cd -P`; a logical `cd` walks
+`../bin` relative to the link and lands outside the checkout.
+
+The phases take the repository, the gate, the agent and the label vocabulary
+from the environment. `bin/` is where this checkout's own answers to those live
+-- `hypatia-verify` is one project's gate, not the pipeline's.
+
+## What you have to wire in
+
+`pipeline/pipeline.env.example` is the full list. Four of them are yours to
+supply and nothing works without them:
+
+- **a gate**: one command taking a worktree, non-zero when the tree is not fit
+  to push. Everything the pipeline claims about correctness comes from it, so
+  make it the command your CI runs.
+- **an agent** that takes a prompt and may edit a working tree.
+- **a triager** and an **implementer** driving that agent for one finding and
+  one issue respectively.
+- **a small, fast model as the dedup judge**. The reviewer rewords findings it
+  carries forward, so the same defect arrives written differently each night.
+  Fingerprints and word overlap settle the obvious cases for free; the judge is
+  asked only where two sentences share a quarter of their words and may or may
+  not mean the same thing. It never sees code, so use the smallest model you
+  have, and not the one doing the reviewing.
+
+Leaving the judge unset is supported: matching stays mechanical and files a
+duplicate when the wording drifts far enough. Every other omission fails loudly
+at startup.
 
 Start at `bin/hypatia-verify`: it decides which gates a branch needs. The rest
 of the `hypatia-*` names are the gates it calls, except `hypatia-pr-ready`,
 which calls it.
+
+`mm-monitor` watches the MagicMirror from here rather than from the mirror. A
+monitor sharing a host with the thing it monitors can report degradation but
+never death: the box loses power and simply stops alerting, and silence reads
+the same as health. Reachability is the first check because it is the one the
+old arrangement could not make.
 
 The `pve-*` pair is unrelated to any of that: `pve-monitor` reports on a Proxmox
 cluster's backups and Ceph state, and `pve-notify-setup` configures where its
