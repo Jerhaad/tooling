@@ -83,18 +83,6 @@ echo "==> migrations"
 touch crates/hypatia-migrate/src/main.rs
 cargo run -q -p hypatia-migrate
 
-# ci.yaml's Schema & Seeds job asserts an exact table count, so any migration
-# that adds or drops a table fails a job no amount of cargo output predicts.
-echo "==> table count matches ci.yaml"
-EXPECTED=\$(grep -oP "\) = \K[0-9]+(?=, 'table count mismatch')" .github/workflows/ci.yaml)
-ACTUAL=\$(docker exec $PG_CONTAINER psql -U hypatia_ci -d $DB -tAc \
-	"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' \
-	 AND table_type = 'BASE TABLE' AND table_name <> '_sqlx_migrations'")
-if [ "\$EXPECTED" != "\$ACTUAL" ]; then
-	echo "ci.yaml expects \$EXPECTED tables, the schema has \$ACTUAL" >&2
-	exit 1
-fi
-
 echo "==> register integration test cases"
 docker exec -i $PG_CONTAINER psql -U hypatia_ci -d $DB -v ON_ERROR_STOP=1 \
 	< examples/hypatia/ci-integration-tests.sql > /dev/null
