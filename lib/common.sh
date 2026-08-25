@@ -33,7 +33,10 @@ host_for() {
 # A non-interactive ssh reads no profile, so a version manager that puts tools on
 # PATH from an interactive shell puts nothing there. Override for a host that
 # keeps its shims elsewhere.
-: "${REMOTE_PATH:='$HOME/.local/share/mise/shims:$HOME/.local/bin:$PATH'}"
+# The dollars stay literal here and expand on the far side: these name the
+# remote account's home and the remote PATH, and expanding them locally sends
+# this machine's paths to a host that has none of them.
+: "${REMOTE_PATH:=\$HOME/.local/share/mise/shims:\$HOME/.local/bin:\$PATH}"
 
 # A stable per-tree name for remote directories and databases, so two branches
 # never share one.
