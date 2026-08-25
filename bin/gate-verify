@@ -53,7 +53,7 @@ skipped() {
 	return 1
 }
 
-NAMES=() GATES=()
+NAMES=() GATES=() SHOWN=()
 for i in "${!GATE_NAMES[@]}"; do
 	name=${GATE_NAMES[$i]} when=${GATE_WHEN[$i]}
 	skipped "$name" && continue
@@ -63,6 +63,7 @@ for i in "${!GATE_NAMES[@]}"; do
 		continue
 	fi
 	NAMES+=("$name")
+	SHOWN+=("${GATE_RUN[$i]}")
 	# $REPO is what a manifest's `run` interpolates; exported so a gate that
 	# shells out again still sees it.
 	GATES+=("REPO=$(printf '%q' "$SRC") ; ${GATE_RUN[$i]}")
@@ -78,7 +79,10 @@ fi
 printf '==> %d file(s) changed; running: %s\n\n' "${#CHANGED[@]}" "$(IFS=, ; echo "${NAMES[*]}")"
 
 if [ "$LIST" = 1 ]; then
-	for i in "${!GATES[@]}"; do printf '  %-18s %s\n' "${NAMES[$i]}" "${GATE_RUN[$i]}"; done
+	# SHOWN, not GATE_RUN: the latter is every gate in the manifest, and indexing
+	# it by a position in the selected list pairs a name with another gate's
+	# command whenever anything was filtered out.
+	for i in "${!GATES[@]}"; do printf '  %-18s %s\n' "${NAMES[$i]}" "${SHOWN[$i]}"; done
 	exit 0
 fi
 
