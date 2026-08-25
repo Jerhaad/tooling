@@ -19,7 +19,7 @@ set -euo pipefail
 
 usage() {
 	cat <<'EOF'
-usage: hypatia-pr-ready <PR> [worktree] [--check] [--no-verify] [--no-condense]
+usage: pr-ready <PR> [worktree] [--check] [--no-verify] [--no-condense]
 
 Marks PR ready for review, but only if all of these hold:
 
@@ -28,11 +28,11 @@ Marks PR ready for review, but only if all of these hold:
   - local HEAD matches the PR's pushed head (nothing unpushed)
   - GitHub reports the PR mergeable, not conflicting
   - every CI check has finished and passed
-  - hypatia-verify passes on the worktree
+  - gate-verify passes on the worktree
   - condense-prose flags nothing in the diff
 
 --check reports the verdict and changes nothing; exit 1 if it would refuse.
---no-verify skips the hypatia-verify run when CI has already covered it. It does
+--no-verify skips the gate-verify run when CI has already covered it. It does
 not skip anything else.
 --no-condense skips the condense-prose pass, for prose you have read and kept.
 
@@ -46,7 +46,7 @@ PR="$1"; shift
 [[ "$PR" =~ ^[0-9]+$ ]] || usage
 
 WORKTREE="" CHECK=0 VERIFY=1 CONDENSE=1
-BASE_REF=${HYPATIA_PR_READY_BASE:-origin/main}
+BASE_REF=${PR_READY_BASE:-origin/main}
 FIND_PROSE=${CONDENSE_PROSE:-$HOME/.claude/skills/condense-prose/find_prose.py}
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -111,14 +111,14 @@ report() {
 }
 
 # Everything above is a metadata read costing a second or two, so they all run
-# and one invocation names every reason. hypatia-verify costs minutes and builds
+# and one invocation names every reason. gate-verify costs minutes and builds
 # on a host other branches are queued against, so it runs only once the cheap
 # answers are all yes.
 [ ${#FAILED[@]} -eq 0 ] || report
 
 if [ "$VERIFY" -eq 1 ]; then
-	echo "==> hypatia-verify $SRC" >&2
-	hypatia-verify "$SRC" >&2 || refuse "hypatia-verify failed"
+	echo "==> gate-verify $SRC" >&2
+	gate-verify "$SRC" >&2 || refuse "gate-verify failed"
 	[ ${#FAILED[@]} -eq 0 ] || report
 fi
 

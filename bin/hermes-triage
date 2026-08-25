@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Triage one issue, or every open one, on the Athens-backed `triage` profile.
+# Triage one issue, or every open one, on the `triage` profile.
 #
-# Runs alongside an implement loop rather than behind it: the two profiles point
-# at different hosts, so the only thing they share is this machine's patience.
+# Runs alongside an implement loop rather than behind it: point the two profiles
+# at different hosts and the only thing they share is this machine's patience.
+# Pointed at one host they serialise, which is correctness, not deadlock.
 set -euo pipefail
 
 HERMES=${HERMES_PYTHON:-${HERMES_HOME:-$HOME/.hermes}/hermes-agent/venv/bin/python}
@@ -10,7 +11,9 @@ PROFILE=${HERMES_TRIAGE_PROFILE:-triage}
 TIMEOUT=${HERMES_TRIAGE_TIMEOUT:-2400}
 ATTEMPTS=${HERMES_TRIAGE_ATTEMPTS:-3}
 QUEUE=${HERMES_TRIAGE_QUEUE:-$HOME/queue}
-LOCK=/tmp/hermes-athens.lock
+# One triage run at a time. Named for the profile rather than a host, so two
+# profiles on one machine do not block each other.
+LOCK=${HERMES_TRIAGE_LOCK:-/tmp/hermes-triage-$PROFILE.lock}
 
 usage() {
 	cat <<'EOF'
@@ -43,7 +46,7 @@ done
 cd "$REPO"
 mkdir -p "$QUEUE"
 
-# One issue per run, never the queue in one context: Athens holds 64K, and a
+# One issue per run, never the queue in one context: a short-context host and a
 # triage that runs out of room silently drops the evidence it was asked for.
 triage_one() {
 	local n="$1"

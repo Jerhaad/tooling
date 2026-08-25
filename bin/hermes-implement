@@ -14,20 +14,20 @@ usage() {
 usage: hermes-implement --issue N --worktree PATH [--repo OWNER/NAME]
                         [--verify CMD] [--extra TEXT] [--profile NAME]
 
---profile selects the hermes profile, which chooses both the model and the host:
+--profile selects the agent profile, which chooses both the model and the host.
+Your profiles are your own; `issue-grade --lanes` names the same set, and the
+three shapes worth having are:
 
-  (omitted)  Logan, dense 27B on dual-c -- the root default. 54.8 tok/s at
-             256K. The quality lane: correcting a bad diff costs more than the
-             extra minutes, so this is what unspecified work gets.
-  fast       Logan, 35B MoE on dual-a. 142 tok/s at 256K, for small or
-             mechanical work where latency matters more than judgement.
-  athens     Athens, 64K. Extra-small work, and the only way to run a second
-             stream: each host serves one request at a time, so two runs on one
-             host queue rather than overlap.
+  (omitted)  The quality lane, and what unspecified work gets: correcting a bad
+             diff costs more than the extra minutes a careful model spends.
+  fast       A quicker model for small or mechanical work, where latency
+             matters more than judgement.
+  small      A short-context host for extra-small work. Also the only way to
+             run a second stream, since a host serving one request at a time
+             makes two runs queue rather than overlap.
 
---verify defaults to `hypatia-verify <worktree>`, which picks its gates from the
-diff rather than from whoever wrote the dispatch. TRIAL, 2026-08-01: drop the
-default back to empty if it proves worse than choosing by hand.
+--verify defaults to `gate-verify <worktree>`, which picks its gates from the
+diff rather than from whoever wrote the dispatch.
 
 Prints the transcript directory on stdout.
 EOF
@@ -51,7 +51,7 @@ done
 # Chosen from the diff rather than by the caller. Picking a gate by hand is how
 # a Helm template passed on Rust compiling and a misplaced --no-build reached
 # CI: both times the gate was green and had not looked at the change.
-: "${VERIFY:=hypatia-verify $WORKTREE}"
+: "${VERIFY:=gate-verify $WORKTREE}"
 
 # -p rather than HERMES_PROFILE: the environment variable is read too late to
 # pick the profile's model, so a run exported into it still talks to the default

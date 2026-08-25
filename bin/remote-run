@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Run one of the project's own recipes on a host that has the tool for it.
+#
+# It runs the project's command rather than a local copy of what that command
+# does. A copy passes while CI fails: a compose checker here once kept its own
+# spelling of `docker compose up` and reported the path healthy while the
+# workflow was broken on a misplaced flag.
+#
+# Transport is tar over ssh rather than rsync, because the role this most often
+# targets is a small appliance that has neither rsync nor docker. Only the paths
+# the recipe reads are sent.
+set -euo pipefail
+
+LIB=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)
+# shellcheck source=../lib/common.sh
+. "$LIB/common.sh"
+
+usage() { echo "usage: remote-run <name> [worktree]" >&2; exit 2; }
+[ $# -ge 1 ] || usage
+NAME=$1
+SRC=$(repo_root "${2:-$PWD}")
+
+# Selected by name out of the manifest's [[remote]] list, so adding one is a
+# manifest edit and never a change here.
+eval "$(python3 "$LIB/manifest.py" "$SRC" --remote "$NAME")"
+
+REMOTE=$(host_for "$REMOTE_ROLE")
+DEST="remote-run/$(tree_name "$SRC")/$NAME"
+
+for p in "${REMOTE_SEND[@]}"; do
+	[ -e "$SRC/$p" ] || { echo "$NAME: $SRC/$p does not exist; check \`send\` in gates.toml" >&2; exit 1; }
+done
+
+ssh "$REMOTE" "rm -rf $DEST && mkdir -p $DEST"
+tar -C "$SRC" -cf - "${REMOTE_SEND[@]}" | ssh "$REMOTE" "tar -C $DEST -xf -"
+ssh "$REMOTE" "export PATH=$REMOTE_PATH
+cd $DEST && $REMOTE_COMMAND"

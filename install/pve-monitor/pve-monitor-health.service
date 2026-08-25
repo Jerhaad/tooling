@@ -1,9 +1,0 @@
-[Unit]
-Description=Proxmox health check (alerts on change)
-After=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=%h/bin/pve-monitor health
-# Exit 1 means conditions were found and reported, not that the check broke.
-SuccessExitStatus=0 1

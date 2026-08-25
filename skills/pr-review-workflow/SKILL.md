@@ -1,6 +1,6 @@
 ---
 name: pr-review-workflow
-description: Workflow for reviewing pull requests across different GitHub instances (public, private, github-reviewer, GHE). Covers fetching PRs when web tools fail, handling branch conflicts, and extracting metadata from local clones.
+description: Workflow for reviewing pull requests across different GitHub instances (public, private, a custom SSH alias, GHE). Covers fetching PRs when web tools fail, handling branch conflicts, and extracting metadata from local clones.
 version: 1.0.0
 metadata:
   hermes:
@@ -27,7 +27,7 @@ Procedural skill for reviewing pull requests when the repo is not publicly acces
 
 ### Phase 2: Fetch the PR via Git
 
-Web extraction does **not** work on private instances (github-reviewer, GHE, GitHub Enterprise). Use git instead:
+Web extraction does **not** work on private instances (a host reached through a custom SSH alias, GHE, GitHub Enterprise). Use git instead:
 
 ```bash
 git fetch origin pull/<N>/head:pr<N>

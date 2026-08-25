@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Fail a branch that adds surface area without touching a test anywhere.
+#
+# Every build-and-migrate gate approves this happily. One change added a table,
+# a repository, three routes and a model in 537 lines, passed a full bench and a
+# compose check, and was verified to compile, migrate and build an image --
+# never to behave, because the gate that proves tests only runs when a test file
+# moves. A gate that stays quiet about that is agreeing the surface is covered.
+#
+# The paths that count as surface are the caller's, because only the project
+# knows which of its directories are load-bearing.
+set -euo pipefail
+
+BASE=${VERIFY_BASE:-origin/main}
+TESTS='(^|/)tests?/'
+
+usage() { echo "usage: gate-untested <worktree> [--tests REGEX] [--allow-var NAME]" >&2; exit 2; }
+[ $# -ge 1 ] || usage
+SRC=$(cd "$1" && git rev-parse --show-toplevel)
+shift
+ALLOW_VAR=ALLOW_UNTESTED
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--tests) [ $# -ge 2 ] || usage; TESTS=$2; shift 2 ;;
+	--allow-var) [ $# -ge 2 ] || usage; ALLOW_VAR=$2; shift 2 ;;
+	*) usage ;;
+	esac
+done
+
+cd "$SRC"
+mapfile -t CHANGED < <(git diff --name-only "$BASE"...HEAD)
+
+if printf '%s\n' "${CHANGED[@]}" | grep -qE "$TESTS"; then
+	echo "==> a test file changed"
+	exit 0
+fi
+
+# An escape hatch that has to be named out loud. The gate is a prompt for a
+# sentence explaining why this change needs no test, not a wall.
+if [ -n "${!ALLOW_VAR:-}" ]; then
+	echo "==> untested surface allowed via $ALLOW_VAR"
+	exit 0
+fi
+
+echo "surface code changed and no test file did." >&2
+printf '  %s\n' "${CHANGED[@]}" >&2
+echo "Add the test, or rerun with $ALLOW_VAR=1 to say why not." >&2
+exit 1

@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Run one of the project's own commands on a host that has the toolchain.
+#
+# What this owns: moving the tree, serialising runs that share a build cache,
+# handing the command a database of its own, and copying back what the build
+# resolved remotely. What the command does is the project's business -- it is
+# read from gates.toml so that it cannot drift from the one CI runs.
+#
+# Every task shares one remote directory per tree, so a warm build cache is
+# reused rather than synced twice, and they take one lock for the same reason.
+#
+# Each source tree gets its own remote directory, so a build cache survives
+# between runs, and its own database, so a branch never inherits the schema of
+# the branch before it.
+set -euo pipefail
+
+LIB=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)
+# shellcheck source=../lib/common.sh
+. "$LIB/common.sh"
+
+usage() { echo "usage: remote-task [--task NAME] [--full] [worktree]" >&2; exit 2; }
+
+TASK=bench FULL=0
+ARGS=()
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--task) [ $# -ge 2 ] || usage; TASK=$2; shift 2 ;;
+	--full) FULL=1; shift ;;
+	-h | --help) usage ;;
+	*) ARGS+=("$1"); shift ;;
+	esac
+done
+set -- "${ARGS[@]+"${ARGS[@]}"}"
+
+SRC=$(repo_root "${1:-$PWD}")
+NAME=$(tree_name "$SRC")
+
+eval "$(python3 "$LIB/manifest.py" "$SRC" --task "$TASK")"
+[ "$FULL" = 1 ] && [ -n "$TASK_FULL_COMMAND" ] && TASK_COMMAND=$TASK_FULL_COMMAND
+REMOTE=$(host_for "$TASK_ROLE")
+
+DB_ENV=""
+if [ -n "$TASK_DB_CONTAINER" ]; then
+	DB="${TASK_DB_PREFIX}_$NAME"
+fi
+
+DEST="bench/$NAME"
+
+echo "==> syncing $SRC to $REMOTE:$DEST"
+ssh "$REMOTE" "mkdir -p $DEST"
+rsync -a --delete --exclude 'target/' --exclude '.git/' --exclude 'node_modules/' \
+	"$SRC/" "$REMOTE:$DEST/"
+
+if [ -n "$TASK_DB_CONTAINER" ]; then
+	echo "==> resetting database $DB"
+	ssh "$REMOTE" "docker exec -i $TASK_DB_CONTAINER psql -U $TASK_DB_USER -d postgres -v ON_ERROR_STOP=1 \
+		-c 'DROP DATABASE IF EXISTS $DB WITH (FORCE)' -c 'CREATE DATABASE $DB'"
+	DB_ENV="export DATABASE_URL=postgres://$TASK_DB_USER@localhost:$TASK_DB_PORT/$DB"
+fi
+
+# Queue on the build host rather than here: the contended resource is remote,
+# and runs are dispatched from more than one agent. A build cache shared by
+# every tree is the reason -- two runs overlapping in it is how one branch's
+# crate gets linked against another branch's.
+ssh "$REMOTE" "flock \$HOME/bench/.lock bash -euo pipefail -s" <<REMOTE_SCRIPT
+export PATH=$REMOTE_PATH
+cd $DEST
+$DB_ENV
+$TASK_COMMAND
+REMOTE_SCRIPT
+
+# A build resolves dependencies where it runs, which is not where the commit is
+# made: a lock file updated remotely and never copied back leaves the branch
+# claiming a dependency set it does not have.
+for f in ${TASK_FETCH[@]+"${TASK_FETCH[@]}"}; do
+	echo "==> fetching $f"
+	# Trailing slash on both sides or rsync nests a directory inside itself.
+	if [ -d "$SRC/$f" ]; then
+		rsync -a --delete "$REMOTE:$DEST/$f/" "$SRC/$f/"
+	else
+		rsync -a "$REMOTE:$DEST/$f" "$SRC/$f"
+	fi
+done
+
+echo "==> PASS ($TASK: $NAME)"

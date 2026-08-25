@@ -1,7 +1,0 @@
-[Unit]
-Description=Proxmox weekly digest
-After=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=%h/bin/pve-monitor digest
