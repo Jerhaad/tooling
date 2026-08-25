@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Prove a branch's new tests actually test its change.
+# Check that a branch's new tests actually exercise its change.
+#
+# This answers one question: would these tests still pass without this diff? It
+# does not answer whether the diff is right. A wrong fix and its test fail
+# together when reverted, and land here as a pass.
 #
 # Reverts the source and keeps the tests, then runs them and requires a
 # failure. A test that passes without the fix is not a test, and it is the
@@ -16,7 +20,8 @@
 # that identifies one, and those files are reported rather than silently
 # counted as covered.
 #
-# Exit codes: 0 proven, 1 not proven, 2 misuse, 3 unprovable.
+# Exit codes: 0 the tests depend on the change, 1 they do not, 2 misuse,
+# 3 unprovable.
 set -euo pipefail
 
 # readlink -f, not `cd -P`: these are installed as symlinks into a bin
@@ -152,6 +157,9 @@ if [ $rc -eq 127 ] || [ $rc -eq 126 ]; then
 fi
 
 echo
-echo "==> proven: the suite fails without the change (exit $rc)"
+# Deliberately not "proven": what this establishes is that the tests depend on
+# the change, which is a fact about the tests. A broken fix passes here too --
+# reverting it still makes its test fail. Nothing about correctness is measured.
+echo "==> the tests depend on the change: the suite fails without it (exit $rc)"
 [ ${#INLINE[@]} -gt 0 ] && printf '    note: inline tests in %s were reverted too and are not covered\n' "${INLINE[@]}"
 exit 0
