@@ -1,6 +1,6 @@
 # Instance Handling
 
-## Non-standard GitHub instances (private forks, github-reviewer, GHE)
+## Non-standard GitHub instances (private forks, custom SSH aliases, GHE)
 
 Web extraction tools (`web_extract`, `web_url_read`) cannot reach private or custom GitHub instances. When the repo URL returns 404 from the public GitHub API:
 

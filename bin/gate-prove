@@ -11,16 +11,24 @@
 # at the same dead address as the broken one, so it passed against the
 # unmodified handler.
 #
-# Inline `#[cfg(test)]` tests cannot be checked this way: they live in the file
-# being reverted, so reverting takes the test with it. Those are reported as
-# unprovable rather than silently passed.
+# Inline tests cannot be checked this way: they live in the file being
+# reverted, so reverting takes the test with it. The manifest names the marker
+# that identifies one, and those files are reported rather than silently
+# counted as covered.
 #
 # Exit codes: 0 proven, 1 not proven, 2 misuse, 3 unprovable.
 set -euo pipefail
 
-BASE=${HYPATIA_PROVE_BASE:-origin/main}
+LIB=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)
+# shellcheck source=../lib/common.sh
+. "$LIB/common.sh"
 
-usage() { echo "usage: hypatia-prove <worktree> [-- cargo test args]" >&2; exit 2; }
+# Falls through to the base gate-verify selected this gate with, so the tests it
+# counted and the sources this reverts are the same set. PROVE_BASE overrides it
+# for a deliberate re-run against an earlier commit.
+BASE=${PROVE_BASE:-${VERIFY_BASE:-origin/main}}
+
+usage() { echo "usage: gate-prove <worktree> [-- test command]" >&2; exit 2; }
 [ $# -ge 1 ] || usage
 SRC=$(cd "$1" && git rev-parse --show-toplevel)
 shift
@@ -43,22 +51,24 @@ fi
 mapfile -t CHANGED < <(git diff --name-only "$BASE"...HEAD)
 [ ${#CHANGED[@]} -gt 0 ] || { echo "no changes against $BASE" >&2; exit 2; }
 
+TEST_RE=$(manifest "$SRC" prove.tests)
+SOURCE_RE=$(manifest "$SRC" prove.sources)
+INLINE_RE=$(manifest "$SRC" prove.inline-marker "")
+
+# Tests are matched first: a file under tests/ that also matches the source
+# pattern is a test, or reverting it would delete the evidence.
 TESTS=() SOURCES=() INLINE=()
 for f in "${CHANGED[@]}"; do
-	case "$f" in
-	*/tests/*.rs | tests/*.rs) TESTS+=("$f") ;;
-	# A migration is source: schema and seed data are behaviour, and reverting
-	# one runs the suite against the schema that existed without it. Counting
-	# only .rs here made every seed change unprovable, which is how a seeded
-	# table missing two of its rows passed a green build.
-	migrations/*.sql) SOURCES+=("$f") ;;
-	*.rs)
+	if printf '%s' "$f" | grep -qE "$TEST_RE"; then
+		TESTS+=("$f")
+	elif printf '%s' "$f" | grep -qE "$SOURCE_RE"; then
 		SOURCES+=("$f")
 		# A reverted file takes its own tests with it, so a change that adds
 		# both a fix and an inline test cannot be split.
-		git show "HEAD:$f" 2>/dev/null | grep -q '#\[cfg(test)\]' && INLINE+=("$f")
-		;;
-	esac
+		if [ -n "$INLINE_RE" ] && git show "HEAD:$f" 2>/dev/null | grep -qE "$INLINE_RE"; then
+			INLINE+=("$f")
+		fi
+	fi
 done
 
 if [ ${#TESTS[@]} -eq 0 ]; then
@@ -96,11 +106,11 @@ done
 # usually because the branch's change reached main by another route while the
 # branch sat. Neither answer is true here: calling it a failure blames tests
 # that are fine, and calling it a pass claims evidence that was never gathered.
-# Exit 3 says so, and hypatia-verify reports it as its own outcome.
+# Exit 3 says so, and gate-verify reports it as its own outcome.
 if git diff --quiet HEAD -- "${SOURCES[@]}"; then
 	echo "UNPROVABLE: source already matches $BASE, so there is nothing to revert." >&2
 	echo "            Re-run against an earlier base to prove these tests," >&2
-	echo "            e.g. HYPATIA_PROVE_BASE=HEAD~1." >&2
+	echo "            e.g. PROVE_BASE=HEAD~1." >&2
 	exit 3
 fi
 
@@ -108,7 +118,8 @@ set +e
 if [ $# -gt 0 ]; then
 	"$@"
 else
-	hypatia-bench "$SRC"
+	# The project's own suite, so what proves a test here is what runs in CI.
+	(cd "$SRC" && eval "$(manifest "$SRC" prove.command)")
 fi
 rc=$?
 set -e
@@ -118,6 +129,22 @@ if [ $rc -eq 0 ]; then
 	echo "FAIL: the suite passes with the change reverted." >&2
 	echo "      The new tests do not distinguish the fix from the bug." >&2
 	exit 1
+fi
+
+# A suite that could not start also exits non-zero, and counting that as proof
+# is the one way this gate can report a result it did not measure. 127 and 126
+# are the shell saying the command is missing or not executable -- an absent
+# toolchain, a recipe that was renamed.
+#
+# It does not catch every such case: a suite that fails to compile is
+# indistinguishable here from one whose assertion fired, and both exit 1. What
+# makes the result trustworthy is that the same command passed on the
+# unmodified tree moments earlier, under whichever gate ran it.
+if [ $rc -eq 127 ] || [ $rc -eq 126 ]; then
+	echo
+	echo "UNPROVABLE: the test command did not run (exit $rc)." >&2
+	echo "            Nothing was measured, so this is neither a pass nor a failure." >&2
+	exit 3
 fi
 
 echo

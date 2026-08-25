@@ -1,0 +1,113 @@
+# Copy to `gates.toml` at the root of the project you want gated, and commit it
+# there.
+#
+# Nothing here may name a host. A gate asks for a *role* -- a machine that can
+# do a thing -- and the address for that role lives in the operator's own
+# environment file. See hosts.env.example.
+
+# What `gate-prove` reverts and what it keeps.
+[prove]
+# Extended regexes, matched against `git diff --name-only`.
+tests = '(^|/)tests/.*\.(rs|py|ts)$'
+# Schema and seed data are source: reverting a migration runs the suite against
+# the schema that existed without it. Omitting them makes every data-only
+# change unprovable.
+sources = '\.(rs|py|ts)$|^migrations/.*\.sql$'
+# A test inside the file being reverted goes away with it. Named so the tool can
+# report it rather than counting it as covered.
+inline-marker = '#\[cfg\(test\)\]'
+# Usually your full local suite.
+command = "just test"
+
+# `remote-task` syncs the tree to a host and runs one command there under a
+# lock. `bench` is the task run by default.
+[[task]]
+name = "bench"
+role = "builder"
+# Everything your CI does for a full check belongs behind one recipe, so this
+# and CI cannot drift apart.
+command = "just ci"
+# Optional. What `--full` runs instead.
+full-command = "just ci-full"
+# Optional. A lock file updated on the builder and never fetched leaves the
+# branch claiming a dependency set it does not have.
+fetch = ["Cargo.lock"]
+# Optional. Dropped and recreated before the command runs, so a branch never
+# inherits the schema of the one before it. Reaches the command as DATABASE_URL.
+# The tree name is appended to name-prefix, so two branches never share one.
+[task.database]
+container = "ci-postgres"
+user = "ci"
+port = 55432
+name-prefix = "ci"
+
+# Shares the tree and the lock with the task above. This one exists because a
+# compile-time-checked query cache cannot be regenerated without a database.
+[[task]]
+name = "refresh-query-cache"
+role = "builder"
+command = "just prepare-queries"
+fetch = [".sqlx"]
+[task.database]
+container = "ci-postgres"
+user = "ci"
+port = 55432
+name-prefix = "ci"
+
+# `remote-run` sends part of the tree to a host that has a tool this one lacks.
+# Send only what the recipe reads: the transport is tar over ssh, so the far end
+# needs no rsync.
+[[remote]]
+name = "chart"
+role = "cluster"
+send = ["deploy/charts", "justfile"]
+command = "just chart-check"
+
+[[remote]]
+name = "terraform"
+role = "cluster"
+send = ["deploy/terraform", "justfile"]
+command = "just terraform-check"
+
+# `gate-verify` runs every gate whose `when` matches the diff, in this order.
+# A gate that exercises something the diff did not touch is worse than no gate,
+# because it is green.
+#
+# `run` is a shell fragment. $REPO is the worktree under test.
+[[gates]]
+name = "bench"
+when = '^(crates/|src/|Cargo\.(toml|lock)$|migrations/|\.sqlx/)'
+run = "remote-task $REPO"
+
+[[gates]]
+name = "bench --full"
+when = '^(migrations/|docker/)'
+run = "remote-task --full $REPO"
+
+[[gates]]
+name = "chart"
+when = '^deploy/charts/'
+run = "remote-run chart $REPO"
+
+[[gates]]
+name = "terraform"
+when = '^deploy/terraform/'
+run = "remote-run terraform $REPO"
+
+# No `when`, so it runs on every branch.
+[[gates]]
+name = "artifacts"
+run = "redaction-check $REPO"
+
+# A gate may be any command. This one fails a branch that adds surface with no
+# test anywhere, which every build-and-migrate gate will happily approve.
+[[gates]]
+name = "untested surface"
+when = '^(src/routes/|crates/api-rest/src/routes/)'
+run = 'gate-untested $REPO --tests "(^|/)tests/"'
+
+# Slowest, so it is last.
+[[gates]]
+name = "prove"
+when = '(^|/)tests/'
+run = "gate-prove $REPO"

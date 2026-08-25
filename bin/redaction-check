@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Fail a branch that carries an agent's redaction artifact into the source.
 #
-# hermes rewrites secret-shaped text as `***` while it works, and on 2026-08-01
-# it committed that rewrite: `Authorization: Bearer <token>` became
+# An agent that rewrites secret-shaped text as `***` while it works will
+# eventually commit that rewrite: `Authorization: Bearer <token>` became
 # `Authorization: Bearer ***` in three doc lines across two READMEs. Nothing
 # else can see it -- the file still parses, the tests still pass, and the
 # sentence still reads like prose until someone tries to follow it.
@@ -11,7 +11,7 @@
 # deliberate emphasis, not this.
 set -euo pipefail
 
-BASE=${HYPATIA_VERIFY_BASE:-origin/main}
+BASE=${VERIFY_BASE:-origin/main}
 SRC=$(cd "${1:-$PWD}" && git rev-parse --show-toplevel)
 cd "$SRC"
 

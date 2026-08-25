@@ -19,7 +19,7 @@ LAST=$(cat "$STATE" 2>/dev/null || true)
 
 if [[ -z "$LAST" ]]; then
 	# First run: record where the trunk is and triage nothing. Triaging the whole
-	# queue from a standing start is hours of Athens time nobody asked for.
+	# queue from a standing start is hours of model time nobody asked for.
 	echo "$HEAD_NOW" >"$STATE"
 	exit 0
 fi

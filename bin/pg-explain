@@ -17,26 +17,17 @@
 # an unseeded EXPLAIN says nothing at all.
 set -euo pipefail
 
-# Host addresses belong to whoever runs this, not to the scripts. Set them in
-# ~/.config/hermes-tools/env (see hosts.env.example); sourced here rather than
-# left to the shell profile so cron jobs and agent subprocesses get them too.
-ENV_FILE=${HERMES_TOOLS_ENV:-$HOME/.config/hermes-tools/env}
-# An if, not `[ -r ] &&`: under `set -e` the && chain returns 1 when the file is
-# absent and takes the whole script with it.
-if [ -r "$ENV_FILE" ]; then
-	# shellcheck source=/dev/null
-	. "$ENV_FILE"
-fi
-
-REMOTE=${AI_SERV_SSH:?set AI_SERV_SSH to an ssh target for the build host: a Rust toolchain, docker and postgres}
-PG_CONTAINER=${HYPATIA_BENCH_PG:-hypatia-ci-pg}
+LIB=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)
+# shellcheck source=../lib/common.sh
+. "$LIB/common.sh"
 
 usage() {
 	cat <<'EOF'
-usage: hypatia-explain <worktree> [--seed FILE.sql] [--analyze] [SQL]
+usage: pg-explain <worktree> [--seed FILE.sql] [--analyze] [SQL]
 
 Reads SQL from the last argument or stdin. Applies the worktree's migrations to
-a per-worktree database first, so the schema matches the branch.
+a per-worktree database first, so the schema matches the branch. The database,
+its container and the migration directory come from gates.toml's `bench` task.
 
   --seed FILE   run FILE.sql before explaining; without rows every plan is a
                 sequential scan and the output is meaningless
@@ -46,7 +37,7 @@ EOF
 }
 
 [ $# -ge 1 ] || usage
-SRC=$(cd "$1" && git rev-parse --show-toplevel)
+SRC=$(repo_root "$1")
 shift
 
 SEED="" ANALYZE=""
@@ -62,35 +53,43 @@ done
 SQL=${1:-$(cat)}
 [ -n "$SQL" ] || { echo "no SQL given" >&2; usage; }
 
-NAME=$(basename "$SRC" | tr -c 'A-Za-z0-9_' '_' | tr -s '_' | sed 's/_$//')
+NAME=$(tree_name "$SRC")
 DB="explain_$NAME"
+
+# The same builder, container and role the bench task uses: a plan is only
+# meaningful against the postgres version the project actually runs.
+eval "$(python3 "$LIB/manifest.py" "$SRC" --task bench)"
+REMOTE=$(host_for "$TASK_ROLE")
+DB_CONTAINER=$TASK_DB_CONTAINER
+DB_USER=$TASK_DB_USER
+MIGRATIONS=$(manifest "$SRC" bench.migrations migrations)
 DEST="explain/$NAME"
 
 ssh "$REMOTE" "mkdir -p $DEST"
-rsync -a --delete "$SRC/migrations/" "$REMOTE:$DEST/migrations/"
+rsync -a --delete "$SRC/$MIGRATIONS/" "$REMOTE:$DEST/migrations/"
 [ -n "$SEED" ] && scp -q "$SEED" "$REMOTE:$DEST/seed.sql"
 
 # Rebuilt every run: a database carrying the previous branch's schema answers
 # confidently about an index that no longer exists.
-ssh "$REMOTE" "docker exec -i $PG_CONTAINER psql -U hypatia_ci -d postgres -q -v ON_ERROR_STOP=1 \
+ssh "$REMOTE" "docker exec -i $DB_CONTAINER psql -U $DB_USER -d postgres -q -v ON_ERROR_STOP=1 \
 	-c 'DROP DATABASE IF EXISTS $DB WITH (FORCE)' -c 'CREATE DATABASE $DB'"
 
 ssh "$REMOTE" "bash -euo pipefail -s" <<REMOTE_SCRIPT
 cd $DEST
 for m in migrations/*.sql; do
-	docker exec -i $PG_CONTAINER psql -U hypatia_ci -d $DB -q -v ON_ERROR_STOP=1 -f - < "\$m"
+	docker exec -i $DB_CONTAINER psql -U $DB_USER -d $DB -q -v ON_ERROR_STOP=1 -f - < "\$m"
 done
-$([ -n "$SEED" ] && echo "docker exec -i $PG_CONTAINER psql -U hypatia_ci -d $DB -q -v ON_ERROR_STOP=1 -f - < seed.sql")
+$([ -n "$SEED" ] && echo "docker exec -i $DB_CONTAINER psql -U $DB_USER -d $DB -q -v ON_ERROR_STOP=1 -f - < seed.sql")
 # </dev/null on every psql that reads no file: `docker exec -i` otherwise
 # inherits this script's stdin, which is the heredoc feeding it, and swallows
 # every remaining line -- the EXPLAINs included.
-docker exec -i $PG_CONTAINER psql -U hypatia_ci -d $DB -q -c 'ANALYZE' >/dev/null </dev/null
+docker exec -i $DB_CONTAINER psql -U $DB_USER -d $DB -q -c 'ANALYZE' >/dev/null </dev/null
 
 echo '=== plan as the planner chooses it ==='
-docker exec -i $PG_CONTAINER psql -U hypatia_ci -d $DB -X -q -c "EXPLAIN ($ANALYZE COSTS OFF) $SQL" </dev/null
+docker exec -i $DB_CONTAINER psql -U $DB_USER -d $DB -X -q -c "EXPLAIN ($ANALYZE COSTS OFF) $SQL" </dev/null
 
 echo '=== plan with sequential scans disabled (is any index usable at all?) ==='
-docker exec -i $PG_CONTAINER psql -U hypatia_ci -d $DB -X -q \
+docker exec -i $DB_CONTAINER psql -U $DB_USER -d $DB -X -q \
 	-c 'SET enable_seqscan = off' -c "EXPLAIN ($ANALYZE COSTS OFF) $SQL" </dev/null
 REMOTE_SCRIPT
 

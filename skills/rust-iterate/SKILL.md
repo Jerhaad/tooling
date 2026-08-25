@@ -1,6 +1,6 @@
 ---
 name: rust-iterate
-description: Iterative Rust development loop for the Hypatia workspace. Edit locally, then compile and unit-test inside a Rust container on the ai-serv build host over SSH — catching errors offline, spending no GitHub Actions minutes — and only push once it is green. Use whenever implementing or fixing a Rust change (a crate under crates/), especially when no local `cargo` is available on this host.
+description: Edit Rust locally, compile and unit-test it in a container on the builder over SSH, and push only once it is green. Use when implementing or fixing a Rust change, especially with no local `cargo`.
 version: 1.0.0
 metadata:
   hermes:
@@ -10,13 +10,13 @@ metadata:
 
 # Rust iterate (`rust-iterate`)
 
-Write Rust, compile it on ai-serv, read the compiler, fix, repeat — then push
+Write Rust, compile it on the builder, read the compiler, fix, repeat — then push
 once it builds and its tests pass. This host has no `cargo`, so guessing at an
 API and pushing to find out wastes CI runs. The compiler is the authority;
 reach it locally.
 
-The build host is whatever `$AI_SERV_SSH` names -- an ssh target set in
-`~/.config/hermes-tools/env`. It has a native Rust toolchain
+The build host is whatever `$HOST_BUILDER` names -- an ssh target set in
+`~/.config/agent-tools/env`. It has a native Rust toolchain
 (`cargo`/`rustc`, stable via rustup) and the horsepower to compile the workspace.
 You run `cargo` there over SSH; its crate cache lives in `~/.cargo` and the build
 output under the synced tree's `target/`, so repeat builds are incremental.
@@ -30,25 +30,25 @@ trigger CI — only `main` pushes and open PRs do — so iterate freely).
 
 **1. Edit** the source in `WT`.
 
-**2. Sync to ai-serv** (rsync over SSH — only changed files move, so this is
+**2. Sync to the builder** (rsync over SSH — only changed files move, so this is
 near-instant after the first pass):
 
 ```bash
 rsync -a --delete --exclude=.git --exclude=target \
   -e "ssh -o BatchMode=yes" \
-  "$WT/" "$AI_SERV_SSH":/tmp/hermes-build/
+  "$WT/" "$HOST_BUILDER":/tmp/hermes-build/
 ```
 
 The trailing slash on `"$WT/"` copies the tree's contents into the target.
-`--delete` removes files on ai-serv that you have deleted locally, so a renamed
+`--delete` removes files on the builder that you have deleted locally, so a renamed
 or removed module cannot linger and mask an error. Excluding `target` protects
 the remote build cache: `--delete` never touches an excluded path, so the
 incremental `target/` survives between iterations while everything else mirrors.
 
-**3. Compile** on ai-serv and read the errors:
+**3. Compile** on the builder and read the errors:
 
 ```bash
-ssh -o BatchMode=yes "$AI_SERV_SSH" \
+ssh -o BatchMode=yes "$HOST_BUILDER" \
   'cd /tmp/hermes-build && SQLX_OFFLINE=true \
      cargo check --workspace --all-targets 2>&1 | tail -40'
 ```
@@ -60,7 +60,7 @@ back to step 2. Do not proceed until this is clean.
 **4. Unit-test** the crate once it compiles (offline, no database needed):
 
 ```bash
-ssh -o BatchMode=yes "$AI_SERV_SSH" \
+ssh -o BatchMode=yes "$HOST_BUILDER" \
   "cd /tmp/hermes-build && SQLX_OFFLINE=true cargo test -p $CRATE --lib 2>&1 | tail -30"
 ```
 
@@ -94,7 +94,7 @@ but avoiding them saves a round:
 ## Housekeeping
 - One iterative build at a time — the loop reuses `/tmp/hermes-build`.
 - `target/` is owned by your SSH user (no container), so a plain
-  `rm -rf /tmp/hermes-build` on ai-serv reclaims the space when you are done.
+  `rm -rf /tmp/hermes-build` on the builder reclaims the space when you are done.
 
 ## Cap the loop
 Give a fix a few attempts, not infinite. If the same error resists three edits,

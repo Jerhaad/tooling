@@ -13,7 +13,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 WORK=${PIPELINE_REVIEW_WORK:?set PIPELINE_REVIEW_WORK to a checkout the reviewer may reset}
 STATE=$STATE_DIR/last-reviewed
 HERMES=$AGENT
-# Falls back to Logan when the metered lane is close to its ceiling.
+# Falls back to the local lane when the metered one is close to its ceiling.
 PICK="$PIPELINE_DIR/pick_lane.py"
 PROFILE=$("$PICK" --fallback default)
 mkdir -p "$(dirname "$STATE")"

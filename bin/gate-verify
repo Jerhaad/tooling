@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# Run the gates that can see what a branch actually changed.
+#
+# Choosing the gate by hand is where this goes wrong. A Helm template reached
+# main because a Rust bench approved it; a misplaced `--no-build` reached CI
+# because a compose check ran its own spelling of the command. Both times the
+# gate was green and blind. Deriving the gate list from the diff removes the
+# choice.
+#
+# Runs every applicable gate rather than stopping at the first failure, so one
+# run reports everything wrong with the branch.
+#
+# The gates themselves live in the project's gates.toml. This decides which of
+# them the diff has earned, runs them, and reports.
+set -euo pipefail
+
+LIB=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)
+# shellcheck source=../lib/common.sh
+. "$LIB/common.sh"
+
+BASE=${VERIFY_BASE:-origin/main}
+# Exported, not just read: the gates below are separate processes that each
+# diff the branch themselves, and a gate reverting against a different base than
+# the one that selected it is wrong in a way neither of them can see.
+export VERIFY_BASE=$BASE
+
+usage() { echo "usage: gate-verify <worktree> [--skip NAME]... [--list]" >&2; exit 2; }
+[ $# -ge 1 ] || usage
+SRC=$(repo_root "$1")
+shift
+LIST=0 SKIP=()
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--skip) [ $# -ge 2 ] || usage; SKIP+=("$2"); shift 2 ;;
+	--list) LIST=1; shift ;;
+	*) usage ;;
+	esac
+done
+
+cd "$SRC"
+mapfile -t CHANGED < <(git diff --name-only "$BASE"...HEAD)
+[ ${#CHANGED[@]} -gt 0 ] || { echo "no changes against $BASE" >&2; exit 2; }
+
+eval "$(manifest "$SRC" gates)"
+
+skipped() {
+	local n
+	for n in ${SKIP[@]+"${SKIP[@]}"}; do [ "$n" = "$1" ] && return 0; done
+	return 1
+}
+
+NAMES=() GATES=()
+for i in "${!GATE_NAMES[@]}"; do
+	name=${GATE_NAMES[$i]} when=${GATE_WHEN[$i]}
+	skipped "$name" && continue
+	# An empty `when` is a gate with no precondition -- cheap and
+	# language-independent, so it runs on every branch.
+	if [ -n "$when" ] && ! printf '%s\n' "${CHANGED[@]}" | grep -qE "$when"; then
+		continue
+	fi
+	NAMES+=("$name")
+	# $REPO is what a manifest's `run` interpolates; exported so a gate that
+	# shells out again still sees it.
+	GATES+=("REPO=$(printf '%q' "$SRC") ; ${GATE_RUN[$i]}")
+done
+
+if [ ${#GATES[@]} -eq 0 ]; then
+	echo "no gate matches the changed paths:" >&2
+	printf '  %s\n' "${CHANGED[@]}" >&2
+	echo "Add one to gates.toml rather than shipping unverified." >&2
+	exit 1
+fi
+
+printf '==> %d file(s) changed; running: %s\n\n' "${#CHANGED[@]}" "$(IFS=, ; echo "${NAMES[*]}")"
+
+if [ "$LIST" = 1 ]; then
+	for i in "${!GATES[@]}"; do printf '  %-18s %s\n' "${NAMES[$i]}" "${GATE_RUN[$i]}"; done
+	exit 0
+fi
+
+failed=() unprovable=()
+for i in "${!GATES[@]}"; do
+	echo "########## ${NAMES[$i]} ##########"
+	set +e
+	eval "${GATES[$i]}"
+	rc=$?
+	set -e
+	# 3 is a gate saying it could not answer, which is neither a pass nor a
+	# failure. Reported on its own line so it cannot be read as either: a gate
+	# that gathered no evidence must not appear in a list headed "passed".
+	if [ $rc -eq 3 ]; then
+		unprovable+=("${NAMES[$i]}")
+	elif [ $rc -ne 0 ]; then
+		failed+=("${NAMES[$i]}")
+	fi
+	echo
+done
+
+if [ ${#failed[@]} -gt 0 ]; then
+	printf '==> FAILED: %s\n' "$(IFS=, ; echo "${failed[*]}")" >&2
+	[ ${#unprovable[@]} -gt 0 ] && printf '==> UNPROVABLE: %s\n' "$(IFS=, ; echo "${unprovable[*]}")" >&2
+	exit 1
+fi
+if [ ${#unprovable[@]} -gt 0 ]; then
+	printf '==> UNPROVABLE: %s\n' "$(IFS=, ; echo "${unprovable[*]}")" >&2
+	passed=()
+	for n in "${NAMES[@]}"; do
+		skip=0
+		for u in "${unprovable[@]}"; do [ "$n" = "$u" ] && skip=1; done
+		[ $skip -eq 0 ] && passed+=("$n")
+	done
+	[ ${#passed[@]} -gt 0 ] && echo "==> gates passed: $(IFS=, ; echo "${passed[*]}")"
+	exit 0
+fi
+echo "==> all gates passed: $(IFS=, ; echo "${NAMES[*]}")"

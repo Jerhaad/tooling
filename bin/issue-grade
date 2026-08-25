@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""Grade open Hypatia issues by how much work and how much context they need.
+"""Grade open issues by how much work and how much context each one needs.
 
-The point is routing, not estimation. Athens serves a 64K context against a
-20 GiB model on a 32 GiB box and cannot be given more, so the implement stream
-that runs there needs the small end of the queue and Logan needs the rest. Logan
-then splits again: a dense 27B for work worth the wait, a fast MoE for the rest.
-Without a grade the two streams race for whatever is top of the list and Athens
-draws issues it cannot hold.
+The point is routing, not estimation. An implement lane backed by a short
+context window cannot hold an issue that has to be understood across several
+subsystems, however small the edit turns out to be; a lane backed by a slow,
+careful model is wasted on a one-line config change. Without a grade the lanes
+race for whatever is top of the list and the smallest one draws work it cannot
+hold.
 
-Talks to the model directly rather than through `hermes`: this is a pure
+Talks to the model directly rather than through an agent: this is a pure
 classification with no tool use, and an agent loop per issue would spend more
-time starting up than thinking. Requests are sequential because llama-swap runs
---parallel 1 -- concurrency here would queue on the server and gain nothing.
+time starting up than thinking. Requests are sequential because a single-slot
+server gains nothing from concurrency -- raise --concurrency if yours has more.
 
 Grades from the issue text alone, the way a human does at triage. That is a
-hint, not a gate: an issue graded small that turns out large produces a run with
-no commit, which the nightly script already reports.
+hint, not a gate: an issue graded small that turns out large produces a run
+with no commit, which the scheduling side already reports.
 """
 import argparse
 import json
@@ -28,17 +28,15 @@ import time
 import urllib.error
 import urllib.request
 
-# The grading model's endpoint belongs to whoever runs this. Same variable the
-# shell tools read from ~/.config/hermes-tools/env.
-ATHENS = os.environ.get("ATHENS_URL")
-MODEL = "qwen3.6-35b-a3b"
-OUT = pathlib.Path.home() / "queue" / "size"
+# The grading model's endpoint belongs to whoever runs this. Same file the shell
+# tools read, so one place names every host.
+GRADER_URL = os.environ.get("GRADER_URL")
+OUT = pathlib.Path(os.environ.get("GRADE_DIR", pathlib.Path.home() / "queue" / "size"))
 
-# Anchored to this repository so the grades mean the same thing run to run. An
-# unanchored "small/medium/large" drifts every time the model is asked.
-PROMPT = """Grade this GitHub issue for an implementation agent working on Hypatia, a
-Rust workspace (axum API, sqlx/Postgres, a React SPA) with a plain-SQL migrations
-directory.
+# Anchored to one project so the grades mean the same thing run to run. An
+# unanchored "small/medium/large" drifts every time the model is asked, which is
+# why {project} is required rather than defaulted to something vague.
+PROMPT = """Grade this GitHub issue for an implementation agent working on {project}.
 
 Answer with exactly four lines and nothing else:
 
@@ -73,23 +71,27 @@ FIELDS = {
 }
 
 
-def route(size, context):
-    """Which hermes profile should implement an issue of this shape.
+def route(size, context, lanes):
+    """Which implement lane should take an issue of this shape.
 
-    Names a `hermes-implement --profile` value; "default" means passing none,
-    which is the root profile and the dense 27B.
+    The two axes do not weigh the same, and that asymmetry is the whole rule.
+    Context decides which lanes are eligible at all: a lane whose window cannot
+    hold the reading is disqualified however small the edit is. Size only then
+    chooses among what is left, because a slower and more careful model earns
+    its time on judgement calls and wastes it on mechanical work.
 
-    Three lanes, and the axes do not weigh the same. Context decides the host --
-    Athens serves 64K and cannot be given more, so anything needing to read
-    around the repository is off it whatever its size. Size then decides which
-    Logan model: the dense 27B is ~2.6x slower than the MoE and better at the
-    judgement calls that small mechanical work does not involve.
+    Lanes are tried in order and the first that admits both axes wins, so the
+    most constrained lane belongs first in the config.
     """
-    if size == "XS" and context == "low":
-        return "athens"
-    if size in ("XS", "S") and context in ("low", "medium"):
-        return "fast"
-    return "default"
+    order = {"XS": 0, "S": 1, "M": 2, "L": 3}
+    ctx_order = {"low": 0, "medium": 1, "high": 2}
+    for lane in lanes:
+        if (order[size] <= order[lane["max-size"]]
+                and ctx_order[context] <= ctx_order[lane["max-context"]]):
+            return lane["name"]
+    # The last lane is the one with no ceiling; a config without one is a config
+    # that can silently drop an issue.
+    return lanes[-1]["name"] if lanes else "default"
 
 
 def issues(repo):
@@ -100,11 +102,12 @@ def issues(repo):
     return json.loads(out)
 
 
-def grade(issue, retries=2):
+def grade(issue, model, project, retries=2):
     body = (issue.get("body") or "").strip()[:6000]
-    prompt = PROMPT.format(number=issue["number"], title=issue["title"], body=body)
+    prompt = PROMPT.format(number=issue["number"], title=issue["title"],
+                           body=body, project=project)
     payload = json.dumps({
-        "model": MODEL,
+        "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 150,
         "temperature": 0,
@@ -112,14 +115,16 @@ def grade(issue, retries=2):
         # lands in `reasoning_content` while `content` comes back empty --
         # indistinguishable from a broken model unless you read the raw
         # response. It also spends roughly three times the tokens to reach the
-        # same four lines. `/no_think` and `reasoning_effort` are both ignored
-        # by this llama.cpp build; only the template kwarg works.
+        # same four lines. `/no_think` and `reasoning_effort` are ignored by
+        # some llama.cpp builds; the template kwarg is the one that lands. A
+        # server that rejects unknown kwargs needs it removed.
         "chat_template_kwargs": {"enable_thinking": False},
     }).encode()
     for attempt in range(retries + 1):
         try:
             req = urllib.request.Request(
-                ATHENS, data=payload, headers={"Content-Type": "application/json"})
+                GRADER_URL, data=payload,
+                headers={"Content-Type": "application/json"})
             text = json.loads(urllib.request.urlopen(req, timeout=300).read()
                               )["choices"][0]["message"]["content"]
         except (urllib.error.URLError, TimeoutError, KeyError) as e:
@@ -140,15 +145,48 @@ def grade(issue, retries=2):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--repo", default=os.environ.get("HYPATIA_REPO"),
-                    help="owner/name; defaults to $HYPATIA_REPO, else the "
+    ap.add_argument("--repo", default=os.environ.get("DEFAULT_GH_REPO"),
+                    help="owner/name; defaults to $DEFAULT_GH_REPO, else the "
                          "current checkout's origin remote")
+    ap.add_argument("--model", default=os.environ.get("GRADER_MODEL"),
+                    help="model id to ask; defaults to $GRADER_MODEL")
+    ap.add_argument("--project", default=os.environ.get("GRADE_PROJECT"),
+                    help="one line describing the project, e.g. 'a Rust "
+                         "workspace (axum API, sqlx/Postgres, a React SPA)'. "
+                         "Anchors the grades so they mean the same thing run "
+                         "to run; defaults to $GRADE_PROJECT")
+    ap.add_argument("--lanes", default=os.environ.get("GRADE_LANES"),
+                    help="implement lanes, most constrained first, as "
+                         "name:max-size:max-context[,...] -- e.g. "
+                         "'small:XS:low,fast:S:medium,default:L:high'. The "
+                         "last lane should have no ceiling, or an issue that "
+                         "exceeds every lane has nowhere to go; defaults to "
+                         "$GRADE_LANES")
     ap.add_argument("--force", action="store_true",
                     help="re-grade issues whose grade is already current")
     ap.add_argument("--limit", type=int, default=0, help="grade at most N issues")
     args = ap.parse_args()
-    if not ATHENS:
-        sys.exit("set ATHENS_URL to an OpenAI-compatible chat-completions endpoint")
+    if not GRADER_URL:
+        sys.exit("set GRADER_URL to an OpenAI-compatible chat-completions endpoint")
+    if not args.model:
+        sys.exit("set --model or $GRADER_MODEL to the model id to grade with")
+    if not args.project:
+        sys.exit("set --project or $GRADE_PROJECT: an ungrounded grade drifts "
+                 "every time the model is asked")
+    if not args.lanes:
+        sys.exit("set --lanes or $GRADE_LANES, e.g. "
+                 "'small:XS:low,fast:S:medium,default:L:high'")
+    lanes = []
+    for spec in args.lanes.split(","):
+        try:
+            name, max_size, max_context = spec.strip().split(":")
+        except ValueError:
+            sys.exit(f"--lanes: {spec!r} is not name:max-size:max-context")
+        if max_size not in ("XS", "S", "M", "L"):
+            sys.exit(f"--lanes: {max_size!r} is not one of XS, S, M, L")
+        if max_context not in ("low", "medium", "high"):
+            sys.exit(f"--lanes: {max_context!r} is not one of low, medium, high")
+        lanes.append({"name": name, "max-size": max_size, "max-context": max_context})
     if not args.repo:
         args.repo = subprocess.run(
             ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
@@ -170,7 +208,7 @@ def main():
             except (json.JSONDecodeError, OSError):
                 pass
 
-        parsed, err = grade(issue)
+        parsed, err = grade(issue, args.model, args.project)
         if err:
             print(f"#{n}: {err}", file=sys.stderr)
             failed += 1
@@ -185,7 +223,7 @@ def main():
             "context": parsed["Context"],
             "files": int(parsed["Files"]) if parsed["Files"] else None,
             "reason": parsed["Reason"],
-            "profile": route(parsed["Size"], parsed["Context"]),
+            "lane": route(parsed["Size"], parsed["Context"], lanes),
         }
         path.write_text(json.dumps(record, indent=2) + "\n")
         graded += 1
