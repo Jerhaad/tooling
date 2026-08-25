@@ -58,7 +58,7 @@ the first failure.
 |---|---|
 | `remote-task`     | sync the tree to a host, run a project command under a lock, fetch artefacts back |
 | `remote-run`      | send part of the tree to a host that has a tool this one lacks, run the project's recipe there |
-| `gate-prove`      | revert the source, keep the tests, require a failure |
+| `gate-prove`      | revert the source, keep the tests, require a failure — the tests depend on the change, not that the change is right |
 | `gate-untested`   | fail a branch that adds surface with no test anywhere |
 | `redaction-check` | fail a branch carrying an agent's `***` rewrite into the source |
 | `pg-explain`      | show whether an index is usable by a query, and whether the planner picks it |
@@ -96,8 +96,10 @@ other omission fails loudly at startup.
 
 ## Limits
 
-`gate-prove` cannot tell a suite that fails to compile from one whose assertion
-fired — both exit 1. Its verdict rests on that command having passed on the
+`gate-prove` answers whether the tests depend on the diff, never whether the
+diff is correct: a wrong fix and its test fail together when reverted and land
+as a pass. It also cannot tell a suite that fails to compile from one whose
+assertion fired — both exit 1. Its verdict rests on that command having passed on the
 unmodified tree first. A command that could not start is reported as unprovable.
 
 Each gate inherits the blind spots of the command it runs. `gate-verify` refuses
