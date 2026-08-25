@@ -28,6 +28,19 @@ def bash_array(name: str, values) -> str:
     return f"declare -a {name}=({items})"
 
 
+# A missing required field is a manifest the reader cannot read, not an entry
+# the script can probe later: name the table, the entry and the field so the
+# operator knows what to add. Optional fields below use .get(key, "") so they
+# reach bash as empty strings; this only fires on fields the caller refuses to
+# proceed without.
+def require(entry: dict, table: str, entry_name: object, *fields: str) -> None:
+    for f in fields:
+        # `in` rather than `entry[f]`: a present-but-empty value is a real
+        # value, and a value the caller can fix without a guess.
+        if f not in entry:
+            sys.exit(f"{MANIFEST}: [[{table}]] {entry_name!r} missing required {f!r}")
+
+
 def main() -> None:
     if len(sys.argv) < 3:
         sys.exit("usage: manifest.py <repo> <query> [default]")
@@ -40,20 +53,28 @@ def main() -> None:
     if query == "--remote":
         want = default
         for entry in doc.get("remote", []):
-            if entry.get("name") == want:
-                print(f"REMOTE_ROLE={shlex.quote(entry['role'])}")
-                print(f"REMOTE_COMMAND={shlex.quote(entry['command'])}")
-                print(bash_array("REMOTE_SEND", entry.get("send", [])))
-                return
+            if entry.get("name") != want:
+                continue
+            # `name` is how the caller picked this entry; `role`, `command`, `send`
+            # are what the caller cannot proceed without. Other fields, if any,
+            # are optional.
+            require(entry, "remote", want, "name", "role", "command", "send")
+            print(f"REMOTE_ROLE={shlex.quote(entry['role'])}")
+            print(f"REMOTE_COMMAND={shlex.quote(entry['command'])}")
+            print(bash_array("REMOTE_SEND", entry.get("send", [])))
+            return
         names = ", ".join(e.get("name", "?") for e in doc.get("remote", [])) or "none"
         sys.exit(f"{MANIFEST}: no [[remote]] named {want!r} (have: {names})")
 
     if query == "--task":
-        # Every field but name/role/command is optional and reaches bash empty.
+        # `name`, `role`, `command` are required. Every other field is optional
+        # and reaches bash empty below -- including `full-command`, `fetch`,
+        # and the `database.*` block, which the caller probes for emptiness.
         want = default
         for entry in doc.get("task", []):
             if entry.get("name") != want:
                 continue
+            require(entry, "task", want, "name", "role", "command")
             db = entry.get("database", {})
             for var, val in [
                 ("TASK_ROLE", entry["role"]),

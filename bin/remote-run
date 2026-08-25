@@ -26,7 +26,13 @@ SRC=$(repo_root "${2:-$PWD}")
 
 # Selected by name out of the manifest's [[remote]] list, so adding one is a
 # manifest edit and never a change here.
-eval "$(python3 "$LIB/manifest.py" "$SRC" --remote "$NAME")"
+# Captured to a variable rather than eval'd inline so the reader's non-zero
+# exit code reaches `set -e`. An `eval $(...)` of an empty string returns 0,
+# so the manifest's refusal would otherwise reach the next access to a
+# REMOTE_* variable as a "unbound variable" shell error pointing at the bash
+# line, not at the manifest field that is missing.
+output=$(python3 "$LIB/manifest.py" "$SRC" --remote "$NAME")
+eval "$output"
 
 REMOTE=$(host_for "$REMOTE_ROLE")
 DEST="remote-run/$(tree_name "$SRC")/$NAME"
