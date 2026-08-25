@@ -14,7 +14,11 @@
 # the branch before it.
 set -euo pipefail
 
-LIB=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)
+# readlink -f, not `cd -P`: these are installed as symlinks into a bin
+# directory on PATH, and BASH_SOURCE holds the symlink's own path. `cd -P`
+# resolves symlinks inside the path it is given, not the script's location, so
+# ../lib resolved against the link and landed outside the checkout.
+LIB=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)
 # shellcheck source=../lib/common.sh
 . "$LIB/common.sh"
 
