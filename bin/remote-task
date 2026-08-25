@@ -35,7 +35,13 @@ set -- "${ARGS[@]+"${ARGS[@]}"}"
 SRC=$(repo_root "${1:-$PWD}")
 NAME=$(tree_name "$SRC")
 
-eval "$(python3 "$LIB/manifest.py" "$SRC" --task "$TASK")"
+# Captured to a variable rather than eval'd inline so the reader's non-zero
+# exit code reaches `set -e`. An `eval $(...)` of an empty string returns 0,
+# so the manifest's refusal would otherwise reach the next access to a TASK_*
+# variable as a "unbound variable" shell error pointing at the bash line, not
+# at the manifest field that is missing.
+output=$(python3 "$LIB/manifest.py" "$SRC" --task "$TASK")
+eval "$output"
 [ "$FULL" = 1 ] && [ -n "$TASK_FULL_COMMAND" ] && TASK_COMMAND=$TASK_FULL_COMMAND
 REMOTE=$(host_for "$TASK_ROLE")
 
