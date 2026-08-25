@@ -62,7 +62,12 @@ DB="explain_$NAME"
 
 # The same builder, container and role the bench task uses: a plan is only
 # meaningful against the postgres version the project actually runs.
-eval "$(python3 "$LIB/manifest.py" "$SRC" --task bench)"
+# Captured to a variable rather than eval'd inline so the reader's non-zero
+# exit code reaches `set -e`. An `eval $(...)` of an empty string returns 0, so
+# the manifest's refusal would otherwise reach the next access to a TASK_*
+# variable as an unbound-variable error naming a bash line, not the field.
+output=$(python3 "$LIB/manifest.py" "$SRC" --task bench)
+eval "$output"
 REMOTE=$(host_for "$TASK_ROLE")
 DB_CONTAINER=$TASK_DB_CONTAINER
 DB_USER=$TASK_DB_USER
