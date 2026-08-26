@@ -77,9 +77,23 @@ $BRANCH, based on the remote default branch. Skip the skill's ingest phase --
 the work item is the issue below, not a REVIEW_NOTES.md file -- and do not
 create, switch, or push any branch. Commit your work on $BRANCH and stop.
 
-**Every file you touch and every git command you run belongs to $WORKTREE.**
-That directory is a git worktree of the same repository your project settings
-point at, and it is not the same checkout. Editing the other one puts your
+**Every file you write belongs to $WORKTREE.** Not only source files, and not
+only git: nothing outside that directory is yours to change. Config files,
+dotfiles, shared state, another worktree, anything under ~/.config or ~/.hermes
+-- all off limits, even when changing one would make your task succeed. Other
+work runs on this machine while you do, and a file outside your worktree is
+something someone else is depending on right now.
+
+**If a tool you need is broken, report it and stop. Do not repair it.** You may
+be right about the cause: a previous run diagnosed a real bug in the
+verification tooling correctly, wrote a workaround into a shared config file,
+and carried on. That workaround changed the conditions of every other run on
+this machine, hid the bug from the people who could fix it properly, and was
+found days later by accident. A blocked task that reports why is a good
+outcome. Put it in your handover and leave the environment as you found it.
+
+That directory is also a git worktree of the same repository your project
+settings point at, and it is not the same checkout. Editing the other one puts your
 commit on a branch someone else is reading and leaves their checkout switched
 underneath them. If a git command needs a repository, pass git's -C option and
 this path. Do not cd elsewhere, and do not trust a remembered working directory
@@ -100,6 +114,9 @@ EOF
 )
 
 BASE=$(git rev-parse HEAD)
+# UTC, matching how hermes stamps last_edit_at, so the stray-write check below
+# sees only this run.
+START_ISO=$(date -u +%Y-%m-%dT%H:%M:%S)
 ATTEMPTS=${HERMES_IMPLEMENT_ATTEMPTS:-4}
 
 # A model that answers with prose instead of a tool call ends the run, so an
@@ -142,6 +159,36 @@ if [[ "$(git rev-parse HEAD)" == "$BASE" ]]; then
 	echo "FAILED: $ATTEMPTS attempts left $BRANCH at $BASE" >&2
 elif [[ ! -s "$WORK/HANDOVER.md" ]]; then
 	echo "WARNING: $BRANCH has a commit but no handover was written" >&2
+fi
+
+# What the run actually wrote, which the handover is not a complete account of:
+# one lane created and deleted a scratch file its handover never mentioned, and
+# another edited a shared config file while reporting only its issue. hermes
+# records every edited path per session here, so this is the only place the
+# question can be answered after the fact.
+EVIDENCE=${HERMES_HOME:-$HOME/.hermes}
+[[ -n "$PROFILE" ]] && EVIDENCE="$EVIDENCE/profiles/$PROFILE"
+EVIDENCE="$EVIDENCE/verification_evidence.db"
+if [[ -r "$EVIDENCE" ]]; then
+	python3 - "$EVIDENCE" "$WORKTREE" "$START_ISO" <<'PYEOF' >&2 || true
+import json, sqlite3, sys
+db, worktree, since = sys.argv[1], sys.argv[2].rstrip("/"), sys.argv[3]
+try:
+    c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    rows = c.execute(
+        "select session_id, changed_paths_json from verification_state"
+        " where root = ? and last_edit_at >= ?", (worktree, since)).fetchall()
+except sqlite3.Error:
+    sys.exit(0)
+stray = sorted({p for _, j in rows for p in json.loads(j or "[]")
+                if not p.startswith(worktree + "/")})
+if stray:
+    print(f"WARNING: this run wrote {len(stray)} path(s) outside {worktree}:")
+    for p in stray:
+        print(f"  {p}")
+    print("  A lane may only write inside its worktree. Review before trusting"
+          " this run, and before trusting anything else that reads those paths.")
+PYEOF
 fi
 
 echo "$WORK"
