@@ -51,6 +51,13 @@ STRANDED=()
 for wt in "$WT_ROOT"/${BRANCH_PREFIX}*; do
 	[ -d "$wt" ] || continue
 	n=${wt##*/${BRANCH_PREFIX}}
+	# Only trees this job created. The name and the branch say an issue is being
+	# worked on, not by whom: a person's checkout matches the same glob, and the
+	# repair below runs a --yolo agent in the tree and then `add -A` plus an
+	# amend over whatever it finds. Adopting someone's working tree that way
+	# rewrites their commit and opens a PR from it. The marker lives in the
+	# worktree's gitdir rather than the tree, where `add -A` cannot sweep it in.
+	[ -f "$(git -C "$wt" rev-parse --git-dir 2>/dev/null)/nightly-owned" ] || continue
 	git -C "$REPO" rev-parse --verify --quiet "origin/${BRANCH_PREFIX}$n" >/dev/null && continue
 	git -C "$wt" log --oneline origin/main..HEAD 2>/dev/null | grep -q . || continue
 	# The same guard the selection loop below uses, and leaving it out here
@@ -161,6 +168,10 @@ if ! git -C "$REPO" worktree add -q -b "$branch" "$worktree" origin/main 2>/tmp/
 	echo "issue $issue: could not create worktree $worktree: $(tail -1 /tmp/nightly-wt-$issue.err)" >&2
 	exit 0
 fi
+# Claims the tree for the resume scan above. Written after the add so a failed
+# add leaves no claim, and inside the gitdir so a repair's `add -A` cannot
+# stage it.
+: >"$(git -C "$worktree" rev-parse --git-dir)/nightly-owned"
 
 verify="$VERIFY $worktree"
 mechanisms=$(sed -n '/^## Candidate mechanisms/,/^## Verdict on scope/p' "$QUEUE/${BRANCH_PREFIX}$issue.md")

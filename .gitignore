@@ -7,3 +7,9 @@ bin/terraform
 hosts.env
 *.env
 !hosts.env.example
+
+# Bytecode from lib/ and the test files that import it. Nothing here is run
+# often enough for a stale cache to matter, and a lane's `add -A` will commit
+# one otherwise.
+__pycache__/
+*.pyc
