@@ -130,7 +130,7 @@ run() {
 	# --no-restore-cwd: a resumed session otherwise returns to the directory it
 	# recorded, which for this agent is its bound project folder rather than the
 	# worktree it was handed. It has committed in the wrong repository that way.
-	timeout "$TIMEOUT" "$HERMES" -m hermes_cli.main ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} "$@" --no-restore-cwd -z "$prompt" --skills swe-updater --yolo \
+	timeout "$TIMEOUT" "$HERMES" -m hermes_cli.main ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} "$@" --no-restore-cwd -z "$prompt" --skills swe-updater,swe-tester --yolo \
 		>"$WORK/$label.stdout" 2>"$WORK/$label.stderr"
 	local rc=$?
 	set -e
