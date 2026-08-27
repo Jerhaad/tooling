@@ -79,12 +79,15 @@ ssh "$REMOTE" "docker exec -i $DB_CONTAINER psql -U $DB_USER -d postgres -q -v O
 	-c 'DROP DATABASE IF EXISTS $DB WITH (FORCE)' -c 'CREATE DATABASE $DB'"
 
 ssh "$REMOTE" "bash -euo pipefail -s" <<REMOTE_SCRIPT
+# A non-interactive ssh gets none of the remote's own toolchain directories, so
+# without this only /usr/bin resolves. Same as remote-task and remote-run.
+export PATH=$REMOTE_PATH
 cd $DEST
 for m in migrations/*.sql; do
 	docker exec -i $DB_CONTAINER psql -U $DB_USER -d $DB -q -v ON_ERROR_STOP=1 -f - < "\$m"
 done
 $([ -n "$SEED" ] && echo "docker exec -i $DB_CONTAINER psql -U $DB_USER -d $DB -q -v ON_ERROR_STOP=1 -f - < seed.sql")
-# </dev/null on every psql that reads no file: `docker exec -i` otherwise
+# </dev/null on every psql that reads no file: docker exec -i otherwise
 # inherits this script's stdin, which is the heredoc feeding it, and swallows
 # every remaining line -- the EXPLAINs included.
 docker exec -i $DB_CONTAINER psql -U $DB_USER -d $DB -q -c 'ANALYZE' >/dev/null </dev/null
