@@ -23,6 +23,31 @@ from pathlib import Path
 HASH_SUFFIXES = {".toml", ".yml", ".yaml", ".sh", ".cfg", ".ini", ".cmake"}
 SLASH_SUFFIXES = {".h", ".hpp", ".cc", ".cpp", ".hujson", ".js", ".ts", ".tsx"}
 PROSE_SUFFIXES = {".py", ".md"} | HASH_SUFFIXES | SLASH_SUFFIXES
+# Interpreters whose scripts are conventionally installed without a suffix, so
+# the shebang is the only thing that says what the file is.
+SHEBANG_HASH = ("sh", "bash", "zsh", "ksh", "dash", "python", "ruby", "perl")
+
+
+def hash_shebang(path: Path, rev: str | None = None) -> bool:
+    """Whether a suffixless file's first line names a #-commenting interpreter.
+
+    A tool installed on PATH usually has no extension -- `bin/gate-verify`, not
+    `bin/gate-verify.sh` -- so suffix alone skips exactly the scripts most
+    likely to be read by someone other than their author.
+    """
+    if path.suffix:
+        return False
+    try:
+        if rev:
+            first = run(["git", "show", f"{rev}:{path}"]).split("\n", 1)[0]
+        else:
+            with path.open("r", errors="replace") as fh:
+                first = fh.readline()
+    except (OSError, UnicodeDecodeError, subprocess.CalledProcessError):
+        return False
+    if not first.startswith("#!"):
+        return False
+    return any(name in first for name in SHEBANG_HASH)
 
 # Ranked most-mechanical first: a duplicate is a fact in N places, an oversize block
 # is only a suspicion.
@@ -322,7 +347,7 @@ def collect(
         except ValueError:
             rel = str(path)
         lines = src.splitlines()
-        if path.suffix == ".py":
+        if path.suffix == ".py" or (not path.suffix and src.startswith("#!") and "python" in src.split("\n", 1)[0]):
             found, raised = python_blocks(rel, src)
         elif path.suffix == ".md":
             found, raised = markdown_blocks(rel, src), ""
@@ -444,7 +469,8 @@ def main() -> int:
         candidates = [
             Path(p)
             for p in touched
-            if Path(p).suffix in PROSE_SUFFIXES and (rev or Path(p).is_file())
+            if (Path(p).suffix in PROSE_SUFFIXES or hash_shebang(Path(p), rev))
+            and (rev or Path(p).is_file())
         ]
     else:
         for raw in args.paths:
@@ -453,9 +479,10 @@ def main() -> int:
                 candidates += [
                     p
                     for p in path.rglob("*")
-                    if p.suffix in PROSE_SUFFIXES and ".git" not in p.parts
+                    if (p.suffix in PROSE_SUFFIXES or (p.is_file() and hash_shebang(p)))
+                    and ".git" not in p.parts
                 ]
-            elif path.suffix in PROSE_SUFFIXES:
+            elif path.suffix in PROSE_SUFFIXES or hash_shebang(path):
                 candidates.append(path)
 
     blocks = collect(sorted(set(candidates)), root, args.min_words, rev)
