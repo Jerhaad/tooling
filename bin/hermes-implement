@@ -170,9 +170,13 @@ EVIDENCE=${HERMES_HOME:-$HOME/.hermes}
 [[ -n "$PROFILE" ]] && EVIDENCE="$EVIDENCE/profiles/$PROFILE"
 EVIDENCE="$EVIDENCE/verification_evidence.db"
 if [[ -r "$EVIDENCE" ]]; then
-	python3 - "$EVIDENCE" "$WORKTREE" "$START_ISO" <<'PYEOF' >&2 || true
+	python3 - "$EVIDENCE" "$WORKTREE" "$START_ISO" "$WORK" <<'PYEOF' >&2 || true
 import json, sqlite3, sys
 db, worktree, since = sys.argv[1], sys.argv[2].rstrip("/"), sys.argv[3]
+# The run's own directory is where this script tells the lane to put its
+# handover, so a write there is the instruction being followed. Flagging it
+# trains the reader to skip the warning, which costs the real ones.
+work = sys.argv[4].rstrip("/")
 try:
     c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     rows = c.execute(
@@ -181,7 +185,8 @@ try:
 except sqlite3.Error:
     sys.exit(0)
 stray = sorted({p for _, j in rows for p in json.loads(j or "[]")
-                if not p.startswith(worktree + "/")})
+                if not p.startswith(worktree + "/")
+                and not p.startswith(work + "/")})
 if stray:
     print(f"WARNING: this run wrote {len(stray)} path(s) outside {worktree}:")
     for p in stray:
