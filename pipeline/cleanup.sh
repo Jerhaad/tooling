@@ -87,6 +87,14 @@ if [ "$head_sha" != "$last_sha" ]; then
 	[ "$age" -gt 25 ] && broken+=("review has not covered origin/main ($(git -C "$REPO" rev-parse --short origin/main), ${age}h old)")
 fi
 
+# An agent update re-bundles each profile's skills tree and drops the local
+# skills the phases dispatch by name, so a lane can stop working without any
+# phase having run to notice. Checked here because this is the job that already
+# asks whether the pipeline is still delivering.
+if ! skills_missing=$("$PIPELINE_DIR/../bin/hermes-skills-sync" --check 2>&1); then
+	broken+=("$(printf '%s' "$skills_missing" | tail -1); run hermes-skills-sync")
+fi
+
 newest_review=$(git -C "$REPO" for-each-ref --format='%(refname:short)' --sort=-refname 'refs/remotes/origin/reviewer-*' | head -1)
 if [ -n "$newest_review" ]; then
 	d=${newest_review##*reviewer-}
