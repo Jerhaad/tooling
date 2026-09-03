@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Copy every skill in the agent's root tree into any profile missing it.
+#
+# Each profile keeps its own skills tree rather than a view onto the root one,
+# and the agent re-bundles that tree in place when it updates. The manifest it
+# rebuilds from lists only bundled skills, so a hand-authored one is invisible
+# to the re-bundle and is deleted by it. The phases dispatch skills by name, so
+# what that produces is a lane failing at startup -- which is indistinguishable
+# from a model that had nothing to say.
+#
+# Run it after any agent update. It only adds: an existing skill is never
+# overwritten, so a profile's own edit survives.
+#
+# --check reports instead of copying and exits 3 when anything is missing.
+set -euo pipefail
+
+ROOT=${HERMES_HOME:-$HOME/.hermes}
+SRC="$ROOT/skills"
+CHECK=0
+# Only the category the phases dispatch from. The rest of a root tree is
+# whatever its owner has installed, and every skill a profile carries is weight
+# in a system prompt the agent already sends on every call.
+CATEGORIES=(software-development)
+
+for arg in "$@"; do
+	case "$arg" in
+	--check) CHECK=1 ;;
+	--all) CATEGORIES=() ;;
+	*) echo "usage: ${0##*/} [--check] [--all]" >&2; exit 2 ;;
+	esac
+done
+
+[ -d "$SRC" ] || { echo "no skills tree at $SRC" >&2; exit 2; }
+
+in_scope() {
+	[ ${#CATEGORIES[@]} -eq 0 ] && return 0
+	local c
+	for c in "${CATEGORIES[@]}"; do [ "$1" = "$c" ] && return 0; done
+	return 1
+}
+
+missing=0
+for pdir in "$ROOT"/profiles/*/; do
+	profile=$(basename "$pdir")
+	dest="$pdir/skills"
+	[ -d "$dest" ] || continue
+
+	while IFS= read -r skill; do
+		rel=${skill#"$SRC"/}
+		# Dot-prefixed categories are the agent's own bookkeeping -- the hub
+		# cache, curator backups, the archive. Copying those between trees
+		# grafts one profile's history onto another.
+		case "$rel" in .*) continue ;; esac
+		in_scope "${rel%%/*}" || continue
+		[ -e "$dest/$rel" ] && continue
+
+		missing=$((missing + 1))
+		if [ "$CHECK" -eq 1 ]; then
+			echo "missing: $profile/$rel"
+		else
+			mkdir -p "$(dirname "$dest/$rel")"
+			cp -r "$skill" "$dest/$rel"
+			echo "restored: $profile/$rel"
+		fi
+	done < <(find "$SRC" -mindepth 2 -maxdepth 2 -type d)
+done
+
+if [ "$CHECK" -eq 1 ]; then
+	echo "$missing skill(s) missing from profile trees"
+	[ "$missing" -gt 0 ] && exit 3
+	exit 0
+fi
+echo "$missing skill(s) restored"
