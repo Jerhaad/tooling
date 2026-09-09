@@ -1,0 +1,421 @@
+#!/usr/bin/env python3
+"""Health checks for the hermes agent's web stack, chat platforms and session logs.
+
+Each check probes the symptom, since these faults report success at the layer you would test.
+
+Exit: 0 passed, 1 fault found, 2 could not run.
+"""
+
+import argparse
+import json
+import os
+import random
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HERMES_HOME = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+AGENT_DIR = HERMES_HOME / "hermes-agent"
+VENV_PY = AGENT_DIR / "venv" / "bin" / "python"
+
+OK, BAD, WARN, INFO = "ok", "FAIL", "warn", "--"
+
+
+class Report:
+    """Collects check results so a run reports every fault, not just the first."""
+
+    def __init__(self) -> None:
+        self.failed = False
+        self.errored = False
+
+    def line(self, status: str, label: str, detail: str = "") -> None:
+        if status == BAD:
+            self.failed = True
+        elif status == "ERR":
+            self.errored = True
+        print(f"  [{status:4}] {label}" + (f" — {detail}" if detail else ""))
+
+    def head(self, title: str) -> None:
+        print(f"\n=== {title} ===")
+
+    def exit_code(self) -> int:
+        return 2 if self.errored else (1 if self.failed else 0)
+
+
+def read_env(path: Path) -> dict:
+    """Parse a hermes .env: last assignment wins, commented lines are absent."""
+    values = {}
+    if not path.is_file():
+        return values
+    for raw in path.read_text(errors="replace").split("\n"):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line)
+        if m:
+            values[m.group(1)] = m.group(2).strip().strip("'\"")
+    return values
+
+
+def profile_homes() -> list:
+    """Root first, then each profile — the fan-out that lets one lane drift from the rest."""
+    homes = [("root", HERMES_HOME)]
+    pdir = HERMES_HOME / "profiles"
+    if pdir.is_dir():
+        homes += [(p.name, p) for p in sorted(pdir.iterdir()) if (p / "config.yaml").is_file()]
+    return homes
+
+
+# ---------------------------------------------------------------------------- web
+
+COLD_TERMS = ["basalt", "quokka", "tessellate", "fjord", "zeppelin", "marzipan",
+              "obsidian", "pangolin", "cartography", "sextant", "yarrow", "brigantine"]
+
+
+def cold_query() -> str:
+    """Unused terms: only a query that must open new connections can overrun the engine deadline,
+    which is shared and counted from the start of the search."""
+    return " ".join(random.sample(COLD_TERMS, 3))
+
+
+def check_searxng(rep: Report, url: str) -> None:
+    import urllib.parse
+    import urllib.request
+
+    q = cold_query()
+    endpoint = f"{url.rstrip('/')}/search?q={urllib.parse.quote(q)}&format=json"
+    started = time.time()
+    try:
+        with urllib.request.urlopen(endpoint, timeout=45) as resp:
+            data = json.load(resp)
+    except Exception as exc:
+        rep.line("ERR", "searxng reachable", f"{url}: {type(exc).__name__}: {exc}")
+        return
+
+    elapsed = time.time() - started
+    results = data.get("results") or []
+    dead = data.get("unresponsive_engines") or []
+    rep.line(INFO, "cold query", f"{q!r} in {elapsed:.1f}s")
+
+    if not results:
+        rep.line(BAD, "search results", f"0 results; unresponsive={dead or 'none reported'}")
+        if dead:
+            reasons = {str(d[1]) for d in dead if isinstance(d, (list, tuple)) and len(d) > 1}
+            if any("timeout" in r for r in reasons):
+                rep.line(INFO, "likely cause",
+                         "every engine timing out at once is one shared deadline, not N network "
+                         "faults — raise outgoing.request_timeout in /etc/searxng/settings.yml")
+    elif dead:
+        rep.line(WARN, "search results", f"{len(results)} results, but unresponsive={dead}")
+    else:
+        rep.line(OK, "search results", f"{len(results)} results, all engines responded")
+
+
+def hermes_probe(home: Path, code: str, timeout: int = 240):
+    """Run *code* inside the hermes venv against *home*, returning parsed JSON on stdout.
+
+    Selection is by HERMES_HOME: HERMES_PROFILE is read by nothing in the config loader, so
+    passing it returns the root profile's values while looking like it worked.
+    """
+    if not VENV_PY.is_file():
+        return None, f"hermes venv missing at {VENV_PY}"
+    env = dict(os.environ, HERMES_HOME=str(home), PYTHONPATH=str(AGENT_DIR))
+    env.pop("HERMES_PROFILE", None)
+    try:
+        proc = subprocess.run([str(VENV_PY), "-c", code], cwd=str(AGENT_DIR), env=env,
+                              capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, f"probe timed out after {timeout}s"
+    for line in reversed(proc.stdout.strip().split("\n")):
+        if line.startswith("{"):
+            try:
+                return json.loads(line), None
+            except json.JSONDecodeError:
+                continue
+    return None, (proc.stderr.strip().split("\n") or ["no output"])[-1][:200]
+
+
+BACKEND_PROBE = """
+import json, sys
+sys.path.insert(0, ".")
+from tools.web_tools import _get_search_backend, _get_extract_backend, _load_web_config
+cfg = _load_web_config()
+print(json.dumps({"search": _get_search_backend(), "extract": _get_extract_backend(),
+                  "cfg_extract": cfg.get("extract_backend", ""), "cfg_search": cfg.get("search_backend", "")}))
+"""
+
+LIVE_PROBE = """
+import asyncio, json, sys
+sys.path.insert(0, ".")
+from tools.web_tools import web_search_tool, web_extract_tool
+out = {}
+try:
+    d = json.loads(web_search_tool("k3s etcd snapshot restore", limit=3))
+    out["search_ok"] = bool(d.get("success"))
+    out["search_n"] = len((d.get("data") or {}).get("web") or [])
+except Exception as e:
+    out["search_ok"] = False; out["search_err"] = f"{type(e).__name__}: {e}"[:160]
+try:
+    d = json.loads(asyncio.run(web_extract_tool(["https://example.com"])))
+    if d.get("success") is False:
+        out["extract_ok"] = False; out["extract_err"] = str(d.get("error"))[:160]
+    else:
+        r = (d.get("results") or [{}])[0]
+        out["extract_ok"] = not r.get("error") and bool(r.get("content"))
+        out["extract_chars"] = len(r.get("content") or "")
+        if r.get("error"): out["extract_err"] = str(r["error"])[:160]
+except Exception as e:
+    out["extract_ok"] = False; out["extract_err"] = f"{type(e).__name__}: {e}"[:160]
+print(json.dumps(out))
+"""
+
+SEARCH_ONLY = {"searxng", "ddgs", "brave_free"}
+
+WEB_BLOCK_RE = re.compile(r"^web:[ \t]*$", re.M)
+
+
+def pin_web_backends(config: Path, search: str, extract: str) -> str:
+    """Write ``web.backend``/``search_backend``/``extract_backend`` explicitly.
+
+    All three go together because a blank one is autodetected: filling in only ``extract_backend``
+    moved a profile's search onto an unconfigured Firecrawl. The edit is textual, since a YAML
+    round-trip would drop every comment in the file.
+    """
+    keys = {"backend": search, "search_backend": search, "extract_backend": extract}
+    text = config.read_text()
+    mode = config.stat().st_mode & 0o777
+    m = WEB_BLOCK_RE.search(text)
+
+    if not m:
+        # A profile can omit the block and still resolve backends from the defaults.
+        body = "".join(f"  {k}: {v}\n" for k, v in keys.items())
+        new_text = text.rstrip("\n") + "\nweb:\n" + body
+    else:
+        start = m.end()
+        rest = text[start:]
+        end_m = re.search(r"^\S", rest, re.M)          # block ends at the next column-0 line
+        end = start + (end_m.start() if end_m else len(rest))
+        block = text[start:end]
+        for key, value in keys.items():
+            if re.search(rf"^\s+{key}:", block, re.M):
+                block = re.sub(rf"^(\s+{key}:)[^\n]*$", rf"\1 {value}", block, count=1, flags=re.M)
+            else:
+                block = f"\n  {key}: {value}" + block
+        if block == text[start:end]:
+            return "unchanged"
+        new_text = text[:start] + block + text[end:]
+
+    shutil.copy2(config, config.with_suffix(config.suffix + f".bak-{time.strftime('%Y%m%d-%H%M%S')}"))
+    config.write_text(new_text)
+    config.chmod(mode)
+    return "set"
+
+
+def cmd_web(args, rep: Report) -> None:
+    rep.head("SearXNG")
+    url = read_env(HERMES_HOME / ".env").get("SEARXNG_URL", "")
+    if not url:
+        rep.line("ERR", "SEARXNG_URL", "not set in ~/.hermes/.env")
+    else:
+        check_searxng(rep, url)
+
+    rep.head("Backend resolution per profile")
+    for name, home in profile_homes():
+        if args.profile and name != args.profile:
+            continue
+        res, err = hermes_probe(home, BACKEND_PROBE, timeout=90)
+        if err:
+            rep.line("ERR", f"{name}", err)
+            continue
+        extract, search = res["extract"], res["search"]
+        # An unset extract_backend falls through to the search backend, and the search
+        # backends cannot extract — so the default resolves to a guaranteed failure.
+        if extract in SEARCH_ONLY:
+            detail = (f"extract resolves to {extract!r}, which is search-only"
+                      + ("; web.extract_backend is unset" if not res["cfg_extract"] else ""))
+            if args.fix:
+                outcome = pin_web_backends(home / "config.yaml", args.fix_search, args.fix_backend)
+                if outcome == "set":
+                    rep.line(OK, f"{name}", f"fixed: search={args.fix_search} extract={args.fix_backend}")
+                else:
+                    rep.line(BAD, f"{name}", f"{detail} (fix failed: {outcome})")
+            else:
+                rep.line(BAD, f"{name}", detail)
+        else:
+            rep.line(OK, f"{name}", f"search={search!r} extract={extract!r}")
+
+    if not args.live:
+        return
+    rep.head("Live tool calls")
+    for name, home in profile_homes():
+        if args.profile and name != args.profile:
+            continue
+        res, err = hermes_probe(home, LIVE_PROBE)
+        if err:
+            rep.line("ERR", f"{name}", err)
+            continue
+        rep.line(OK if res.get("search_ok") and res.get("search_n") else BAD, f"{name} web_search",
+                 f"{res.get('search_n', 0)} results" + (f" {res['search_err']}" if res.get("search_err") else ""))
+        rep.line(OK if res.get("extract_ok") else BAD, f"{name} web_extract",
+                 f"{res.get('extract_chars', 0)} chars" if res.get("extract_ok") else res.get("extract_err", "failed"))
+
+
+# ---------------------------------------------------------------------- platforms
+
+def live_gateway_pid() -> int:
+    """Lowest matching pid, for display only.
+
+    The gateway runs as more than one process and platform rows are written by a child, so this
+    is never the right thing to compare a row's ``writer_pid`` against — use :func:`pid_alive`.
+    """
+    try:
+        out = subprocess.run(["pgrep", "-f", "hermes_cli.main gateway run"],
+                             capture_output=True, text=True, timeout=15).stdout.split()
+        return min(int(p) for p in out) if out else 0
+    except Exception:
+        return 0
+
+
+def pid_alive(pid) -> bool:
+    try:
+        return Path(f"/proc/{int(pid)}").exists()
+    except (TypeError, ValueError):
+        return False
+
+
+def cmd_platforms(args, rep: Report) -> None:
+    rep.head("Gateway platforms")
+    state_file = HERMES_HOME / "gateway_state.json"
+    if not state_file.is_file():
+        rep.line("ERR", "gateway_state.json", "missing")
+        return
+    state = json.loads(state_file.read_text())
+    live_pid = live_gateway_pid()
+    rep.line(INFO, "gateway", f"state={state.get('gateway_state')} pid={live_pid or 'not running'} "
+                              f"version={state.get('code_version')}")
+
+    env = read_env(HERMES_HOME / ".env")
+    # Enablement is env-driven; the config.yaml `platforms:` block maps toolsets, not startup.
+    required = {"telegram": ["TELEGRAM_BOT_TOKEN"], "signal": ["SIGNAL_HTTP_URL", "SIGNAL_ACCOUNT"],
+                "whatsapp": ["WHATSAPP_ENABLED"], "slack": ["SLACK_BOT_TOKEN"],
+                "discord": ["DISCORD_BOT_TOKEN"], "matrix": ["MATRIX_ACCESS_TOKEN"]}
+
+    for name, p in (state.get("platforms") or {}).items():
+        st = str(p.get("state"))
+        writer = p.get("writer_pid")
+        configured = all(env.get(k) for k in required.get(name, [])) if name in required else None
+        # A platform's row is only written while it runs; after it is disabled the last row
+        # persists, so a dead process's `retrying` is indistinguishable from a live retry loop.
+        if writer and not pid_alive(writer):
+            rep.line(WARN, name, f"state={st!r} is stale — writer pid {writer} is gone")
+        elif st in ("connected", "ready"):
+            rep.line(OK, name, f"state={st}")
+        elif configured is False:
+            rep.line(WARN, name, f"state={st} but no credentials in .env — disabled, row not yet cleared")
+        else:
+            rep.line(BAD, name, f"state={st} {(p.get('error_message') or '')[:70]}")
+
+    rep.head("Platform credentials by profile")
+    for name, home in profile_homes():
+        penv = read_env(home / ".env")
+        on = sorted(k for k, v in required.items() if all(penv.get(x) for x in v))
+        rep.line(INFO, name, ", ".join(on) if on else "no chat platform configured")
+
+
+# ----------------------------------------------------------------------- sessions
+
+def cmd_sessions(args, rep: Report) -> None:
+    db = HERMES_HOME / "state.db"
+    if not db.is_file():
+        rep.line("ERR", "state.db", "missing")
+        return
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+
+    if args.export:
+        if conn.execute("SELECT 1 FROM sessions WHERE id = ?", (args.export,)).fetchone() is None:
+            rep.line(BAD, "export", f"no session {args.export!r} in state.db")
+            return
+        out_dir = Path(args.out or (HERMES_HOME / "session-exports"))
+        # --session-id is the only export path that ignores the ended-only guard.
+        cmd = [shutil.which("hermes") or "hermes", "sessions", "export", "--format", args.format,
+               "--session-id", args.export, "--yes", str(out_dir)]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        print((proc.stdout or proc.stderr).strip())
+        # `hermes sessions export` exits 0 after writing nothing, so the exit code alone
+        # cannot confirm a transcript exists.
+        if proc.returncode != 0 or "Exported" not in proc.stdout:
+            rep.line(BAD, "export", f"exit {proc.returncode}, no transcript written")
+        return
+
+    rep.head(f"Sessions (source={args.source or 'any'})")
+    where, params = "1=1", []
+    if args.source:
+        where, params = "source = ?", [args.source]
+    rows = conn.execute(
+        f"""SELECT id, source, chat_id, profile_name, started_at, ended_at, message_count,
+                   COALESCE(title,'') FROM sessions WHERE {where}
+            ORDER BY started_at DESC LIMIT ?""", params + [args.limit]).fetchall()
+    if not rows:
+        rep.line(WARN, "sessions", "none matched")
+        return
+    open_count = 0
+    for sid, source, chat, prof, started, ended, n, title in rows:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(started or 0))
+        state = "open" if ended is None else "ended"
+        open_count += ended is None
+        print(f"  {sid}  {source:9} {state:5} {when}  {n:3} msg  {title[:38]}")
+    print(f"\n  {len(rows)} shown, {open_count} still open.")
+    if open_count:
+        # Filtered export reuses the prune selector, whose WHERE begins `ended_at IS NOT NULL`.
+        print("  Open sessions are invisible to `hermes sessions export --source ...`.")
+        print(f"  Use: hermes-doctor sessions --export <id>")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="hermes-doctor", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    w = sub.add_parser("web", help="SearXNG health and per-profile backend resolution")
+    w.add_argument("--profile", help="only this profile (name under ~/.hermes/profiles, or 'root')")
+    w.add_argument("--live", action="store_true", help="also call web_search/web_extract for real")
+    w.add_argument("--fix", action="store_true", help="set web.extract_backend where it resolves search-only")
+    w.add_argument("--fix-backend", default="parallel",
+                   help="extract backend --fix writes (default: parallel, which needs no API key)")
+    w.add_argument("--fix-search", default="searxng",
+                   help="search backend --fix writes (default: searxng)")
+
+    sub.add_parser("platforms", help="gateway platform states and per-profile credentials")
+
+    s = sub.add_parser("sessions", help="list chat sessions, or export one by id")
+    s.add_argument("--source", help="telegram, cli, cron, ...")
+    s.add_argument("--limit", type=int, default=20)
+    s.add_argument("--export", metavar="ID", help="export this session id to markdown")
+    s.add_argument("--format", default="md", choices=["md", "jsonl", "qmd", "html"])
+    s.add_argument("--out", help="output directory")
+
+    a = sub.add_parser("all", help="web (no live calls) + platforms")
+    a.add_argument("--live", action="store_true")
+
+    args = ap.parse_args()
+    rep = Report()
+    if args.cmd == "web":
+        cmd_web(args, rep)
+    elif args.cmd == "platforms":
+        cmd_platforms(args, rep)
+    elif args.cmd == "sessions":
+        cmd_sessions(args, rep)
+    elif args.cmd == "all":
+        args.profile = None
+        args.fix = False
+        cmd_web(args, rep)
+        cmd_platforms(args, rep)
+    return rep.exit_code()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
