@@ -20,6 +20,12 @@
 # that identifies one, and those files are reported rather than silently
 # counted as covered.
 #
+# The suite runs twice on every proof, once before the revert and once after.
+# The verdict is the comparison, not the second exit code: a build that fails
+# before any test executes -- a regenerated offline cache the revert removes, a
+# renamed recipe -- is indistinguishable from a fired assertion by status alone,
+# and reading it as proof is how this gate reports what it never measured.
+#
 # Exit codes: 0 the tests depend on the change, 1 they do not, 2 misuse,
 # 3 unprovable.
 set -euo pipefail
@@ -90,6 +96,58 @@ if [ ${#SOURCES[@]} -eq 0 ]; then
 	exit 1
 fi
 
+# Whether the revert would change anything is a question about two commits, so
+# it is answered before anything is executed. A branch whose change reached the
+# base by another route while it sat has nothing to revert, and neither verdict
+# is true of it: calling it a failure blames tests that are fine, and calling it
+# a pass claims evidence that was never gathered. Asking first also keeps the
+# suite below out of a case it cannot measure.
+if git diff --quiet "$BASE" HEAD -- "${SOURCES[@]}"; then
+	echo "UNPROVABLE: source already matches $BASE, so there is nothing to revert." >&2
+	echo "            Re-run against an earlier base to prove these tests," >&2
+	echo "            e.g. PROVE_BASE=HEAD~1." >&2
+	exit 3
+fi
+
+# One definition for both runs. The verdict is a comparison, and a comparison
+# between two different commands is no comparison at all, so the caller's
+# `-- test command` override has to win in the same way on each side.
+run_suite() {
+	if [ $# -gt 0 ]; then
+		"$@"
+	else
+		# The project's own suite, so what proves a test here is what runs in CI.
+		(cd "$SRC" && eval "$(manifest "$SRC" prove.command)")
+	fi
+}
+
+# The suite on the unmodified tree. The verdict this gate gives is a comparison
+# against this run: a build that fails before any test executes -- a regenerated
+# offline cache the revert removes, a renamed recipe -- exits non-zero for
+# reasons that have nothing to do with the test, and without this the gate would
+# report "tests depend on the change" for a branch whose tests never ran.
+#
+# Before the restore trap: a pre-run inside the trap window would restore over a
+# tree the trap is responsible for.
+set +e
+run_suite "$@"
+pre_rc=$?
+set -e
+
+if [ "$pre_rc" -eq 126 ] || [ "$pre_rc" -eq 127 ]; then
+	echo
+	echo "UNPROVABLE: the test command did not run (exit $pre_rc)." >&2
+	echo "            Nothing was measured, so this is neither a pass nor a failure." >&2
+	exit 3
+fi
+if [ "$pre_rc" -ne 0 ]; then
+	echo
+	echo "UNPROVABLE: the suite fails on the unmodified tree (exit $pre_rc)." >&2
+	echo "            The branch is already red, so a failure after the revert" >&2
+	echo "            would say nothing about these tests." >&2
+	exit 3
+fi
+
 # Restored on every exit path, including the failure that is the expected
 # outcome: leaving a half-reverted tree behind would be worse than any answer
 # this gives.
@@ -111,25 +169,8 @@ for f in "${SOURCES[@]}"; do
 	fi
 done
 
-# A revert that changed nothing means the sources already match the base --
-# usually because the branch's change reached main by another route while the
-# branch sat. Neither answer is true here: calling it a failure blames tests
-# that are fine, and calling it a pass claims evidence that was never gathered.
-# Exit 3 says so, and gate-verify reports it as its own outcome.
-if git diff --quiet HEAD -- "${SOURCES[@]}"; then
-	echo "UNPROVABLE: source already matches $BASE, so there is nothing to revert." >&2
-	echo "            Re-run against an earlier base to prove these tests," >&2
-	echo "            e.g. PROVE_BASE=HEAD~1." >&2
-	exit 3
-fi
-
 set +e
-if [ $# -gt 0 ]; then
-	"$@"
-else
-	# The project's own suite, so what proves a test here is what runs in CI.
-	(cd "$SRC" && eval "$(manifest "$SRC" prove.command)")
-fi
+run_suite "$@"
 rc=$?
 set -e
 
@@ -147,8 +188,8 @@ fi
 #
 # It does not catch every such case: a suite that fails to compile is
 # indistinguishable here from one whose assertion fired, and both exit 1. What
-# makes the result trustworthy is that the same command passed on the
-# unmodified tree moments earlier, under whichever gate ran it.
+# makes the result trustworthy is the pre-run: the same command passed on the
+# unmodified tree moments earlier, so something the revert did is what changed.
 if [ $rc -eq 127 ] || [ $rc -eq 126 ]; then
 	echo
 	echo "UNPROVABLE: the test command did not run (exit $rc)." >&2
