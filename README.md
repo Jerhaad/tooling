@@ -26,7 +26,9 @@ environment file. What is left is the same everywhere.
 **Draft is the interlock between agent work and human review.** A pull request
 stays draft while an agent is still working it. `pr-ready` owns that transition
 and refuses it while the tree is dirty, the head is unpushed, CI is red or
-unfinished, or `gate-verify` fails.
+unfinished, or `gate-verify` fails. A check that never started (no steps, no log) is
+promoted with an annotation naming which local gates ran, so the reviewer is
+told what they are getting rather than left to infer it.
 
 **Review, triage and implement are one pipeline, not three jobs.** Each phase
 hands the next a file rather than a conclusion. Findings that survive triage

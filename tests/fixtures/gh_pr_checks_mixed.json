@@ -1,0 +1,12 @@
+[
+  {
+    "name": "real-failure",
+    "bucket": "fail",
+    "link": "https://github.com/owner/repo/actions/runs/5001/job/9501"
+  },
+  {
+    "name": "quota-blocked",
+    "bucket": "fail",
+    "link": "https://github.com/owner/repo/actions/runs/5002/job/9502"
+  }
+]
