@@ -375,6 +375,90 @@ def cmd_sessions(args, rep: Report) -> None:
         print(f"  Use: hermes-doctor sessions --export <id>")
 
 
+def cmd_live(args, rep: Report) -> None:
+    """Check the live checkout the scheduled jobs run out of.
+
+    The pipeline stages a second checkout whose sole job is to be reset --hard
+    to origin/main on every job. A reviewer cannot see that machine state, so
+    the only check is to read it back: exists, clean, on main, at origin/main,
+    and the tool that does the refreshing is reachable from the command line.
+    """
+    # Overridable for tests; the default matches the operator's documented
+    # split between the working checkout and the one jobs run out of.
+    live = Path(os.environ.get("LIVE_REPO", Path.home() / "hermes-tools-live"))
+    rep.head("Live checkout")
+    if not live.is_dir():
+        rep.line("ERR", "live checkout", f"{live} does not exist")
+        return
+    if subprocess.run(["git", "-C", str(live), "rev-parse", "--git-dir"],
+                      capture_output=True, timeout=10).returncode != 0:
+        rep.line("ERR", "live checkout", f"{live} is not a git checkout")
+        return
+    wrapper = shutil.which("tools-live-run")
+    if not wrapper:
+        rep.line("ERR", "tools-live-run on PATH",
+                 "not found; the scheduled jobs cannot refresh the live checkout without it")
+        return
+    # The wrapper resets the live checkout, so it must not live in what it
+    # resets: a refresh would rewrite the bytes of the running script. Its
+    # header says to install it as a copy, and this is where that is enforced
+    # rather than left to whoever next tidies the bin directory into symlinks.
+    # is_symlink() before resolve(), since resolve() is what follows the link.
+    target = Path(wrapper)
+    real = target.resolve()
+    if target.is_symlink() and str(real).startswith(str(live.resolve()) + "/"):
+        rep.line(BAD, "tools-live-run installed as a copy",
+                 f"{wrapper} is a symlink into {live}; a refresh would rewrite it mid-run")
+    else:
+        rep.line(OK, "tools-live-run installed as a copy", wrapper)
+
+    head = subprocess.run(["git", "-C", str(live), "symbolic-ref", "--quiet", "--short", "HEAD"],
+                          capture_output=True, text=True, timeout=10)
+    branch = head.stdout.strip() if head.returncode == 0 else ""
+    # Detached HEAD reads as empty above; the symbolic-ref exit code is the
+    # signal that the checkout is not on a branch at all.
+    if head.returncode != 0:
+        rep.line(BAD, "on main", "HEAD is detached")
+    elif branch != "main":
+        rep.line(BAD, "on main", f"currently on {branch!r}")
+    else:
+        rep.line(OK, "on main", "main")
+
+    status = subprocess.run(["git", "-C", str(live), "status", "--porcelain"],
+                            capture_output=True, text=True, timeout=10).stdout
+    if status.strip():
+        # The first line is enough: the test pattern is "is it dirty at all",
+        # and the rest of the porcelain output belongs to whoever clears it.
+        first = status.splitlines()[0]
+        rep.line(BAD, "clean", f"{first} (+{len(status.splitlines()) - 1} more)")
+    else:
+        rep.line(OK, "clean", "no uncommitted changes")
+
+    # Checked, not just read: on an unborn branch `rev-parse HEAD` prints the
+    # literal string "HEAD" on stdout and fails, so an unread return code turns
+    # an unusable checkout into a confident "HEAD=HEAD" mismatch against a real
+    # sha -- a fault reported against the checkout instead of an admission that
+    # nothing could be measured.
+    head_res = subprocess.run(["git", "-C", str(live), "rev-parse", "HEAD"],
+                              capture_output=True, text=True, timeout=10)
+    if head_res.returncode != 0:
+        rep.line("ERR", "at origin/main", "HEAD is unreadable; the checkout has no commit")
+        return
+    head_sha = head_res.stdout.strip()
+    # The remote ref is fetched by every job that runs, but not by this check.
+    # A ref that does not exist locally is itself the fault: origin/main is
+    # what every job resets to, and a missing one is a job that cannot run.
+    origin = subprocess.run(["git", "-C", str(live), "rev-parse", "--verify", "origin/main"],
+                            capture_output=True, text=True, timeout=10)
+    if origin.returncode != 0:
+        rep.line("ERR", "origin/main", "missing; the live checkout has no remote ref to reset to")
+    elif origin.stdout.strip() != head_sha:
+        rep.line(BAD, "at origin/main",
+                 f"HEAD={head_sha[:12]} origin/main={(origin.stdout.strip())[:12]}")
+    else:
+        rep.line(OK, "at origin/main", head_sha[:12])
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(prog="hermes-doctor", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -401,6 +485,8 @@ def main() -> int:
     a = sub.add_parser("all", help="web (no live calls) + platforms")
     a.add_argument("--live", action="store_true")
 
+    sub.add_parser("live", help="live checkout the scheduled jobs reset and run from")
+
     args = ap.parse_args()
     rep = Report()
     if args.cmd == "web":
@@ -409,6 +495,8 @@ def main() -> int:
         cmd_platforms(args, rep)
     elif args.cmd == "sessions":
         cmd_sessions(args, rep)
+    elif args.cmd == "live":
+        cmd_live(args, rep)
     elif args.cmd == "all":
         args.profile = None
         args.fix = False
