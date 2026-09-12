@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Advisory drift report between a [[task]]'s command and the CI job it mirrors.
+#
+# `remote-task` runs what `gates.toml` names; the CI workflow runs what its
+# YAML names. When those part -- a workflow step added, a recipe renamed --
+# nothing today says so. A drift detector that *under*-extracts stays green by
+# running fewer tests, which is the failure this tool exists to prevent.
+#
+# This tool names a job for the manifest to mirror and compares the two by
+# name. It is advisory: exit 0 whatever it finds, so a project without
+# [task.mirrors] sees no change in behaviour.
+#
+# Reading the workflow and *running* what comes out is the wrong fix: a parser
+# that under-extracts runs fewer tests and stays green. Reading the workflow
+# and *comparing* raises a false alarm instead. Same parser, opposite failure
+# direction -- the comparison makes the under-extraction visible, and that is
+# the point.
+set -euo pipefail
+
+# readlink -f, not `cd -P`: these are installed as symlinks into a bin
+# directory on PATH, and BASH_SOURCE holds the symlink's own path. `cd -P`
+# resolves symlinks inside the path it is given, not the script's location, so
+# ../lib resolved against the link and landed outside the checkout.
+LIB=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)
+# shellcheck source=../lib/common.sh
+. "$LIB/common.sh"
+
+usage() { echo "usage: task-mirror-check <worktree> [--task NAME]" >&2; exit 2; }
+[ $# -ge 1 ] || usage
+SRC=$(repo_root "$1")
+shift
+TASK=bench
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--task) [ $# -ge 2 ] || usage; TASK=$2; shift 2 ;;
+	-h | --help) usage ;;
+	*) usage ;;
+	esac
+done
+
+# Read the task's mirrors block from the manifest. When the entry has no
+# [task.mirrors] sub-table, all three reach bash empty and the tool exits
+# silently -- a project without the feature must look like one without it.
+output=$(python3 "$LIB/manifest.py" "$SRC" --task "$TASK")
+eval "$output"
+
+if [ -z "${TASK_MIRRORS_WORKFLOW:-}" ] || [ -z "${TASK_MIRRORS_JOB:-}" ]; then
+	exit 0
+fi
+
+# The python helper does the workflow parse, the just-show expansion, and the
+# diff report. Exit is always 0 -- advisory only. Args are passed as a single
+# argv so quoting across shell -> python is one hop.
+EXCEPT_ARGS=()
+for e in "${TASK_MIRRORS_EXCEPT[@]+"${TASK_MIRRORS_EXCEPT[@]}"}"; do
+	EXCEPT_ARGS+=(--except "$e")
+done
+
+exec python3 "$LIB/workflow_steps.py" \
+	--command "$TASK_COMMAND" \
+	--workflow "$TASK_MIRRORS_WORKFLOW" \
+	--job "$TASK_MIRRORS_JOB" \
+	--worktree "$SRC" \
+	"${EXCEPT_ARGS[@]}"
