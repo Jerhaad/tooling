@@ -45,6 +45,22 @@ cd "$SRC"
 mapfile -t CHANGED < <(git diff --name-only "$BASE"...HEAD)
 [ ${#CHANGED[@]} -gt 0 ] || { echo "no changes against $BASE" >&2; exit 2; }
 
+# Warn, do not block: gating an unsettled tree is sometimes correct, and the
+# gate's job is to exercise what the tree contains, not to police how it got
+# there. A line of output here is enough -- a caller about to trust a tree
+# deserves to know it moved (or that the lane that wrote it is still going)
+# before the gates report. See issue #25.
+BIN=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+set +e
+"$BIN/lane-settled" "$SRC"
+settled_rc=$?
+set -e
+# lane-settled has already printed which of the two it found, and exit 1 covers
+# both a live lane and one that died holding the tree. Naming either here would
+# put a second, less accurate account of the same fact on the same stream.
+[ "$settled_rc" -eq 0 ] ||
+	echo "WARNING: the worktree above is not settled; gating anyway" >&2
+
 eval "$(manifest "$SRC" gates)"
 
 skipped() {

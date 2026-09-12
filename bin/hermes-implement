@@ -61,8 +61,13 @@ PROFILE_ARGS=()
 [[ -n "$ISSUE" && -n "$WORKTREE" ]] || { usage >&2; exit 2; }
 
 cd "$WORKTREE"
+# Canonical from here on. lane-settled finds this run's record by hashing
+# `git rev-parse --show-toplevel`, so a caller passing a trailing slash or a
+# relative path would otherwise write a record under a hash nothing reads.
+WORKTREE=$(git rev-parse --show-toplevel)
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
 WORK=$(mktemp -d -t hermes-implement-XXXXXX)
+
 
 GH_ARGS=(issue view "$ISSUE")
 [[ -n "$REPO" ]] && GH_ARGS+=(--repo "$REPO")
@@ -119,6 +124,74 @@ BASE=$(git rev-parse HEAD)
 START_ISO=$(date -u +%Y-%m-%dT%H:%M:%S)
 ATTEMPTS=${HERMES_IMPLEMENT_ATTEMPTS:-4}
 
+# Where hermes records what each session wrote. Resolved up front so the EXIT
+# trap below can read the lane's last_edit_at without re-deriving the path on
+# every code path that reaches it (a profile switch between attempts would
+# otherwise move the file under the trap).
+EVIDENCE_DB=${HERMES_HOME:-$HOME/.hermes}
+[[ -n "$PROFILE" ]] && EVIDENCE_DB="$EVIDENCE_DB/profiles/$PROFILE"
+EVIDENCE_DB="$EVIDENCE_DB/verification_evidence.db"
+
+# Where this run's signals live: beside the worktree, in the state directory
+# the other tools here already use. `lane-active` is the in-band marker that a hermes process holds
+# the tree right now; `lane-final` is the record written at exit, naming the
+# commit the lane left and the session's last_edit_at so a later check can
+# tell drift from "the lane finished cleanly".
+STATE_DIR=${AGENT_STATE_DIR:-$HOME/.local/state/agent-tools}
+# A path cannot be a filename: it contains separators. The sha256 of the
+# canonical path is stable across readers, which is what lets lane-settled
+# find this record from the worktree alone.
+WORKTREE_HASH=$(printf '%s' "$WORKTREE" | python3 -c "import hashlib,sys; print(hashlib.sha256(sys.stdin.read().encode()).hexdigest())")
+ACTIVE_FILE="$STATE_DIR/lane-active/$WORKTREE_HASH"
+FINAL_FILE="$STATE_DIR/lane-final/$WORKTREE_HASH"
+# A sidecar index so a human can recover the path from the hash; the predicate
+# itself only needs the hash to find the record.
+mkdir -p "$STATE_DIR/lane-active" "$STATE_DIR/lane-final"
+echo "$WORKTREE" >"$STATE_DIR/lane-active/$WORKTREE_HASH.path" 2>/dev/null || true
+echo "$WORKTREE" >"$STATE_DIR/lane-final/$WORKTREE_HASH.path" 2>/dev/null || true
+# Below the variables the trap reads. An EXIT trap installed before START_ISO
+# and EVIDENCE_DB exist dies on the first failure it was meant to cover: under
+# `set -u` it aborts unbound, writes no record, and leaves the active marker
+# behind naming a pid that is gone.
+
+# Record on every exit, including the failure paths. The signal that was always
+# true -- the process ending -- is what we expose: the trap runs whether the
+# lane committed, ran out of attempts, or was killed. `last_edit_at` is read
+# fresh here so a resume that started before this trap was installed still
+# carries the session's actual last edit, not START_ISO from a stale frame.
+record_lane_final() {
+	local final_tip last_edit now
+	final_tip=$(git -C "$WORKTREE" rev-parse HEAD 2>/dev/null || echo "")
+	last_edit="$START_ISO"
+	if [[ -r "$EVIDENCE_DB" ]]; then
+		last_edit=$(python3 - "$EVIDENCE_DB" "$WORKTREE" "$START_ISO" <<'PYEOF' 2>/dev/null || echo "$START_ISO"
+import sqlite3, sys
+db, root, since = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    row = c.execute(
+        "select max(last_edit_at) from verification_state"
+        " where root = ? and last_edit_at >= ?", (root, since)).fetchone()
+except sqlite3.Error:
+    sys.exit(1)
+print((row[0] if row and row[0] else since))
+PYEOF
+)
+	fi
+	now=$(date -u +%Y-%m-%dT%H:%M:%S)
+	# Overwrite, not append: a previous run's record for this tree is by
+	# definition stale -- the lane has run again, and the file should name
+	# *this* run's exit, not the one before it.
+	{
+		echo "sha=$final_tip"
+		echo "last_edit_at=$last_edit"
+		echo "recorded_at=$now"
+	} >"$FINAL_FILE"
+	rm -f "$ACTIVE_FILE"
+}
+trap record_lane_final EXIT
+echo "$$" >"$ACTIVE_FILE"
+
 # A model that answers with prose instead of a tool call ends the run, so an
 # abandoned task and a finished one both exit 0. The branch is the only
 # trustworthy completion signal: keep resuming the session until it carries a
@@ -166,11 +239,8 @@ fi
 # another edited a shared config file while reporting only its issue. hermes
 # records every edited path per session here, so this is the only place the
 # question can be answered after the fact.
-EVIDENCE=${HERMES_HOME:-$HOME/.hermes}
-[[ -n "$PROFILE" ]] && EVIDENCE="$EVIDENCE/profiles/$PROFILE"
-EVIDENCE="$EVIDENCE/verification_evidence.db"
-if [[ -r "$EVIDENCE" ]]; then
-	python3 - "$EVIDENCE" "$WORKTREE" "$START_ISO" "$WORK" <<'PYEOF' >&2 || true
+if [[ -r "$EVIDENCE_DB" ]]; then
+	python3 - "$EVIDENCE_DB" "$WORKTREE" "$START_ISO" "$WORK" <<'PYEOF' >&2 || true
 import json, sqlite3, sys
 db, worktree, since = sys.argv[1], sys.argv[2].rstrip("/"), sys.argv[3]
 # The run's own directory is where this script tells the lane to put its
