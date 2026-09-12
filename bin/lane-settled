@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Predicate: has the lane that wrote this worktree stopped, and has the tree
+# not moved since it stopped?
+#
+# Exit:
+#   0  settled (no hermes process holds the worktree, current tip equals the
+#      recorded final). If no record exists -- an older tree whose run wrote
+#      before this check existed -- the predicate is inert and exits 0 with a
+#      message on stderr.
+#   1  a hermes process still holds the worktree (the lane is still running or
+#      crashed without recording a final).
+#   2  misuse, as everywhere else in this repository.
+#   3  the tree has moved since the lane's recorded final (drift). The lane
+#      finished, but someone -- human or otherwise -- has amended, rebased, or
+#      committed on top.
+#
+# Both names matter: a caller who gates a tree they intend to trust needs to
+# know whether the run is still going, or whether the tree simply isn't what
+# the lane left. The exit codes are the difference; the diagnostic on stderr
+# is what makes either one actionable.
+set -euo pipefail
+
+# readlink -f, not `cd -P`: bin/ is reached through a symlink on PATH, and
+# BASH_SOURCE holds the symlink's own path. `cd -P` resolves symlinks inside the
+# path it is given, not the script's location, so ../lib resolved against the
+# link and landed outside the checkout.
+LIB=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)
+# shellcheck source=../lib/common.sh
+. "$LIB/common.sh"
+
+usage() { echo "usage: lane-settled <worktree>" >&2; exit 2; }
+[ $# -eq 1 ] || usage
+
+# git, not readlink -f: the worktree may be reached through a path that git has
+# normalised to its real location, and readlink -f follows the *symlink* path
+# a worktree's gitdir uses. `rev-parse --show-toplevel` is what every other tool
+# in the repo trusts.
+WORKTREE=$(git -C "$1" rev-parse --show-toplevel 2>/dev/null) || {
+	echo "lane-settled: $1 is not inside a git worktree" >&2
+	exit 2
+}
+
+STATE_DIR=${AGENT_STATE_DIR:-$HOME/.local/state/agent-tools}
+# Hashed the same way hermes-implement does. A path cannot be a filename --
+# it contains separators -- and truncating or flattening one collides two
+# worktrees onto a single record.
+WORKTREE_HASH=$(printf '%s' "$WORKTREE" | python3 -c "import hashlib,sys; print(hashlib.sha256(sys.stdin.read().encode()).hexdigest())")
+ACTIVE_FILE="$STATE_DIR/lane-active/$WORKTREE_HASH"
+FINAL_FILE="$STATE_DIR/lane-final/$WORKTREE_HASH"
+
+# The marker is a pid file hermes-implement writes at start and removes in its
+# EXIT trap, so a live pid here is the in-band signal that a lane holds the
+# tree right now. This has to be asked before anything else: the final record
+# is only written when the lane exits, so a check that short-circuits on its
+# absence answers "settled" for every lane that is currently running, which is
+# the question this predicate exists to answer.
+# The marker decides this before the record is consulted. hermes-implement
+# writes it at start and removes it in its EXIT trap, so its presence means a
+# lane has not finished here -- and the final record does not exist until the
+# lane exits, so a check that short-circuits on the record's absence answers
+# "settled" for every lane that is currently running.
+#
+# A dead pid still fails. The record only names commits, so a lane killed
+# before its trap ran may have left uncommitted work the sha comparison below
+# cannot see; the marker is the only evidence that happened.
+if [ -f "$ACTIVE_FILE" ]; then
+	ACTIVE_PID=$(cat "$ACTIVE_FILE" 2>/dev/null || true)
+	if [ -n "$ACTIVE_PID" ] && kill -0 "$ACTIVE_PID" 2>/dev/null; then
+		echo "lane-settled: lane still running (pid $ACTIVE_PID holds $WORKTREE)" >&2
+		exit 1
+	fi
+	echo "lane-settled: stale active marker (pid $ACTIVE_PID no longer alive); the lane died without recording a final" >&2
+	exit 1
+fi
+
+# No marker and no record: a tree written before this check existed. Failing
+# open is the only honest answer -- reporting "unsettled" on no evidence is a
+# nuisance callers learn to route around.
+if [ ! -f "$FINAL_FILE" ]; then
+	echo "lane-settled: no final record for $WORKTREE; treating as settled" >&2
+	exit 0
+fi
+
+# Read two fields from the record: `sha=<40-hex>` and `last_edit_at=<iso8601>`.
+# Validate the sha as we read so a corrupted record cannot produce a
+# misleading "settled". The other field is informational; the sha is the one
+# the predicate's contract rests on, so an empty or non-hex sha is a fail.
+RECORDED_SHA=$(awk -F= '/^sha=/ {print $2; exit}' "$FINAL_FILE")
+[ -n "$RECORDED_SHA" ] || {
+	echo "lane-settled: record at $FINAL_FILE is missing 'sha'" >&2
+	exit 1
+}
+case "$RECORDED_SHA" in
+	*[!0-9a-f]*) echo "lane-settled: recorded sha '$RECORDED_SHA' is not hex" >&2; exit 1 ;;
+esac
+# Length as well as alphabet: a truncated record is still hex, and comparing a
+# short sha against a full one reports drift on a tree that never moved.
+[ ${#RECORDED_SHA} -eq 40 ] || {
+	echo "lane-settled: recorded sha '$RECORDED_SHA' is not a full 40-character sha" >&2
+	exit 1
+}
+
+# Guarded: an unborn HEAD makes git exit 128, and under `set -e` that would
+# leave this predicate with an exit code outside the contract above.
+CURRENT_SHA=$(git -C "$WORKTREE" rev-parse HEAD 2>/dev/null) || {
+	echo "lane-settled: $WORKTREE has no HEAD to compare against" >&2
+	exit 2
+}
+if [ "$CURRENT_SHA" != "$RECORDED_SHA" ]; then
+	echo "lane-settled: tree has drifted since the lane finished" >&2
+	echo "  recorded final: $RECORDED_SHA" >&2
+	echo "  current tip:    $CURRENT_SHA" >&2
+	exit 3
+fi
+
+echo "lane-settled: $WORKTREE is settled at $RECORDED_SHA"
+exit 0
