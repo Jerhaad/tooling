@@ -1,0 +1,12 @@
+[
+  {
+    "name": "bench",
+    "bucket": "pass",
+    "link": "https://github.com/owner/repo/actions/runs/1001/job/9001"
+  },
+  {
+    "name": "artifacts",
+    "bucket": "pass",
+    "link": "https://github.com/owner/repo/actions/runs/1002/job/9002"
+  }
+]

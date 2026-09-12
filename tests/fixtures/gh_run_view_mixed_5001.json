@@ -1,0 +1,13 @@
+{
+  "jobs": [
+    {
+      "databaseId": 9501,
+      "name": "real-failure",
+      "conclusion": "failure",
+      "steps": [
+        {"name": "checkout", "conclusion": "success"},
+        {"name": "build", "conclusion": "failure"}
+      ]
+    }
+  ]
+}

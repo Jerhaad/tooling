@@ -15,6 +15,15 @@
 #     it was written and stale by the time it merged
 #   - two PRs edited the same assertion to the same number, so git merged them
 #     without a conflict into a value that was wrong for both
+#
+# A non-passing CI check is one of two things: a run that produced evidence
+# against the branch (steps with conclusions, a log to read), or a run that
+# never came up (an empty steps list, no log). The second is not evidence
+# against the branch -- a quota-blocked runner, a workflow that failed to parse,
+# and a cancelled run all have the same shape and all mean "this check did
+# not see the branch". Lumping them together with real failures keeps the PR
+# in draft until someone notices the cause is on the runner's account, not
+# on the branch. The two are reported separately; only the first refuses.
 set -euo pipefail
 
 usage() {
@@ -27,7 +36,9 @@ Marks PR ready for review, but only if all of these hold:
   - the worktree is clean (nothing uncommitted)
   - local HEAD matches the PR's pushed head (nothing unpushed)
   - GitHub reports the PR mergeable, not conflicting
-  - every CI check has finished and passed
+  - every CI check has finished and passed, OR every non-passing CI check
+    never started (zero steps, no log); the latter is promoted with an
+    annotation naming which local gates ran
   - gate-verify passes on the worktree
   - condense-prose flags nothing in the diff
 
@@ -64,6 +75,7 @@ SRC=$(cd "${WORKTREE:-$PWD}" && git rev-parse --show-toplevel)
 cd "$SRC"
 
 FAILED=()
+NEVER_STARTED=()
 refuse() { FAILED+=("$1"); }
 
 read -r STATE IS_DRAFT HEAD_BRANCH HEAD_OID MERGEABLE < <(
@@ -95,14 +107,71 @@ LOCAL_OID=$(git -C "$SRC" rev-parse HEAD)
 
 # `gh pr checks` exits non-zero for both "failing" and "still running", which are
 # different answers to this question, so read the buckets rather than the code.
-CHECKS=$(gh pr checks "$PR" --json name,bucket 2>/dev/null || echo '[]')
+CHECKS=$(gh pr checks "$PR" --json name,bucket,link 2>/dev/null || echo '[]')
 PENDING=$(jq -r '[.[] | select(.bucket=="pending")] | length' <<<"$CHECKS")
-BAD=$(jq -r '[.[] | select(.bucket!="pass" and .bucket!="skipping" and .bucket!="pending")] | .[].name' <<<"$CHECKS")
 TOTAL=$(jq -r 'length' <<<"$CHECKS")
 
 [ "$TOTAL" -gt 0 ] || refuse "no CI checks reported for this head -- has it been pushed?"
 [ "$PENDING" -eq 0 ] || refuse "$PENDING CI check(s) still running"
-[ -z "$BAD" ] || refuse "CI check(s) not passing: $(tr '\n' ' ' <<<"$BAD")"
+
+# A check with bucket fail/cancel is either "ran and failed" (steps with
+# conclusions, a log to read) or "never started" (empty steps, no log).
+# Classify by the structural fact rather than the bucket or log text: a
+# runner that never came up, a workflow that failed to parse, and a
+# cancelled run all have the same answer and must be handled by the same
+# branch.
+while IFS=$'\t' read -r NAME LINK; do
+	[ -n "$NAME" ] || continue
+	# An actions-job link is /actions/runs/<run>/job/<job>; everything else
+	# is a CheckRun from an external service, which we cannot structurally
+	# inspect and so treat as a real failure.
+	RUN_ID=$(printf '%s' "$LINK" | sed -n 's@.*/actions/runs/\([0-9]\+\).*@\1@p')
+	JOB_ID=$(printf '%s' "$LINK" | sed -n 's@.*/actions/runs/[0-9]\+/job/\([0-9]\+\).*@\1@p')
+	if [ -z "$RUN_ID" ] || [ -z "$JOB_ID" ]; then
+		refuse "CI check failed: $NAME"
+		continue
+	fi
+	# A run we cannot fetch is not the same as a run we can fetch and see
+	# has no steps: the structural test the issue asks for needs the
+	# job object, and treating "could not fetch" as "never started" would
+	# promote on a missing-run error the same way as on quota exhaustion.
+	if ! JOBS=$(gh run view "$RUN_ID" --json jobs 2>/dev/null); then
+		refuse "CI check failed: $NAME (run $RUN_ID could not be fetched)"
+		continue
+	fi
+	# A run whose job we cannot find is a run we could not inspect, which
+	# is the un-fetchable case again and not evidence of anything. Counting
+	# a missing job as "no steps" would promote on a check that ran and
+	# failed, which is the opposite of what this classification is for.
+	MATCHED=$(jq --argjson jid "$JOB_ID" \
+		'[.jobs[] | select(.databaseId == $jid)] | length' <<<"$JOBS")
+	if [ "$MATCHED" -eq 0 ]; then
+		refuse "CI check failed: $NAME (run $RUN_ID reports no job $JOB_ID)"
+		continue
+	fi
+	# Has steps: the matching job has at least one step. A run whose job
+	# never produced steps did not run the branch.
+	HAS_STEPS=$(jq --argjson jid "$JOB_ID" \
+		'[.jobs[] | select(.databaseId == $jid)
+		        | select((.steps // []) | length > 0)] | length' \
+		<<<"$JOBS")
+	if [ "$HAS_STEPS" -gt 0 ]; then
+		refuse "CI check failed: $NAME"
+	else
+		NEVER_STARTED+=("$NAME")
+	fi
+done < <(jq -r '.[] | select(.bucket=="fail" or .bucket=="cancel")
+		| [.name, .link] | @tsv' <<<"$CHECKS")
+
+# The loop above selects two buckets by name. Anything else that is not a pass
+# is a check this script has no opinion about, and silently ignoring it would
+# promote on it. Refusing names it instead, which is the same direction the
+# single catch-all filter used to point.
+UNCLASSIFIED=$(jq -r '[.[] | select(.bucket!="pass" and .bucket!="skipping"
+		and .bucket!="pending" and .bucket!="fail" and .bucket!="cancel")]
+		| .[].name' <<<"$CHECKS")
+[ -z "$UNCLASSIFIED" ] ||
+	refuse "CI check(s) in an unrecognised state: $(tr '\n' ' ' <<<"$UNCLASSIFIED")"
 
 report() {
 	echo "refusing to mark PR $PR ready:" >&2
@@ -110,12 +179,12 @@ report() {
 	exit 1
 }
 
+[ ${#FAILED[@]} -eq 0 ] || report
+
 # Everything above is a metadata read costing a second or two, so they all run
 # and one invocation names every reason. gate-verify costs minutes and builds
 # on a host other branches are queued against, so it runs only once the cheap
 # answers are all yes.
-[ ${#FAILED[@]} -eq 0 ] || report
-
 if [ "$VERIFY" -eq 1 ]; then
 	echo "==> gate-verify $SRC" >&2
 	gate-verify "$SRC" >&2 || refuse "gate-verify failed"
@@ -147,4 +216,31 @@ if [ "$CHECK" -eq 1 ]; then
 fi
 
 [ "$IS_DRAFT" = "true" ] || exit 0
+
+# Part of promoting, so it sits below the test for whether promoting is what
+# is about to happen: re-running against an already-ready PR is documented as
+# a no-op, and a comment is not one.
+#
+# A reviewer is told what they are getting: which local gates ran, at which
+# sha, and which CI checks did not produce evidence. --no-verify means the
+# annotation must say no local gates ran, because none did.
+if [ ${#NEVER_STARTED[@]} -gt 0 ]; then
+	ANNOTATION=$(mktemp -t pr-ready-annotate-XXXXXX)
+	{
+		echo "pr-ready promoted this PR. The following CI check(s) reported"
+		echo "zero steps and no log -- the runner did not produce evidence"
+		echo "against this branch:"
+		printf '  - %s\n' "${NEVER_STARTED[@]}"
+		echo
+		if [ "$VERIFY" -eq 1 ]; then
+			echo "Local gates run on ${LOCAL_OID:0:7}:"
+			gate-verify "$SRC" --list 2>/dev/null | sed 's/^/  /' || true
+		else
+			echo "Local gates run: none (--no-verify was passed)."
+		fi
+	} >"$ANNOTATION"
+	gh pr comment "$PR" --body-file "$ANNOTATION" >&2
+	rm -f "$ANNOTATION"
+fi
+
 gh pr ready "$PR"
