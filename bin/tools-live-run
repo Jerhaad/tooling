@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# Run one pipeline script out of the live checkout, refreshing it first.
+#
+# INSTALL AS A COPY, NOT A SYMLINK. The reader will otherwise "fix" it into
+# a symlink like every other tool here, and a refresh can rewrite the bytes
+# beneath a script that is reading itself by byte offset -- which is exactly
+# how a running bash interpreter finds a syntax error at a line that is fine,
+# in a file nobody edited. The script is what does the refreshing, so it
+# must live outside what it refreshes.
+#
+# Two locks against the same file, because there are two things to keep apart
+# and they are not the same thing. Exclusive marks "I am refreshing"; shared
+# marks "a pipeline is running, do not refresh underneath it". The exclusive
+# attempt is non-blocking: six scheduled jobs all starting within a minute of
+# each other would otherwise queue behind whichever one won the refresh, and
+# the queue would be measured in minutes of cron overlap. The losers skip the
+# refresh and run the pipeline against the freshly-reset tree the winner left.
+#
+# Refusals print on stdout for the reason pipeline/common.sh gives for its own
+# failure trap: a --no-agent cron job delivers stdout and drops the rest, and
+# this is the entry point cron calls, so a refusal on stderr is a refusal
+# nobody is told about. Six jobs going quiet is the failure to avoid.
+set -euo pipefail
+
+LIVE=${LIVE_REPO:-$HOME/hermes-tools-live}
+LOCK=${LIVE_LOCK:-/home/hermes/.local/state/agent-tools/live.lock}
+
+usage() {
+	cat <<'EOF' >&2
+usage: tools-live-run <pipeline-script> [args...]
+
+Runs the named pipeline script out of $LIVE (LIVE_REPO overrides).
+The script is looked up under $LIVE/pipeline/ and exec'd in place, so the
+shared lock that protects it survives across the exec.
+
+Refreshes $LIVE to origin/main first, unless another refresher is already at
+work. A dirty live checkout, or one that is not on main, is refused by name
+and the refresh is skipped -- the script is not run, since there is no safe
+fresh tree to run it from.
+
+Exit codes: 0 the script ran, 1 the script ran and failed, 2 this tool was
+called wrong or names a pipeline script that does not exist, 3 the live
+checkout is missing, is not a checkout, or holds work a reset would discard.
+EOF
+	exit 2
+}
+[ $# -ge 1 ] || usage
+NAME=$1; shift
+
+[ -d "$LIVE" ] || { echo "$LIVE does not exist; set LIVE_REPO or run setup"; exit 3; }
+git -C "$LIVE" rev-parse --git-dir >/dev/null 2>&1 || \
+	{ echo "$LIVE is not a git checkout; refusing to refresh"; exit 3; }
+mkdir -p "$(dirname "$LOCK")"
+# The fd is held for the whole script lifetime; exec'ing the pipeline keeps it
+# open across the swap, so the shared lock survives into the child.
+exec {lockfd}>"$LOCK"
+
+did_refresh=0
+before_sha=""
+after_sha=""
+skip_reason="another job holds the lock"
+
+# Non-blocking exclusive: a loser here skips the refresh. Blocking would
+# serialise every concurrent caller behind one refresher, which the issue
+# explicitly rejects -- "blocking would make six scheduled jobs queue".
+if flock -n -x "$lockfd"; then
+	if [ "$(git -C "$LIVE" symbolic-ref --quiet --short HEAD 2>/dev/null || true)" != "main" ]; then
+		echo "$LIVE is not on main (currently $(git -C "$LIVE" symbolic-ref --quiet --short HEAD 2>/dev/null || echo 'detached')); refusing to reset --hard"
+		exit 3
+	fi
+	if [ -n "$(git -C "$LIVE" status --porcelain)" ]; then
+		echo "$LIVE is dirty; refusing to reset --hard (uncommitted changes would be lost)"
+		git -C "$LIVE" status --short
+		exit 3
+	fi
+	before_sha=$(git -C "$LIVE" rev-parse HEAD)
+	# A pull merges, a merge can conflict, and a conflicted live checkout is a
+	# worse failure than a stale one. Fetch + reset --hard takes exactly the
+	# state origin/main points at and discards nothing that is not already
+	# committed to it.
+	#
+	# A refresh that cannot happen is not a reason to skip the job: running
+	# against a tree that is one commit stale is the outcome this degrades to,
+	# and it is a far better one than a scheduled job that does not run.
+	if ! git -C "$LIVE" fetch --quiet origin; then
+		skip_reason="fetch from origin failed"
+	elif ! git -C "$LIVE" rev-parse --verify --quiet origin/main >/dev/null; then
+		skip_reason="origin/main does not exist after fetch"
+	else
+		git -C "$LIVE" reset --hard --quiet origin/main
+		after_sha=$(git -C "$LIVE" rev-parse HEAD)
+		did_refresh=1
+	fi
+	# Release exclusive before taking shared: another job arriving now can
+	# read -- they take shared straight away, since nobody else has the lock.
+	flock -u "$lockfd"
+fi
+
+# Blocking shared. Held across the exec below so a refresh cannot begin until
+# the pipeline returns. Blocks only when a refresher is currently running,
+# which is bounded by the time a fetch + reset --hard takes.
+flock -s "$lockfd"
+
+if [ "$did_refresh" = 1 ]; then
+	printf 'refreshed %s..%s\n' "${before_sha:0:12}" "${after_sha:0:12}"
+else
+	echo "refresh skipped ($skip_reason); running against the live checkout as it stands"
+fi
+
+# Resolved here rather than at each exit above, so every path that reaches the
+# pipeline reaches it the same way. With .sh appended if needed: the cron
+# entries use the bare name and the files carry the suffix.
+SCRIPT="$LIVE/pipeline/$NAME"
+[ -x "$SCRIPT" ] || SCRIPT="$SCRIPT.sh"
+[ -x "$SCRIPT" ] || { echo "no pipeline script at $LIVE/pipeline/$NAME[.sh]"; exit 2; }
+
+cd "$LIVE"
+exec "$SCRIPT" "$@"
