@@ -69,13 +69,16 @@ def main() -> None:
     if query == "--task":
         # `name`, `role`, `command` are required. Every other field is optional
         # and reaches bash empty below -- including `full-command`, `fetch`,
-        # and the `database.*` block, which the caller probes for emptiness.
+        # the `database.*` block, and `mirrors`, which the caller probes for
+        # emptiness. A project with no [task.mirrors] must be indistinguishable
+        # from one built before the drift check existed.
         want = default
         for entry in doc.get("task", []):
             if entry.get("name") != want:
                 continue
             require(entry, "task", want, "name", "role", "command")
             db = entry.get("database", {})
+            mirrors = entry.get("mirrors") or {}
             for var, val in [
                 ("TASK_ROLE", entry["role"]),
                 ("TASK_COMMAND", entry["command"]),
@@ -84,9 +87,12 @@ def main() -> None:
                 ("TASK_DB_USER", db.get("user", "")),
                 ("TASK_DB_PORT", db.get("port", "")),
                 ("TASK_DB_PREFIX", db.get("name-prefix", "")),
+                ("TASK_MIRRORS_WORKFLOW", mirrors.get("workflow", "")),
+                ("TASK_MIRRORS_JOB", mirrors.get("job", "")),
             ]:
                 print(f"{var}={shlex.quote(str(val))}")
             print(bash_array("TASK_FETCH", entry.get("fetch", [])))
+            print(bash_array("TASK_MIRRORS_EXCEPT", mirrors.get("except", [])))
             return
         names = ", ".join(e.get("name", "?") for e in doc.get("task", [])) or "none"
         sys.exit(f"{MANIFEST}: no [[task]] named {want!r} (have: {names})")

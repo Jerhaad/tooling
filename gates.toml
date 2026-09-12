@@ -1,0 +1,28 @@
+# gates.toml for the agent-tools checkout itself.
+#
+# The tools are the judge; gating them against their own tests is the only
+# gate that does not depend on a remote. Every change to a bin/ script,
+# a lib/ helper, or the test that pins its behaviour runs the matching test.
+#
+# `gate-verify` reads this file from the worktree root and runs every gate
+# whose `when` matches a file in the diff.
+
+# A change to the harness or any test pins its behaviour. We run the tests
+# that cover what changed, plus the manifest reader (the foundation) when
+# anything under lib/ moves.
+[[gates]]
+name = "task-mirror-check tests"
+when = '^(bin/task-mirror-check|lib/workflow_steps\.py|tests/test_task_mirror_check\.py|lib/manifest\.py)$'
+run = "python3 tests/test_task_mirror_check.py"
+
+# A gate that always runs when the manifest reader or any bin/ tool moves.
+# The reader is the foundation every other tool builds on; a change to a
+# bin/ script can regress the way its output reaches bash, even when the
+# script itself never touched the reader. We pin the refusal contract
+# (missing field -> named error that survives `set -e`) rather than parsing
+# the manifest's shape -- a parse is green against a manifest the reader
+# would still reject.
+[[gates]]
+name = "manifest reader contract"
+when = '^(lib/manifest\.py|bin/)'
+run = "python3 tests/test_manifest.py"

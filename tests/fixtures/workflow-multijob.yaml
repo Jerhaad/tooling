@@ -1,0 +1,39 @@
+# Multi-job workflow fixture for the drift detector's parser.
+#
+# This file is committed so the test for `extract_run_steps` exercises the
+# parser against a real on-disk artifact, not a string in the test. The
+# `rust-tests` job sits between `lint` and `web`: the previous parser broke
+# on the first sibling whose name was not the target, so the search would
+# stop after `lint` and report "workflow has no job named 'rust-tests'".
+# Two of the sibling jobs have multi-step bodies with `name:` keys and
+# `run: |` literal blocks, so the fix has to keep scoping correct after
+# the target is found too -- not just locate it.
+name: CI
+on: [push]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+  rust-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: cargo build --workspace
+      - name: Test
+        run: |
+          cargo test --workspace
+          cargo test --doc
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install
+        run: npm ci
+      - name: Test
+        run: npm test

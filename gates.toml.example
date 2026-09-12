@@ -41,6 +41,22 @@ user = "ci"
 port = 55432
 name-prefix = "ci"
 
+# Optional. Names the CI job this task's command is meant to mirror. Omit the
+# block to opt out entirely: a project without `[task.mirrors]` is read
+# exactly as before, and nothing extra is printed or run. When set,
+# `remote-task` reports which `run:` steps the command does not reach and
+# which reached lines the job does not run, after the build finishes.
+[task.mirrors]
+# Path to the workflow file, relative to the worktree root.
+workflow = ".github/workflows/ci.yaml"
+# Job name inside `workflow`. Only `run:` steps of this job are compared.
+job = "rust-tests"
+# Optional. Substrings of commands the gate rightly omits (migrations that
+# touch a real cluster, a `psql` seed that depends on fixtures). Matching
+# lines are excluded from both directions and listed under `deliberate` so a
+# human can still see them.
+except = ["cargo run -p migrate", "psql "]
+
 # Shares the tree and the lock with the task above. This one exists because a
 # compile-time-checked query cache cannot be regenerated without a database.
 [[task]]

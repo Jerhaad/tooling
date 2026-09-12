@@ -108,3 +108,16 @@ for f in ${TASK_FETCH[@]+"${TASK_FETCH[@]}"}; do
 done
 
 echo "==> PASS ($TASK: $NAME)"
+
+# Drift report between the command that just ran and the CI job it mirrors.
+# After the PASS line: a failed build is already red, and the report is
+# about a run that succeeded. The tool is advisory -- exit 0 whatever it
+# finds, and a task without [task.mirrors] exits silently before printing --
+# so a project that has not opted in sees no change. The guard keeps the
+# report from failing a run where the tool is not on PATH yet: a missing
+# drift report is not a failed build.
+if command -v task-mirror-check >/dev/null 2>&1; then
+	task-mirror-check "$SRC" --task "$TASK" || true
+else
+	echo "==> task-mirror-check not on PATH: skipping drift report"
+fi
