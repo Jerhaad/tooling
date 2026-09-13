@@ -71,10 +71,12 @@ fi
 # Two locks, because there are two contended resources and they are not on the
 # same machine.
 #
-# The remote one guards the build cache a host shares across every tree: two runs
-# overlapping in it is how one branch's crate gets linked against another
-# branch's. It has to be remote, because runs reach a host from more than one
-# agent.
+# The remote one guards the host's bench directory as a whole. Caches are per
+# tree, so a build cannot link one branch's crate against another's the way a
+# shared cache let it -- what needs serialising is the reaping below, which
+# removes directories a concurrent run may be about to build in, and the one
+# database container every tree resets. It has to be remote, because runs reach
+# a host from more than one agent.
 #
 # The local one guards the hypervisors. Builders are the largest guests on
 # memory-overcommitted nodes -- allocation runs to 1.3-1.7x real RAM -- so two
@@ -82,6 +84,12 @@ fi
 # is what takes guests down. A per-host lock cannot see that, which is how
 # "a second builder buys parallelism" was true of CPU and false of RAM. Every
 # dispatch leaves from this machine, so one lock here serialises the cluster.
+# How many build caches the host keeps, this run's own included. A number
+# rather than an age, because the disk is spent by how many exist. It is an
+# override rather than a constant since the right value is a property of the
+# builder's disk, which this tool cannot see.
+KEEP_CACHES=${REMOTE_TASK_KEEP_CACHES:-6}
+
 BUILD_LOCK=${REMOTE_TASK_LOCK:-$HOME/.local/state/agent-tools/build.lock}
 mkdir -p "$(dirname "$BUILD_LOCK")"
 exec {lockfd}>"$BUILD_LOCK"
@@ -89,6 +97,32 @@ flock "$lockfd"
 
 ssh "$REMOTE" "flock \$HOME/bench/.lock bash -euo pipefail -s" <<REMOTE_SCRIPT
 export PATH=$REMOTE_PATH
+
+# Each tree keeps its own build cache and the sync excludes it, so nothing ever
+# removed one: a builder accumulated a cache per branch ever benched until a
+# compile died on ENOSPC, which reads as a broken build rather than a full
+# disk. Reaped by recency, because what bounds the disk is how many caches
+# exist and not how old any one of them is.
+#
+# Inside the lock, so a concurrent run cannot lose the cache it is about to
+# use, and ahead of the build, so the space is free when this run needs it.
+# The tree being built is excluded by name rather than by its rank in the
+# listing: its own cache is stale by mtime whenever anything else was benched
+# more recently, and reaping it would make every run cold.
+#
+# A reaped tree pays one cold rebuild. That is the cost this trades against
+# losing the host, and the trees here are the same workspace at different
+# commits, so the rebuild is one it was going to pay for its own diff anyway.
+stale=\$( { ls -dt \$HOME/bench/*/target 2>/dev/null || true; } \
+	| grep -v "^\$HOME/bench/$NAME/target\$" \
+	| tail -n +$KEEP_CACHES || true )
+if [ -n "\$stale" ]; then
+	printf '%s\n' "\$stale" | while read -r dir; do
+		echo "==> reaping \$dir"
+		rm -rf "\$dir"
+	done
+fi
+
 cd $DEST
 $DB_ENV
 $TASK_COMMAND
