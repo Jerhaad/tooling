@@ -1,15 +1,8 @@
 # gates.toml for the agent-tools checkout itself.
 #
-# The tools are the judge; gating them against their own tests is the only
-# gate that does not depend on a remote. Every change to a bin/ script,
-# a lib/ helper, or the test that pins its behaviour runs the matching test.
-#
-# `gate-verify` reads this file from the worktree root and runs every gate
-# whose `when` matches a file in the diff.
+# A tool and the test that pins it share a `when`, so editing either runs the
+# test. tests/test_gate_coverage.py fails when one does not.
 
-# A change to the harness or any test pins its behaviour. We run the tests
-# that cover what changed, plus the manifest reader (the foundation) when
-# anything under lib/ moves.
 [[gates]]
 name = "task-mirror-check tests"
 when = '^(bin/task-mirror-check|lib/workflow_steps\.py|tests/test_task_mirror_check\.py|lib/manifest\.py)$'
@@ -24,5 +17,35 @@ run = "python3 tests/test_task_mirror_check.py"
 # would still reject.
 [[gates]]
 name = "manifest reader contract"
-when = '^(lib/manifest\.py|bin/)'
+when = '^(lib/manifest\.py|tests/test_manifest\.py|bin/)'
 run = "python3 tests/test_manifest.py"
+
+[[gates]]
+name = "pr-ready tests"
+when = '^(bin/pr-ready|tests/test_pr_ready\.py|tests/fixtures/gh_.*\.json)$'
+run = "python3 tests/test_pr_ready.py"
+
+[[gates]]
+name = "lane-settled tests"
+when = '^(bin/lane-settled|bin/hermes-implement|bin/gate-verify|tests/test_lane_settled\.py)$'
+run = "python3 tests/test_lane_settled.py"
+
+[[gates]]
+name = "tools-live-run tests"
+when = '^(bin/tools-live-run|tests/test_tools_live_run\.py)$'
+run = "python3 tests/test_tools_live_run.py"
+
+[[gates]]
+name = "remote-task drift tests"
+when = '^(bin/remote-task|bin/task-mirror-check|lib/workflow_steps\.py|tests/test_remote_task_drift\.py)$'
+run = "python3 tests/test_remote_task_drift.py"
+
+[[gates]]
+name = "remote path tests"
+when = '^(bin/remote-task|bin/remote-run|lib/common\.sh|tests/test_remote_path\.py)$'
+run = "python3 tests/test_remote_path.py"
+
+[[gates]]
+name = "gate-prove tests"
+when = '^(bin/gate-prove|tests/test_gate_prove\.py)$'
+run = "python3 tests/test_gate_prove.py"
