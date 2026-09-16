@@ -41,6 +41,18 @@ user = "ci"
 port = 55432
 name-prefix = "ci"
 
+# Optional. `sqlx::migrate!` embeds the migrations directory at compile
+# time, and stable cargo does not register a rerun-if-changed for the
+# embedded files. `remote-task` keeps a warm `target/` per tree, so a
+# rebase that adds migrations leaves the builder applying the set it
+# had at the last compile, not the one the source tree now carries.
+# List every file that holds a sqlx::Migrator: when the migrations
+# directory on the local tree differs from what the remote last built,
+# `remote-task` touches those files so cargo rebuilds them and the new
+# set is embedded. `dir` defaults to `migrations`.
+[task.migrator]
+sources = ["crates/db/src/lib.rs", "crates/api-rest/src/lib.rs", "src/main.rs"]
+
 # Optional. Names the CI job this task's command is meant to mirror. Omit the
 # block to opt out entirely: a project without `[task.mirrors]` is read
 # exactly as before, and nothing extra is printed or run. When set,

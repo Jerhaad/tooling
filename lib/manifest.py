@@ -79,6 +79,9 @@ def main() -> None:
             require(entry, "task", want, "name", "role", "command")
             db = entry.get("database", {})
             mirrors = entry.get("mirrors") or {}
+            # Optional sub-table naming the files that hold a sqlx::Migrator;
+            # bin/remote-task says what it does with them.
+            migrator = entry.get("migrator") or {}
             for var, val in [
                 ("TASK_ROLE", entry["role"]),
                 ("TASK_COMMAND", entry["command"]),
@@ -89,10 +92,12 @@ def main() -> None:
                 ("TASK_DB_PREFIX", db.get("name-prefix", "")),
                 ("TASK_MIRRORS_WORKFLOW", mirrors.get("workflow", "")),
                 ("TASK_MIRRORS_JOB", mirrors.get("job", "")),
+                ("TASK_MIGRATOR_DIR", migrator.get("dir", "migrations")),
             ]:
                 print(f"{var}={shlex.quote(str(val))}")
             print(bash_array("TASK_FETCH", entry.get("fetch", [])))
             print(bash_array("TASK_MIRRORS_EXCEPT", mirrors.get("except", [])))
+            print(bash_array("TASK_MIGRATOR_SOURCES", migrator.get("sources", [])))
             return
         names = ", ".join(e.get("name", "?") for e in doc.get("task", [])) or "none"
         sys.exit(f"{MANIFEST}: no [[task]] named {want!r} (have: {names})")
