@@ -196,6 +196,59 @@ def main() -> int:
         if r.returncode == 0:
             failures.append(f"[[gates]] missing 'run' did not refuse: {r.stdout!r}")
 
+        # [task.migrator] reaches bash as TASK_MIGRATOR_DIR (defaults to
+        # `migrations`) and TASK_MIGRATOR_SOURCES (declare -a). The block
+        # is optional, so an entry without it must still read the same
+        # as before -- both fields populated, the array empty. Read
+        # these against a manifest without the block.
+        no_migrator = (EXAMPLE.read_text().replace(
+            "sources = [\"crates/db/src/lib.rs\", \"crates/api-rest/src/lib.rs\", \"src/main.rs\"]\n",
+            ""))
+        # Strip the comment lines so the file is valid TOML.
+        cleaned = "\n".join(
+            ln for ln in no_migrator.splitlines()
+            if "every file that holds a sqlx::Migrator" not in ln
+            and not ln.lstrip().startswith("#")
+            and ln.strip() != ""
+        )
+        (tmpdir / "gates.toml").write_text(cleaned)
+        # Sanity: the manifest still has the same task entry the rest of
+        # the test queries against. tomllib validates it for us.
+        tomllib.loads(cleaned)
+        out = assert_pass(tmpdir, "--task", "bench")
+        if "TASK_MIGRATOR_DIR=migrations" not in out:
+            failures.append(
+                f"TASK_MIGRATOR_DIR default missing: {out!r}")
+        if "declare -a TASK_MIGRATOR_SOURCES=()" not in out:
+            failures.append(
+                f"TASK_MIGRATOR_SOURCES default not empty array: {out!r}")
+
+        # A populated block round-trips through the reader. We append a
+        # second [[task]] entry with its own [task.migrator] so the
+        # existing example block does not collide on the table name.
+        setup(tmpdir)
+        text = (tmpdir / "gates.toml").read_text()
+        new_entry = [
+            "[[task]]",
+            'name = "bench-migrator-test"',
+            'role = "builder"',
+            'command = "cargo build --workspace"',
+            "[task.migrator]",
+            'dir = "db/migrations"',
+            'sources = ["crates/db/src/lib.rs", "crates/api-rest/src/lib.rs"]',
+        ]
+        (tmpdir / "gates.toml").write_text(text + "\n" + "\n".join(new_entry) + "\n")
+        out = assert_pass(tmpdir, "--task", "bench-migrator-test")
+        if "TASK_MIGRATOR_DIR=db/migrations" not in out:
+            failures.append(
+                f"TASK_MIGRATOR_DIR custom value missing: {out!r}")
+        # Both source paths reach bash as separate array entries. The
+        # reader quotes only when the value needs it; the path here is
+        # safe, so it appears unquoted.
+        if "TASK_MIGRATOR_SOURCES=(crates/db/src/lib.rs crates/api-rest/src/lib.rs)" not in out:
+            failures.append(
+                f"TASK_MIGRATOR_SOURCES did not contain both entries: {out!r}")
+
         # Bash integration: under `set -euo pipefail`, an unset required field
         # must reach the caller as the manifest's named error, not as an
         # unbound-variable shell error. This is the exact failure mode the

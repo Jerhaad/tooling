@@ -58,8 +58,55 @@ DEST="bench/$NAME"
 
 echo "==> syncing $SRC to $REMOTE:$DEST"
 ssh "$REMOTE" "mkdir -p $DEST"
+
+# `sqlx::migrate!` embeds the migrations at compile time and stable cargo
+# registers no rerun-if-changed for them, so the warm `target/` this tool keeps
+# carries whichever set was in effect when the crate last compiled. A rebase that
+# adds migrations goes on applying the old one, and the gate fails naming a table
+# the diff never mentions. Caught here, where the staleness is created.
+#
+# The fingerprint compares what the remote last received against what is being
+# sent now, and is recorded after the sync so a partial failure leaves no stale
+# hash. Without [task.migrator] there is nothing to touch and the run is
+# unchanged.
+MIGRATOR_FP=""
+MIGRATOR_STALE=0
+if [ ${#TASK_MIGRATOR_SOURCES[@]} -gt 0 ] && [ -d "$SRC/$TASK_MIGRATOR_DIR" ]; then
+	MIGRATOR_FP=$(cd "$SRC" && find "$TASK_MIGRATOR_DIR" -type f -print0 \
+		| sort -z | xargs -0 sha256sum 2>/dev/null \
+		| sha256sum | awk '{print $1}')
+	REMOTE_FP=$(ssh "$REMOTE" "cat $DEST/.migrations-fingerprint 2>/dev/null" || true)
+	[ -n "$REMOTE_FP" ] && [ "$REMOTE_FP" != "$MIGRATOR_FP" ] && MIGRATOR_STALE=1
+fi
+
+# Exclude the fingerprint sentinel the same way target/ is excluded: the
+# file lives on the remote as a side-effect of this tool's own bookkeeping
+# and is not part of the source tree.
 rsync -a --delete --exclude 'target/' --exclude '.git/' --exclude 'node_modules/' \
+	--exclude '.migrations-fingerprint' \
 	"$SRC/" "$REMOTE:$DEST/"
+
+# After the sync, not before it. `rsync -a` preserves the source's mtimes, so a
+# touch applied to the remote copy beforehand is reverted by the very transfer
+# it was meant to survive -- the file lands with its original timestamp, older
+# than the artifacts in the warm target/, and cargo rebuilds nothing.
+if [ "$MIGRATOR_STALE" = 1 ]; then
+	touch_args=""
+	sep=""
+	for src in "${TASK_MIGRATOR_SOURCES[@]}"; do
+		touch_args="$touch_args$sep$DEST/$src"
+		sep=" "
+	done
+	echo "==> migrations changed since last sync; touching ${#TASK_MIGRATOR_SOURCES[@]} source(s) that hold a Migrator"
+	ssh "$REMOTE" "touch $touch_args"
+fi
+
+# Write the fingerprint *after* the sync so the recorded hash reflects the
+# content that was just delivered. Under `set -e`, an rsync failure exits
+# before this line.
+if [ -n "$MIGRATOR_FP" ]; then
+	ssh "$REMOTE" "printf '%s\n' '$MIGRATOR_FP' > $DEST/.migrations-fingerprint"
+fi
 
 if [ -n "$TASK_DB_CONTAINER" ]; then
 	echo "==> resetting database $DB"
