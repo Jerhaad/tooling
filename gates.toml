@@ -46,6 +46,22 @@ when = '^(bin/remote-task|bin/remote-run|lib/common\.sh|tests/test_remote_path\.
 run = "python3 tests/test_remote_path.py"
 
 [[gates]]
+name = "remote-prune tests"
+when = '^(bin/remote-prune|tests/test_remote_prune\.py)$'
+run = "python3 tests/test_remote_prune.py"
+
+[[gates]]
 name = "gate-prove tests"
 when = '^(bin/gate-prove|tests/test_gate_prove\.py)$'
 run = "python3 tests/test_gate_prove.py"
+
+# The phases are shipped code with no suite of their own. A syntax check is
+# what can honestly be claimed here; it is still the difference between a broken
+# phase found now and one found at 02:00 by not running.
+#
+# `xargs -n1`, not a glob: `bash -n a.sh b.sh` parses only a.sh and takes the
+# rest as positional parameters, so the glob form checked one file and passed.
+[[gates]]
+name = "pipeline syntax"
+when = '^pipeline/.*\.sh$'
+run = "find pipeline -name '*.sh' -print0 | xargs -0 -n1 bash -n"
