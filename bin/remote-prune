@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+# Prune the builder's bench directory.
+#
+# A bench dir whose branch has landed can go entirely; `target/debug/incremental`
+# is pure cache and can go from a tree nothing has built in days. `git cherry`,
+# not an ancestry test: a squash merge lands the same patches under a new sha.
+#
+# Dry run by default. `--prune` is the only thing that unlinks, and it takes the
+# same `$HOME/bench/.lock` every `remote-task` run holds, so a build in flight
+# cannot lose the tree it is about to use.
+#
+# Kept: a dir with no worktree behind it, the trunk, and any name outside the
+# alphabet `tree_name` emits. Uncertainty means keep.
+#
+set -euo pipefail
+
+# readlink -f, not `cd -P`: these are installed as symlinks into a bin
+# directory on PATH, and BASH_SOURCE holds the symlink's own path. `cd -P`
+# resolves symlinks inside the path it is given, not the script's location, so
+# ../lib resolved against the link and landed outside the checkout.
+LIB=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)
+# shellcheck source=../lib/common.sh
+. "$LIB/common.sh"
+
+usage() { echo "usage: remote-prune [--prune] [--task NAME] [worktree]" >&2; exit 2; }
+
+PRUNE=0
+TASK=bench
+ARGS=()
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--prune) PRUNE=1; shift ;;
+	--task) [ $# -ge 2 ] || usage; TASK=$2; shift 2 ;;
+	-h | --help) usage ;;
+	*) ARGS+=("$1"); shift ;;
+	esac
+done
+set -- "${ARGS[@]+"${ARGS[@]}"}"
+
+SRC=$(repo_root "${1:-$PWD}")
+# `git worktree list` is read from the repo, not the worktree: a worktree can
+# list siblings but it is the repo whose worktrees/ the entries live under.
+REPO=$(git -C "$SRC" worktree list --porcelain 2>/dev/null | awk '/^worktree / {print $2; exit}')
+[ -n "$REPO" ] || REPO=$SRC
+
+# Captured to a variable rather than eval'd inline so the reader's non-zero
+# exit code reaches `set -e`. An `eval $(...)` of an empty string returns 0,
+# so the manifest's refusal would otherwise reach the next access to a
+# TASK_* variable as a "unbound variable" shell error pointing at the bash
+# line, not at the manifest field that is missing.
+output=$(python3 "$LIB/manifest.py" "$SRC" --task "$TASK")
+eval "$output"
+REMOTE=$(host_for "$TASK_ROLE")
+
+if [ "$PRUNE" = 1 ]; then
+	echo "==> pruning $REMOTE (role=$TASK_ROLE, task=$TASK)"
+else
+	echo "==> dry run: $REMOTE (role=$TASK_ROLE, task=$TASK); re-run with --prune to act"
+fi
+
+# Walk the local worktrees once and build a `tree_name -> path` table. The
+# remote `bench/$NAME` directory only has a branch we can ask about when
+# there is a local worktree behind the same name; entries missing from this
+# table are the conservative "uncertainty means keep" case.
+declare -A WT_BY_NAME=()
+while read -r wt; do
+	[ -n "$wt" ] || continue
+	WT_BY_NAME[$(tree_name "$wt")]=$wt
+done < <(git -C "$REPO" worktree list --porcelain | awk '/^worktree / {print $2}')
+
+# `git fetch origin` is the only way `git cherry origin/main HEAD` can answer
+# correctly: a remote branch whose tip has moved since the local ref was last
+# updated makes every cherry verdict wrong in the same direction. Fetched
+# here rather than from inside the per-worktree loop, because one fetch
+# covers every worktree the repo knows about.
+git -C "$REPO" fetch --quiet origin
+
+# List the remote bench directories through ssh and let bash parse the
+# output, not awk: each name is a single token on its own line, and a
+# word-split keeps the script readable. The capture is split so the
+# ssh exit code reaches us; `mapfile < <(...)` discards the inner rc
+# (the one that matters), and an unreachable host would otherwise read
+# as "bench is empty" -- which is a wrong, actionable lie.
+set +e
+BENCH_OUT=$(ssh "$REMOTE" "ls -1 \$HOME/bench 2>/dev/null")
+ssh_rc=$?
+set -e
+if [ "$ssh_rc" -ne 0 ]; then
+	echo "remote-prune: cannot reach $REMOTE (ssh exit $ssh_rc); cannot measure the bench" >&2
+	exit 3
+fi
+# A here-string of an empty variable is still one empty line, so testing the
+# array's length here answers a question that is never true. The per-entry
+# guard in the loop below is what actually skips it.
+mapfile -t BENCH_DIRS <<<"$BENCH_OUT"
+
+# Three-way, not two: 0 landed, 1 carrying work, 2 unreadable. A cherry that
+# cannot read its refs must not share a path with a clean "everything landed".
+cherry_landed() {
+	local wt=$1 rc out
+	out=$(git -C "$wt" cherry origin/main HEAD 2>/dev/null)
+	rc=$?
+	[ "$rc" -eq 0 ] || return 2
+	printf '%s\n' "$out" | grep -q '^+' && return 1
+	return 0
+}
+
+# `REMOTE_PRUNE_IDLE_DAYS` overrides the idle threshold: the right value is
+# a property of how often this builder sees traffic, which the tool cannot
+# see. Default matches pipeline/cleanup.sh's stale-days, so a tree the local
+# cleaner would call stale is one this one will look at.
+IDLE_DAYS=${REMOTE_PRUNE_IDLE_DAYS:-${PIPELINE_STALE_DAYS:-3}}
+
+landed=() uncertain=() idle=() trunk=() refused=()
+landed_bytes=0 idle_bytes=0
+for name in "${BENCH_DIRS[@]}"; do
+	[ -n "$name" ] || continue
+	# Every name below is interpolated into a remote command string, and this
+	# tool's whole purpose is `rm -rf`. The listing comes from the builder's
+	# filesystem, so a directory nobody here created decides what that string
+	# says. `tree_name` only ever produces this alphabet; anything else was
+	# not made by this tooling and is exactly the case the issue's rule covers.
+	case "$name" in
+	*[!A-Za-z0-9._-]*)
+		refused+=("$name")
+		continue
+		;;
+	esac
+	wt=${WT_BY_NAME[$name]:-}
+	if [ -z "$wt" ]; then
+		uncertain+=("$name")
+		continue
+	fi
+	# The trunk checkout answers the cherry test trivially -- every commit on
+	# main is on main -- so it reads as landed and its bench dir, the warmest
+	# one on the builder, would be removed on every run. "Landed" means a
+	# branch whose work reached the trunk, which the trunk is not.
+	branch=$(git -C "$wt" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+	if [ "$branch" = "${TRUNK_BRANCH:-main}" ]; then
+		trunk+=("$name")
+		continue
+	fi
+	set +e
+	cherry_landed "$wt"
+	cherry_rc=$?
+	set -e
+	case "$cherry_rc" in
+	0)	# `du -sb` rather than `du -sh`: the bytes go into a sum, not a label,
+		# and the report quotes them in a single human-readable line. One
+		# invocation per dir; the bench is shallow.
+		size=$(ssh "$REMOTE" "du -sb \$HOME/bench/$name 2>/dev/null | awk '{print \$1}'")
+		landed+=("$name")
+		landed_bytes=$((landed_bytes + ${size:-0}))
+		continue
+		;;
+	2)	uncertain+=("$name")
+		continue
+		;;
+	esac
+
+	# Carrying work: only the incremental subdir is a candidate, and only
+	# when it has not been touched in IDLE_DAYS. A target dir whose mtime is
+	# fresh means a build is still running; dropping incremental underneath
+	# it is the bug the lock is supposed to stop. A heredoc keeps the script
+	# readable and lets the remote shell see the $s and $(...) it needs to
+	# run, with no escape-level confusion for the local one.
+	set +e
+	inc_bytes=$(ssh "$REMOTE" bash -s -- "$name" "$IDLE_DAYS" <<'REMOTE_INC'
+name=$1
+days=$2
+d="$HOME/bench/$name/target/debug/incremental"
+[ -d "$d" ] || exit 1
+age_days=$(( ( $(date +%s) - $(stat -c %Y "$d") ) / 86400 ))
+[ "$age_days" -ge "$days" ] || exit 1
+du -sb "$d" | awk '{print $1}'
+REMOTE_INC
+	)
+	set -e
+	[ -n "$inc_bytes" ] || continue
+	idle+=("$name")
+	idle_bytes=$((idle_bytes + ${inc_bytes:-0}))
+done
+
+# Formats the byte sum into a line a human can sanity-check against
+# `du -sh` of the same paths. Nothing here interprets the values; `du -sb`
+# is the source of truth and the shell is only doing arithmetic on it.
+report_bytes() {
+	local bytes=$1 label=$2
+	if [ "$bytes" -gt 0 ]; then
+		# 1024-based units, the same `ls -lh` prints, so the report and the
+		# operator's own check read in the same scale.
+		if   [ "$bytes" -ge 1073741824 ]; then printf '%s: %d (%.1fG)\n' "$label" "$bytes" "$(awk "BEGIN{printf \"%.1f\", $bytes/1073741824}")"
+		elif [ "$bytes" -ge 1048576 ]; then    printf '%s: %d (%.1fM)\n' "$label" "$bytes" "$(awk "BEGIN{printf \"%.1f\", $bytes/1048576}")"
+		elif [ "$bytes" -ge 1024 ]; then       printf '%s: %d (%.1fK)\n' "$label" "$bytes" "$(awk "BEGIN{printf \"%.1f\", $bytes/1024}")"
+		else                                      printf '%s: %dB\n' "$label" "$bytes"
+		fi
+	else
+		printf '%s: 0\n' "$label"
+	fi
+}
+
+# advisory exit code 0 -- a tool that runs through every case and has nothing
+# to report is not a failure.
+if [ ${#landed[@]} -eq 0 ] && [ ${#idle[@]} -eq 0 ] && [ ${#uncertain[@]} -eq 0 ] && [ ${#trunk[@]} -eq 0 ] && [ ${#refused[@]} -eq 0 ]; then
+	echo "==> nothing to prune"
+	exit 0
+fi
+
+if [ ${#landed[@]} -gt 0 ]; then
+	echo
+	echo "==> landed, safe to remove (${#landed[@]} tree(s)):"
+	printf '  %s\n' "${landed[@]}"
+	report_bytes "$landed_bytes" "  reclaimable from landed"
+fi
+if [ ${#refused[@]} -gt 0 ]; then
+	echo
+	echo "==> left alone, name is not one this tooling produces (${#refused[@]}):"
+	printf '  %q\n' "${refused[@]}"
+fi
+if [ ${#trunk[@]} -gt 0 ]; then
+	echo
+	echo "==> left alone, trunk checkout (${#trunk[@]} tree(s)):"
+	printf '  %s\n' "${trunk[@]}"
+fi
+if [ ${#uncertain[@]} -gt 0 ]; then
+	echo
+	echo "==> left alone, no local worktree (${#uncertain[@]} tree(s)):"
+	printf '  %s\n' "${uncertain[@]}"
+fi
+if [ ${#idle[@]} -gt 0 ]; then
+	echo
+	echo "==> idle >= ${IDLE_DAYS}d, incremental cache droppable (${#idle[@]} tree(s)):"
+	printf '  %s\n' "${idle[@]}"
+	report_bytes "$idle_bytes" "  reclaimable from incremental"
+fi
+
+if [ "$PRUNE" -eq 0 ]; then
+	exit 0
+fi
+
+# `flock` is blocking: a concurrent run holds the lock for its whole build and
+# we wait. The lock lives on the remote, because agents reach the builder from
+# more than one machine.
+echo
+echo "==> acquiring \$HOME/bench/.lock on $REMOTE"
+
+# The heredoc carries both halves of the prune into one flocked session:
+# landed dirs disappear outright, and the idle trees lose only the
+# incremental cache. `rm -rf` on the landed side, `rm -rf` on the
+# incremental side -- one per candidate, so a permission failure on one
+# does not silently skip the rest.
+ssh "$REMOTE" "flock \$HOME/bench/.lock bash -euo pipefail -s" <<REMOTE_PRUNE
+cd \$HOME/bench
+for name in ${landed[@]+"${landed[@]}"}; do
+	[ -d "\$name" ] || continue
+	echo "  rm -rf \$name"
+	rm -rf "\$name"
+done
+for name in ${idle[@]+"${idle[@]}"}; do
+	d=\$name/target/debug/incremental
+	[ -d "\$d" ] || continue
+	echo "  rm -rf \$d"
+	rm -rf "\$d"
+done
+REMOTE_PRUNE
+
+echo "==> done"
