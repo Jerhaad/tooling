@@ -18,6 +18,7 @@ LOCK=${HERMES_TRIAGE_LOCK:-/tmp/hermes-triage-$PROFILE.lock}
 usage() {
 	cat <<'EOF'
 usage: hermes-triage --repo PATH (--issue N | --all-open | --since-merge REF)
+                     [--ledger PATH]
 
   --issue N        Triage one issue.
   --all-open       Triage every open issue with no triage file newer than the
@@ -26,22 +27,33 @@ usage: hermes-triage --repo PATH (--issue N | --all-open | --since-merge REF)
                    the diff REF..HEAD touched -- a merge is what makes an issue
                    stale, so that is what is worth re-checking.
 
+  --ledger PATH    (--since-merge only.) Skip issue numbers listed in PATH
+                   (one per line) and append each issue triaged during this
+                   run, so a run killed before finishing the gap leaves the
+                   next run with strictly less to do. Touches PATH.done at
+                   the end of a complete run; a caller that sees that file
+                   knows the gap is closed.
+
 Writes $QUEUE/issue-<N>.md. Prints each path written.
 EOF
 }
 
-REPO="" ISSUE="" MODE=""
+REPO="" ISSUE="" MODE="" LEDGER=""
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	--repo) REPO="$2"; shift 2 ;;
 	--issue) ISSUE="$2"; MODE=one; shift 2 ;;
 	--all-open) MODE=all; shift ;;
 	--since-merge) MODE=merge; SINCE="$2"; shift 2 ;;
+	--ledger) LEDGER="$2"; shift 2 ;;
 	-h | --help) usage; exit 0 ;;
 	*) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
 	esac
 done
 [[ -n "$REPO" && -n "$MODE" ]] || { usage >&2; exit 2; }
+# --ledger is meaningless outside --since-merge: the other modes do not iterate
+# an enumerated gap, so there is nothing to skip or advance.
+[[ -n "$LEDGER" && "$MODE" != "merge" ]] && { usage >&2; exit 2; }
 
 cd "$REPO"
 mkdir -p "$QUEUE"
@@ -97,18 +109,52 @@ all)
 merge)
 	# A merge is what makes an issue stale, so re-triage only what it could have
 	# touched: any open issue whose body names a path in the diff.
+	#
+	# The ledger is the gap's progress: an issue is appended once it is done, so
+	# a SIGTERM between appends loses at most the one it was inside.
+	#
+	# `grep -qx`, not a substring match: issue 12 must not be skipped because
+	# the ledger names 120.
+	#
+	# The sentinel describes this run and nothing else. One left by a previous
+	# run that died would credit this one with a gap it never closed.
+	[[ -n "$LEDGER" ]] && rm -f "$LEDGER.done"
+	if [[ -n "$LEDGER" && -f "$LEDGER" ]]; then
+		already_done() { grep -qx "$1" "$LEDGER" 2>/dev/null; }
+	else
+		already_done() { return 1; }
+	fi
 	paths=$(git diff --name-only "$SINCE..HEAD")
-	[[ -z "$paths" ]] && { echo "no paths changed in $SINCE..HEAD" >&2; exit 0; }
+	[[ -z "$paths" ]] && {
+		# Touch the sentinel so a caller can advance state even when the
+		# gap produced no candidates: the trunk moved, the diff is empty
+		# (e.g. a merge commit with no tree changes), and the script
+		# should treat the gap as closed exactly as it does today. The
+		# stderr line is the diagnostic the old `echo ... >&2` printed;
+		# kept on stderr because the cron delivery ignores it.
+		[[ -n "$LEDGER" ]] && touch "$LEDGER.done"
+		echo "no paths changed in $SINCE..HEAD" >&2
+		exit 0
+	}
 	for n in $(gh issue list --state open --limit 100 --json number --jq '.[].number' | sort -n); do
+		if already_done "$n"; then continue; fi
 		body=$(gh issue view "$n" --json body --jq .body)
 		while read -r path; do
 			[[ -z "$path" ]] && continue
 			if grep -qF "$path" <<<"$body"; then
 				rm -f "$QUEUE/issue-$n.md"
-				triage_one "$n" || true
+				if triage_one "$n"; then
+					# Append only after triage_one reports success: the
+					# entry is a contract that the file was written.
+					[[ -n "$LEDGER" ]] && printf '%s\n' "$n" >>"$LEDGER"
+				fi
 				break
 			fi
 		done <<<"$paths"
 	done
+	# Reached the end of the candidate loop without being killed. Touch the
+	# sentinel so the caller can advance $LAST; the sentinel is what
+	# distinguishes "we finished the gap" from "we ran out of time".
+	[[ -n "$LEDGER" ]] && touch "$LEDGER.done"
 	;;
 esac

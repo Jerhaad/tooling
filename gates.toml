@@ -74,3 +74,8 @@ run = "find pipeline -name '*.sh' -print0 | xargs -0 -n1 bash -n"
 name = "gate coverage"
 when = '^(gates\.toml|tests/test_gate_coverage\.py)$'
 run = "python3 tests/test_gate_coverage.py"
+
+[[gates]]
+name = "triage-on-merge tests"
+when = '^(pipeline/triage-on-merge\.sh|bin/hermes-triage|tests/test_triage_on_merge\.py)$'
+run = "python3 tests/test_triage_on_merge.py"
