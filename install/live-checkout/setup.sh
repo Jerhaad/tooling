@@ -19,6 +19,7 @@ WORK=${WORK_REPO:-$HOME/hermes-tools}
 BIN_DIR=${LIVE_BIN_DIR:-$HOME/bin}
 COPY_DIR=${LIVE_COPY_DIR:-$HOME/.local/bin}
 SCRIPTS_DIR=${HERMES_SCRIPTS_DIR:-$HOME/.hermes/scripts}
+SKILL_LINK=${CONDENSE_SKILL_LINK:-$HOME/.claude/skills/condense-prose}
 
 CHECK=0
 [ "${1:-}" = "--check" ] && CHECK=1
@@ -52,8 +53,19 @@ if [ -L "$SCRIPTS_DIR" ]; then
 	run rm -f "$SCRIPTS_DIR"
 fi
 run mkdir -p "$SCRIPTS_DIR"
-shims=("$LIVE"/pipeline/*.sh)
-[ ${#shims[@]} -gt 0 ] || { echo "no pipeline scripts in $LIVE/pipeline; nothing for cron to reach" >&2; exit 3; }
+# On a first --check the clone has not happened, so the live checkout cannot be
+# listed. The working checkout is the same commit and is what the clone will
+# contain, which makes it the honest preview.
+SHIM_SRC=$LIVE
+[ -d "$LIVE/pipeline" ] || SHIM_SRC=$WORK
+
+# Executable only. pipeline/ also holds common.sh, which every phase sources and
+# nothing runs; shimming it offers cron a job that is a library.
+shims=()
+for src in "$SHIM_SRC"/pipeline/*.sh; do
+	[ -x "$src" ] && shims+=("$src")
+done
+[ ${#shims[@]} -gt 0 ] || { echo "no executable pipeline scripts in $SHIM_SRC/pipeline; nothing for cron to reach" >&2; exit 3; }
 for src in "${shims[@]}"; do
 	name=$(basename "$src")
 	say "  shim $name"
@@ -80,6 +92,23 @@ for tool in "$LIVE"/bin/*; do
 	say "  link $name"
 	run ln -sfn "$tool" "$BIN_DIR/$name"
 done
+
+# The third symlink the issue names. pr-ready resolves the prose finder through
+# it, so leaving it on the working checkout means a scheduled job runs a skill
+# from whatever branch someone left that checkout on.
+say "==> condense-prose skill: $SKILL_LINK -> $LIVE/skills/condense-prose"
+if [ -d "$LIVE/skills/condense-prose" ]; then
+	run mkdir -p "$(dirname "$SKILL_LINK")"
+	run ln -sfn "$LIVE/skills/condense-prose" "$SKILL_LINK"
+else
+	# Where it still resolves is the thing worth knowing: pr-ready reaches the
+	# prose finder through this link, and one into the working checkout is the
+	# hazard this arrangement removes.
+	say "  no skills/condense-prose in $LIVE"
+	if [ -e "$SKILL_LINK" ]; then
+		say "  WARNING: $SKILL_LINK still resolves to $(readlink -f "$SKILL_LINK")"
+	fi
+fi
 
 say
 if [ "$CHECK" = 1 ]; then

@@ -55,13 +55,22 @@ name = "gate-prove tests"
 when = '^(bin/gate-prove|tests/test_gate_prove\.py)$'
 run = "python3 tests/test_gate_prove.py"
 
-# The phases are shipped code with no suite of their own. A syntax check is
-# what can honestly be claimed here; it is still the difference between a broken
-# phase found now and one found at 02:00 by not running.
-#
-# `xargs -n1`, not a glob: `bash -n a.sh b.sh` parses only a.sh and takes the
-# rest as positional parameters, so the glob form checked one file and passed.
+# install/ and pipeline/ ship shell with no suite. `bash -n` parses; it does not
+# run, so a host that refuses to clone is unseen. `xargs -n1` is not incidental:
+# test_gate_coverage.py rejects the forms that check one file or none.
+[[gates]]
+name = "install syntax"
+when = '^install/.*\.sh$'
+run = "find install -name '*.sh' -print0 | xargs -0 -n1 bash -n"
+
 [[gates]]
 name = "pipeline syntax"
 when = '^pipeline/.*\.sh$'
 run = "find pipeline -name '*.sh' -print0 | xargs -0 -n1 bash -n"
+
+# The manifest and its checker. A `when` broken here breaks selection everywhere,
+# and editing either selected nothing.
+[[gates]]
+name = "gate coverage"
+when = '^(gates\.toml|tests/test_gate_coverage\.py)$'
+run = "python3 tests/test_gate_coverage.py"
