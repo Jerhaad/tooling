@@ -79,3 +79,49 @@ run = "python3 tests/test_gate_coverage.py"
 name = "triage-on-merge tests"
 when = '^(pipeline/triage-on-merge\.sh|bin/hermes-triage|tests/test_triage_on_merge\.py)$'
 run = "python3 tests/test_triage_on_merge.py"
+
+# Syntax floor for the eight bin/ tools that have no suite. Each gate names
+# exactly the one file it parses: `bash -n a.sh b.sh` parses only the first
+# and treats the rest as positional args, and `find -exec` does not propagate
+# the exit status of what it runs, so the run has to be the per-file form.
+# This establishes the file parses and nothing more -- real coverage would
+# pin a behaviour, not a parse, and writing eight suites is a separate task.
+[[gates]]
+name = "gate-untested syntax"
+when = '^(bin/gate-untested)$'
+run = "bash -n bin/gate-untested"
+
+[[gates]]
+name = "hermes-doctor syntax"
+when = '^(bin/hermes-doctor)$'
+run = "python3 -m py_compile bin/hermes-doctor"
+
+[[gates]]
+name = "hermes-skills-sync syntax"
+when = '^(bin/hermes-skills-sync)$'
+run = "bash -n bin/hermes-skills-sync"
+
+[[gates]]
+name = "hermes-triage syntax"
+when = '^(bin/hermes-triage)$'
+run = "bash -n bin/hermes-triage"
+
+[[gates]]
+name = "issue-grade syntax"
+when = '^(bin/issue-grade)$'
+run = "python3 -m py_compile bin/issue-grade"
+
+[[gates]]
+name = "pg-explain syntax"
+when = '^(bin/pg-explain)$'
+run = "bash -n bin/pg-explain"
+
+[[gates]]
+name = "redaction-check syntax"
+when = '^(bin/redaction-check)$'
+run = "bash -n bin/redaction-check"
+
+[[gates]]
+name = "repo-branch-sweep syntax"
+when = '^(bin/repo-branch-sweep)$'
+run = "bash -n bin/repo-branch-sweep"
