@@ -106,3 +106,7 @@ unmodified tree first. A command that could not start is reported as unprovable.
 
 Each gate inherits the blind spots of the command it runs. `gate-verify` refuses
 a branch no gate matches rather than reporting a pass it did not earn.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
