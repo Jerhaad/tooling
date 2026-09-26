@@ -130,14 +130,18 @@ fi
 # builds on two *different* hosts still land on one pool of memory, and the peak
 # is what takes guests down. A per-host lock cannot see that, which is how
 # "a second builder buys parallelism" was true of CPU and false of RAM. Every
-# dispatch leaves from this machine, so one lock here serialises the cluster.
+# dispatch leaves from this machine, so one lock here serialises the builders
+# that share a memory pool; a lane with its own LANE_POOL has its own lock.
 # How many build caches the host keeps, this run's own included. A number
 # rather than an age, because the disk is spent by how many exist. It is an
 # override rather than a constant since the right value is a property of the
 # builder's disk, which this tool cannot see.
 KEEP_CACHES=${REMOTE_TASK_KEEP_CACHES:-6}
 
-BUILD_LOCK=${REMOTE_TASK_LOCK:-$HOME/.local/state/agent-tools/build.lock}
+BUILD_LOCK=$(lock_for)
+if [ -n "${REMOTE_LANE:-}" ]; then
+	echo "==> lane ${REMOTE_LANE}: host=$REMOTE lock=$BUILD_LOCK"
+fi
 mkdir -p "$(dirname "$BUILD_LOCK")"
 exec {lockfd}>"$BUILD_LOCK"
 flock "$lockfd"

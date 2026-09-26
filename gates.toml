@@ -46,6 +46,11 @@ when = '^(bin/remote-task|bin/remote-run|lib/common\.sh|tests/test_remote_path\.
 run = "python3 tests/test_remote_path.py"
 
 [[gates]]
+name = "remote lane tests"
+when = '^(bin/remote-task|lib/common\.sh|hosts\.env\.example|tests/test_remote_lane\.py)$'
+run = "python3 tests/test_remote_lane.py"
+
+[[gates]]
 name = "remote-prune tests"
 when = '^(bin/remote-prune|tests/test_remote_prune\.py)$'
 run = "python3 tests/test_remote_prune.py"
