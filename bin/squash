@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# Squash every commit between HEAD and the branch's fork point into one.
+#
+# The bug this answers: `reset --soft origin/main` follows the ref, and a
+# fetch in a sibling worktree can move it between fork and squash. `merge-base`
+# is fixed, so the squash commit's parent stays at the fork point.
+#
+# Usage: squash [--base REF] (-m MSG | -F FILE)
+set -euo pipefail
+
+# readlink -f, not `cd -P`: bin/ is reached through a symlink on PATH, and
+# BASH_SOURCE holds the symlink's own path.
+LIB=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)
+# shellcheck source=../lib/common.sh
+. "$LIB/common.sh"
+
+usage() {
+	cat >&2 <<'EOF'
+usage: squash [--base REF] (-m MSG | -F FILE)
+
+  --base REF   ref to compute the fork point against (default: origin/main)
+  -m MSG       commit message
+  -F FILE      commit message file
+EOF
+	exit 2
+}
+
+BASE=origin/main
+MSG_FILE=
+MSG_TEXT=
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--base) [ $# -ge 2 ] || usage; BASE=$2; shift 2 ;;
+	-m) [ $# -ge 2 ] || usage; MSG_TEXT=$2; shift 2 ;;
+	-F) [ $# -ge 2 ] || usage; MSG_FILE=$2; shift 2 ;;
+	-h | --help) usage ;;
+	*) echo "squash: unknown argument: $1" >&2; usage ;;
+	esac
+done
+
+# A lane cannot answer an editor. Both message forms are required so the
+# tool never has to guess and never has to launch a prompt.
+if [ -n "$MSG_TEXT" ] && [ -n "$MSG_FILE" ]; then
+	echo "squash: -m and -F are mutually exclusive" >&2
+	exit 2
+fi
+if [ -z "$MSG_TEXT" ] && [ -z "$MSG_FILE" ]; then
+	echo "squash: a commit message is required (-m MSG or -F FILE)" >&2
+	exit 2
+fi
+
+SRC=$(repo_root "$PWD")
+cd "$SRC"
+
+# All pre-flight refusals live here, before anything is moved.
+git rev-parse --verify --quiet "$BASE" >/dev/null || {
+	echo "squash: no such ref: $BASE" >&2
+	exit 2
+}
+if [ -n "$MSG_FILE" ] && [ ! -r "$MSG_FILE" ]; then
+	echo "squash: message file not readable: $MSG_FILE" >&2
+	exit 2
+fi
+if ! git diff --quiet || ! git diff --cached --quiet; then
+	echo "squash: refusing to run with a dirty index or working tree" >&2
+	git status --short >&2
+	echo "Commit or stash your changes before squashing." >&2
+	exit 1
+fi
+
+PRE=$(git rev-parse HEAD)
+MERGE_BASE=$(git merge-base "$BASE" HEAD)
+
+# Already squashed: HEAD equals the fork, or sits one commit on top of it.
+# Exit 0 so a re-run after a successful squash reads as success.
+if [ "$PRE" = "$MERGE_BASE" ]; then
+	echo "squash: HEAD is already at the fork point ($PRE); nothing to squash" >&2
+	exit 0
+fi
+if [ "$(git rev-list --count "$MERGE_BASE"..HEAD)" = "1" ]; then
+	echo "squash: HEAD is already one commit on top of the fork ($PRE); nothing to squash" >&2
+	exit 0
+fi
+
+git reset --soft "$MERGE_BASE"
+
+# A failing commit (a rejecting hook, a signing error) would leave HEAD on the
+# fork point; put it back.
+trap 'git reset --soft "$PRE" >/dev/null; exit 1' ERR
+
+if [ -n "$MSG_FILE" ]; then
+	git commit --quiet -F "$MSG_FILE"
+else
+	git commit --quiet -m "$MSG_TEXT"
+fi
+
+trap - ERR
+
+# The clean-tree refusal makes the index equal PRE's tree, so a changed tree
+# here means something else wrote the index mid-run.
+if ! git diff --quiet "$PRE" HEAD; then
+	POST=$(git rev-parse HEAD)
+	git reset --soft "$PRE" >/dev/null
+	echo "squash: tree changed after the squash (refusing)" >&2
+	echo "  pre-squash:  $PRE" >&2
+	echo "  bad squash:  $POST" >&2
+	echo "  undo with:   git reset --hard $PRE" >&2
+	exit 1
+fi
+
+echo "squash: $PRE -> $(git rev-parse HEAD)"
+echo "  undo with: git reset --hard $PRE"
