@@ -73,11 +73,12 @@ name = "pipeline syntax"
 when = '^pipeline/.*\.sh$'
 run = "find pipeline -name '*.sh' -print0 | xargs -0 -n1 bash -n"
 
-# The manifest and its checker. A `when` broken here breaks selection everywhere,
-# and editing either selected nothing.
+# The manifest and its checker, run on any diff that adds a tool or a suite.
+# That makes this `when` a catch-all over bin/ and tests/, which the PHONY
+# probe correctly declines to count as coverage for any one of them.
 [[gates]]
 name = "gate coverage"
-when = '^(gates\.toml|tests/test_gate_coverage\.py)$'
+when = '^(gates\.toml|tests/test_gate_coverage\.py|bin/|tests/test_[^/]*\.py)'
 run = "python3 tests/test_gate_coverage.py"
 
 [[gates]]

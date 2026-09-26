@@ -9,15 +9,12 @@ that would also match a name under bin/ that nothing owns) wins the assertion
 by accident: the check would report full coverage while running only the gate
 that happened to match the broad pattern. The probe for that is mechanical: if
 a gate's `when` also matches `bin/<a name that does not exist>`, it is matching
-the directory, not this tool, and is not coverage for any specific one.
+the directory, not this tool, and is not coverage for any specific one. The
+same probe distinguishes a real suite-coverage gate from one whose `when` is
+just a catch-all for tests/.
 
-Checked both directions for suites: a suite no `when` selects, and a gate
-whose `run` names a file that is gone.
-
-The `self_tests` cases at the bottom exercise the probe against patterns the
-issue names (bare `bin/`, blanket `^bin/.*`). They build a fake bin/ and a
-fake gates list in a tmpdir so the tightened check can be run end-to-end
-without rotating a gate in the real manifest.
+`self_tests` runs the probe against bare and blanket patterns for both
+directories.
 
 Run directly: `python3 tests/test_gate_coverage.py`.
 """
@@ -43,6 +40,9 @@ EXEMPT = {"test_gate_coverage.py"}
 # also matches any tool, which is not coverage for any of them.
 PHONY = "bin/__definitely_not_a_real_tool__"
 
+# The same probe for tests/: a suite name nothing owns.
+SUITE_PHONY = "tests/test___definitely_not_a_real_suite___.py"
+
 # bin/ and tests/ have per-file checks above, which the directory rule would
 # only paper over. skills/ is content the installer symlinks, not code this
 # repository has committed to gating. Hidden directories are VCS state.
@@ -53,15 +53,25 @@ SOURCE_EXTS = (".sh", ".py")
 
 def check_suites(gates: list, tests_dir: Path) -> tuple[list[str], list[str]]:
     """A suite no `when` selects is one gate-verify refuses to gate at all.
+    A gate that also matches SUITE_PHONY covers the directory, not this suite.
     A gate naming a suite that is gone passes green having run nothing."""
     failures = []
     suites = sorted(p.name for p in tests_dir.glob("test_*.py")
                     if p.name not in EXEMPT)
     for suite in suites:
         rel = f"tests/{suite}"
-        if not any(g.get("when") and re.search(g["when"], rel) for g in gates):
+        matching = [g for g in gates
+                    if g.get("when") and re.search(g["when"], rel)]
+        if not matching:
             failures.append(
                 f"{rel} is named by no gate, so editing it runs nothing")
+            continue
+        real = [g for g in matching if not re.search(g["when"], SUITE_PHONY)]
+        if not real:
+            names = ", ".join(g.get("name", "?") for g in matching)
+            failures.append(
+                f"{rel}: only catch-all gates name it ({names} "
+                f"also match {SUITE_PHONY!r})")
     for g in gates:
         for named in re.findall(r"tests/test_\w+\.py", g.get("run", "")):
             if not (REPO_ROOT / named).is_file():
@@ -177,11 +187,8 @@ def main() -> int:
 
 # ----- self_tests ----------------------------------------------------------
 #
-# End-to-end checks of `check_tools` against patterns the issue names. A fake
-# bin/ and a fake gates list are built in a tmpdir so the tightened check can
-# be exercised without rotating a gate in the real manifest. These run as part
-# of the script so a developer running it sees both "the manifest pins"
-# (main) and "the probe does what it says" (self_tests).
+# `check_tools` and `check_suites` against a fake bin/, tests/ and gates list,
+# so the probe is exercised without editing the real manifest.
 
 def self_tests() -> int:
     failures = []
@@ -221,6 +228,69 @@ def self_tests() -> int:
            "run": "echo ok"}],
          ["hermes-doctor"],
          "matches no gate"),
+        # The audit's own catch-all `when` must not cover a new tool.
+        ("audit gate alone does not cover a new tool",
+         [{"name": "audit", "when": "^(bin/)",
+           "run": "echo ok"}],
+         ["brand-new-tool"],
+         "only catch-all"),
+        ("audit gate plus a specific gate covers a new tool",
+         [
+             {"name": "audit", "when": "^(bin/)",
+              "run": "echo ok"},
+             {"name": "specific", "when": r"^(bin/brand-new-tool)$",
+              "run": "echo ok"},
+         ],
+         ["brand-new-tool"],
+         None),
+    ]
+
+    # (label, gates, suite files, expected failure substring or None)
+    suite_cases = [
+        ("bare tests/ catch-all is not coverage",
+         [{"name": "catch-all", "when": r"^(tests/)",
+           "run": "echo ok"}],
+         ["test_brand_new.py"],
+         "only catch-all"),
+        ("blanket tests/ pattern is not coverage",
+         [{"name": "catch-all", "when": r"^tests/test_\w+\.py$",
+           "run": "echo ok"}],
+         ["test_brand_new.py"],
+         "only catch-all"),
+        ("specific tests/test_*.py is real coverage",
+         [{"name": "specific",
+           "when": r"^(tests/test_brand_new\.py)$",
+           "run": "echo ok"}],
+         ["test_brand_new.py"],
+         None),
+        ("one specific gate among tests/ catch-alls counts",
+         [
+             {"name": "catch-all", "when": r"^(tests/)",
+              "run": "echo ok"},
+             {"name": "specific",
+              "when": r"^(tests/test_brand_new\.py)$",
+              "run": "echo ok"},
+         ],
+         ["test_brand_new.py"],
+         None),
+        # The audit's own catch-all `when` must not cover a new suite.
+        ("audit gate alone does not cover a new suite",
+         [{"name": "audit",
+           "when": r"^(tests/test_\w+\.py|bin/)",
+           "run": "echo ok"}],
+         ["test_brand_new.py"],
+         "only catch-all"),
+        ("audit gate plus a specific gate covers a new suite",
+         [
+             {"name": "audit",
+              "when": r"^(tests/test_\w+\.py|bin/)",
+              "run": "echo ok"},
+             {"name": "specific",
+              "when": r"^(tests/test_brand_new\.py)$",
+              "run": "echo ok"},
+         ],
+         ["test_brand_new.py"],
+         None),
     ]
 
     with tempfile.TemporaryDirectory() as t:
@@ -235,6 +305,22 @@ def self_tests() -> int:
             for tool in tools:
                 (fake_bin / tool).write_text("#!/usr/bin/sh\n")
             fails = check_tools(gates, fake_bin)
+            if expect is None:
+                if fails:
+                    failures.append(
+                        f"{label}: expected pass, got {fails}")
+            else:
+                if not any(expect in f for f in fails):
+                    failures.append(
+                        f"{label}: expected a failure containing {expect!r}, "
+                        f"got {fails}")
+
+        for case_no, (label, gates, suites_, expect) in enumerate(suite_cases):
+            fake_tests = tmp / f"suite-{case_no}" / "tests"
+            fake_tests.mkdir(parents=True)
+            for suite in suites_:
+                (fake_tests / suite).write_text("#!/usr/bin/env python3\n")
+            fails, _ = check_suites(gates, fake_tests)
             if expect is None:
                 if fails:
                     failures.append(
@@ -279,13 +365,29 @@ def self_tests() -> int:
                     cached.unlink()
                 (work / "__pycache__").rmdir()
 
+    # The real manifest's audit fires on bin/ and tests/test_*.py paths. The
+    # probes name no file the `when` lists literally, so each exercises its arm.
+    real_gates = tomllib.loads(GATES.read_text()).get("gates", [])
+    coverage_gates = [g for g in real_gates
+                      if g.get("name") == "gate coverage"]
+    if not coverage_gates:
+        failures.append("real manifest has no `gate coverage` gate")
+    else:
+        audit_when = coverage_gates[0].get("when", "")
+        for probe in ("bin/pr-ready", "tests/test_pr_ready.py"):
+            if not re.search(audit_when, probe):
+                failures.append(
+                    f"`gate coverage`'s `when` ({audit_when!r}) does not "
+                    f"select {probe}; the audit must fire on bin/ and "
+                    f"tests/test_*.py diffs")
+
     if failures:
         print("FAIL self_tests:")
         for f in failures:
             print(" -", f)
         return 1
     print(f"PASS self_tests ({len(coverage_cases)} coverage, "
-          f"{len(syntax_cases)} syntax-floor cases)")
+          f"{len(suite_cases)} suite, {len(syntax_cases)} syntax-floor cases)")
     return 0
 
 
