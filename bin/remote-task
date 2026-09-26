@@ -85,18 +85,28 @@ ssh "$REMOTE" "mkdir -p $DEST"
 # adds migrations goes on applying the old one, and the gate fails naming a table
 # the diff never mentions. Caught here, where the staleness is created.
 #
-# The fingerprint compares what the remote last received against what is being
-# sent now, and is recorded after the sync so a partial failure leaves no stale
-# hash. Without [task.migrator] there is nothing to touch and the run is
-# unchanged.
+# Compare against the last successful build, not the last transfer. Discover
+# embedding sites even without a manifest list; declared sources add custom
+# sites without suppressing any discovered ones.
 MIGRATOR_FP=""
 MIGRATOR_STALE=0
-if [ ${#TASK_MIGRATOR_SOURCES[@]} -gt 0 ] && [ -d "$SRC/$TASK_MIGRATOR_DIR" ]; then
+if [ -d "$SRC/$TASK_MIGRATOR_DIR" ]; then
+	output=$(python3 "$LIB/migrator.py" "$SRC" "$TASK_MIGRATOR_DIR" "${TASK_MIGRATOR_SOURCES[@]}")
+	eval "$output"
 	MIGRATOR_FP=$(cd "$SRC" && find "$TASK_MIGRATOR_DIR" -type f -print0 \
 		| sort -z | xargs -0 sha256sum 2>/dev/null \
 		| sha256sum | awk '{print $1}')
+	# Version the sentinel so pre-discovery caches cannot look verified. A
+	# different command or source set must invalidate too: tasks share a cache
+	# but a successful command may compile only some of the embedding sites.
+	MIGRATOR_FP=$(printf '%s\0' "guard-v2" "$MIGRATOR_FP" "$TASK_COMMAND" "${TASK_MIGRATOR_SOURCES[@]}" | sha256sum | awk '{print $1}')
 	REMOTE_FP=$(ssh "$REMOTE" "cat $DEST/.migrations-fingerprint 2>/dev/null" || true)
-	[ -n "$REMOTE_FP" ] && [ "$REMOTE_FP" != "$MIGRATOR_FP" ] && MIGRATOR_STALE=1
+	# A missing sentinel can mean an old warm cache adopting this guard.
+	[ "$REMOTE_FP" != "$MIGRATOR_FP" ] && MIGRATOR_STALE=1
+	if [ "$MIGRATOR_STALE" = 1 ] && [ ${#TASK_MIGRATOR_SOURCES[@]} -eq 0 ]; then
+		echo "migration guard: $TASK_MIGRATOR_DIR changed or has no verified fingerprint, but no embedding sources were found; declare [task.migrator].sources for custom embedding" >&2
+		exit 1
+	fi
 fi
 
 # Exclude the fingerprint sentinel the same way target/ is excluded: the
@@ -114,18 +124,12 @@ if [ "$MIGRATOR_STALE" = 1 ]; then
 	touch_args=""
 	sep=""
 	for src in "${TASK_MIGRATOR_SOURCES[@]}"; do
-		touch_args="$touch_args$sep$DEST/$src"
+		quoted=$(python3 -c 'import shlex, sys; print(shlex.quote(sys.argv[1]))' "$DEST/$src")
+		touch_args="$touch_args$sep$quoted"
 		sep=" "
 	done
-	echo "==> migrations changed since last sync; touching ${#TASK_MIGRATOR_SOURCES[@]} source(s) that hold a Migrator"
+	echo "==> migrations changed or unverified; touching ${#TASK_MIGRATOR_SOURCES[@]} source(s) that hold a Migrator"
 	ssh "$REMOTE" "touch $touch_args"
-fi
-
-# Write the fingerprint *after* the sync so the recorded hash reflects the
-# content that was just delivered. Under `set -e`, an rsync failure exits
-# before this line.
-if [ -n "$MIGRATOR_FP" ]; then
-	ssh "$REMOTE" "printf '%s\n' '$MIGRATOR_FP' > $DEST/.migrations-fingerprint"
 fi
 
 if [ -n "$TASK_DB_CONTAINER" ]; then
@@ -198,6 +202,13 @@ cd $DEST
 $DB_ENV
 $TASK_COMMAND
 REMOTE_SCRIPT
+
+# A failed build must retry invalidation: the next rsync restores local mtimes.
+# Advance the sentinel only after the command succeeds, so failure cannot mark
+# a stale cache as verified.
+if [ -n "$MIGRATOR_FP" ]; then
+	ssh "$REMOTE" "printf '%s\n' '$MIGRATOR_FP' > $DEST/.migrations-fingerprint"
+fi
 
 # A build resolves dependencies where it runs, which is not where the commit is
 # made: a lock file updated remotely and never copied back leaves the branch

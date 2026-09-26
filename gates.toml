@@ -37,7 +37,7 @@ run = "python3 tests/test_tools_live_run.py"
 
 [[gates]]
 name = "remote-task drift tests"
-when = '^(bin/remote-task|bin/task-mirror-check|lib/workflow_steps\.py|tests/test_remote_task_drift\.py)$'
+when = '^(bin/remote-task|lib/migrator\.py|bin/task-mirror-check|lib/workflow_steps\.py|tests/test_remote_task_drift\.py)$'
 run = "python3 tests/test_remote_task_drift.py"
 
 [[gates]]
