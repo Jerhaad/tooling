@@ -18,16 +18,42 @@ TOOLS_LIB=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # fatal, which is the right outcome for a gate that would otherwise guess.
 manifest() { python3 "$TOOLS_LIB/manifest.py" "$@"; }
 
+env_name() { printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_'; }
+
 # Roles are named for what a host can do, so a project asks for `cluster` and
 # never for anyone's hostname.
+#
+# A lane is an alternative builder: REMOTE_LANE selects HOST_BUILDER_<LANE>
+# and leaves every other role alone. There is no fallback, because the env file
+# above may set HOST_BUILDER unconditionally, and falling back would send a
+# lane's build to the default host silently.
 host_for() {
-	local role=$1 var
-	var="HOST_$(printf '%s' "$role" | tr '[:lower:]-' '[:upper:]_')"
+	local var
+	var="HOST_$(env_name "$1")"
+	if [ "$1" = builder ] && [ -n "${REMOTE_LANE:-}" ]; then
+		var="${var}_$(env_name "$REMOTE_LANE")"
+	fi
 	if [ -z "${!var:-}" ]; then
-		echo "set $var to an ssh target for the '$role' role (see hosts.env.example)" >&2
+		echo "set $var to an ssh target for the '$1' role (see hosts.env.example)" >&2
 		return 1
 	fi
 	printf '%s' "${!var}"
+}
+
+# Builders whose memory comes from one pool share a dispatch lock. A lane
+# without LANE_POOL_<LANE> shares it too: a wrong shared lock costs
+# parallelism, a wrong private one costs the protection the lock exists for.
+lock_for() {
+	local var pool=build
+	if [ -n "${REMOTE_TASK_LOCK:-}" ]; then
+		printf '%s' "$REMOTE_TASK_LOCK"
+		return
+	fi
+	if [ -n "${REMOTE_LANE:-}" ]; then
+		var="LANE_POOL_$(env_name "$REMOTE_LANE")"
+		pool=${!var:-build}
+	fi
+	printf '%s' "$HOME/.local/state/agent-tools/$pool.lock"
 }
 
 # A non-interactive ssh reads no profile, so a version manager that puts tools on
