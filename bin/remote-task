@@ -14,6 +14,26 @@
 # the branch before it.
 set -euo pipefail
 
+TASK=bench NAME=unknown REMOTE_TASK_DONE=0
+# Installed before setup so every failure ends in one verdict. A signal-killed
+# run reaches this trap with $? still 0, so PASS also needs REMOTE_TASK_DONE,
+# set by the script's last line. An INT/TERM trap would not help: bash defers
+# it until the foreground ssh returns, holding a killed run open.
+verdict() {
+	local status=$?
+	trap - EXIT
+	if [ "$status" -eq 0 ] && [ "$REMOTE_TASK_DONE" = 1 ]; then
+		printf '==> PASS (%s: %s)\n' "$TASK" "$NAME" || :
+	else
+		local reason
+		if [ "$status" -eq 0 ]; then reason=interrupted; else reason="exit $status"; fi
+		printf '==> FAIL (%s: %s, %s)\n' "$TASK" "$NAME" "$reason" || :
+		[ "$status" -ne 0 ] || status=1
+	fi
+	exit "$status"
+}
+trap verdict EXIT
+
 # readlink -f, not `cd -P`: these are installed as symlinks into a bin
 # directory on PATH, and BASH_SOURCE holds the symlink's own path. `cd -P`
 # resolves symlinks inside the path it is given, not the script's location, so
@@ -192,10 +212,8 @@ for f in ${TASK_FETCH[@]+"${TASK_FETCH[@]}"}; do
 	fi
 done
 
-echo "==> PASS ($TASK: $NAME)"
-
 # Drift report between the command that just ran and the CI job it mirrors.
-# After the PASS line: a failed build is already red, and the report is
+# Before the final verdict: a failed build is already red, and the report is
 # about a run that succeeded. The tool is advisory -- exit 0 whatever it
 # finds, and a task without [task.mirrors] exits silently before printing --
 # so a project that has not opted in sees no change. The guard keeps the
@@ -206,3 +224,6 @@ if command -v task-mirror-check >/dev/null 2>&1; then
 else
 	echo "==> task-mirror-check not on PATH: skipping drift report"
 fi
+
+# Must stay the last statement: verdict reads it as "the run finished".
+REMOTE_TASK_DONE=1

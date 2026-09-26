@@ -10,10 +10,12 @@ so a regression in any of them is caught here, not just in the tool's own
 tests.
 """
 import os
+import signal
 import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -236,10 +238,14 @@ def make_fakebin(tmpdir: Path, extra: dict | None = None,
     return fake
 
 
-def run_remote_task(project: Path, fakebin: Path, repo_bin: bool,
-                     fake_remote_root: Path | None = None
-                     ) -> subprocess.CompletedProcess:
-    """Run the real remote-task against the fake project, hermetically."""
+def remote_task_env(project: Path, fakebin: Path, repo_bin: bool,
+                    fake_remote_root: Path | None = None) -> dict:
+    """The hermetic environment a remote-task run is built in.
+
+    Shared by run_remote_task and the kill test, which Popen's the same
+    command but has to signal it mid-run: two copies of this env would
+    drift, and a test that reaches a real host or lock is not hermetic.
+    """
     env_file = project / "tools.env"
     env_file.write_text("")
     lock = project / "build.lock"
@@ -261,8 +267,17 @@ def run_remote_task(project: Path, fakebin: Path, repo_bin: bool,
     }
     if fake_remote_root is not None:
         env["FAKE_REMOTE_ROOT"] = str(fake_remote_root)
+    return env
+
+
+def run_remote_task(project: Path, fakebin: Path, repo_bin: bool,
+                     fake_remote_root: Path | None = None
+                     ) -> subprocess.CompletedProcess:
+    """Run the real remote-task against the fake project, hermetically."""
     return subprocess.run([str(REMOTE_TASK), str(project)],
-                          capture_output=True, text=True, env=env)
+                          capture_output=True, text=True,
+                          env=remote_task_env(project, fakebin, repo_bin,
+                                              fake_remote_root))
 
 
 def assert_pass(msg: str, cond: bool, detail: str = "") -> None:
@@ -270,8 +285,8 @@ def assert_pass(msg: str, cond: bool, detail: str = "") -> None:
         raise AssertionError(f"{msg}: {detail}")
 
 
-def test_reports_drift_after_pass():
-    """A successful run with a mirrors block ends in the drift report."""
+def test_reports_drift_before_final_pass():
+    """A successful run reports drift before its final verdict."""
     with tempfile.TemporaryDirectory() as t:
         project = setup_project(Path(t) / "proj", True)
         fakebin = make_fakebin(Path(t))
@@ -284,9 +299,13 @@ def test_reports_drift_after_pass():
         assert_pass("missing step recommended",
                     "+ cargo test --workspace" in out, out)
         # The report is an observation after the run, not before or instead
-        # of it: the PASS line comes first.
-        assert_pass("report after the PASS line",
-                    out.index("==> PASS") < out.index("drift report"), out)
+        # of it: the PASS line comes last.
+        lines = out.splitlines()
+        verdicts = [line for line in lines
+                    if line.startswith(("==> PASS", "==> FAIL"))]
+        assert_pass("exactly one PASS, on the final line",
+                    verdicts == ["==> PASS (bench: proj)"]
+                    and lines[-1] == verdicts[0], out)
 
 
 def test_no_mirrors_is_unchanged():
@@ -601,9 +620,99 @@ def test_touch_survives_a_real_rsync():
                 "-- a touch before the sync is reverted by rsync -a")
 
 
+
+def test_failures_have_one_final_verdict():
+    """Setup, sync, remote command, and fetch failures retain their status."""
+    cases = [
+        ("mkdir", {"ssh": "#!/bin/sh\nexit 17\n"}, 17),
+        ("sync", {"rsync": "#!/bin/sh\nexit 23\n"}, 23),
+        ("command", {"ssh": "#!/bin/sh\ncase \"$2\" in flock*) cat >/dev/null; exit 42;; esac\n"}, 42),
+        ("fetch", {"rsync": "#!/bin/sh\ncase \"$*\" in *fakehost:bench/proj/result*) exit 24;; esac\nexit 0\n"}, 24),
+        ("manifest", {}, 1),
+    ]
+    for stage, extra, status in cases:
+        with tempfile.TemporaryDirectory() as t:
+            project = setup_project(Path(t) / "proj", False)
+            if stage == "fetch":
+                with (project / "gates.toml").open("a") as f:
+                    f.write('fetch = ["result"]\n')
+            if stage == "manifest":
+                (project / "gates.toml").write_text("invalid = [")
+            fakebin = make_fakebin(Path(t), extra=extra)
+            r = run_remote_task(project, fakebin, repo_bin=False)
+            assert_pass(stage + " exit status", r.returncode == status, repr(r))
+            lines = r.stdout.splitlines()
+            verdicts = [line for line in lines if line.startswith(("==> PASS", "==> FAIL"))]
+            expected = f"==> FAIL (bench: proj, exit {status})"
+            assert_pass(stage + " one final verdict",
+                        verdicts == [expected] and lines[-1] == expected, r.stdout)
+
+
+# Holds the build (the ssh call carrying `flock`) open to be killed. It drains
+# the heredoc first, or remote-task's write gets EPIPE, and drops its stdout
+# and stderr before sleeping, or communicate() waits for the sleep.
+KILL_FAKE_SSH = r"""#!/bin/sh
+case "$*" in
+*flock*)
+  cat > /dev/null
+  touch "${KILL_TEST_MARKER:?}"
+  exec 1>/dev/null 2>/dev/null
+  sleep 30
+  ;;
+esac
+exit 0
+"""
+
+
+def test_killed_run_does_not_pass():
+    """SIGTERM mid-build ends in a FAIL naming the interruption, not a PASS."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        project = setup_project(tmp / "proj", False)
+        marker = tmp / "sleep-started"
+        fakebin = make_fakebin(tmp, extra={"ssh": KILL_FAKE_SSH})
+        env = remote_task_env(project, fakebin, repo_bin=False)
+        env["KILL_TEST_MARKER"] = str(marker)
+        proc = subprocess.Popen([str(REMOTE_TASK), str(project)],
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                text=True, env=env)
+        deadline = time.time() + 30
+        while not marker.exists():
+            if proc.poll() is not None:
+                out, err = proc.communicate()
+                raise AssertionError(
+                    f"remote-task died before the build started: "
+                    f"rc={proc.returncode} stdout={out!r} stderr={err!r}")
+            if time.time() > deadline:
+                proc.kill()
+                proc.communicate()
+                raise AssertionError(
+                    "marker never appeared: the build dispatch was not reached")
+            time.sleep(0.05)
+        proc.send_signal(signal.SIGTERM)
+        out, err = proc.communicate(timeout=30)
+        lines = out.splitlines()
+        verdicts = [line for line in lines
+                    if line.startswith(("==> PASS", "==> FAIL"))]
+        assert_pass("a killed run exits non-zero",
+                    proc.returncode != 0,
+                    f"rc={proc.returncode} stdout={out!r} stderr={err!r}")
+        assert_pass("the final line names the interruption",
+                    len(verdicts) == 1 and bool(lines)
+                    and lines[-1] == verdicts[0]
+                    and verdicts[0].startswith("==> FAIL (bench")
+                    and "interrupted" in verdicts[0],
+                    f"stdout={out!r} stderr={err!r}")
+        assert_pass("no PASS anywhere",
+                    not any(line.startswith("==> PASS") for line in lines), out)
+
+
 def main() -> int:
     tests = [
-        test_reports_drift_after_pass,
+        test_failures_have_one_final_verdict,
+        test_killed_run_does_not_pass,
+        test_reports_drift_before_final_pass,
         test_no_mirrors_is_unchanged,
         test_failing_tool_does_not_fail_run,
         test_missing_tool_is_named,
