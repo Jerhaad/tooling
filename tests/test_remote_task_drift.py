@@ -108,6 +108,10 @@ def setup_project_migrator(tmpdir: Path, sources: list[str] | None,
         mig.mkdir(exist_ok=True)
         for name, body in migrations:
             (mig / name).write_text(body)
+    for source in sources or []:
+        path = tmpdir / source
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("// custom embedding site\n")
     for args in (
         ["init", "-q"],
         ["config", "user.email", "test@example.com"],
@@ -171,12 +175,12 @@ cat)
   cat "$root/$f" 2>/dev/null || true
   ;;
 touch)
-  # `touch FILE1 FILE2 ...`: take every argument that isn't a flag.
-  for a in $cmdline; do
-    case "$a" in
-      touch|-*) ;;
-      *) mkdir -p "$root/$(dirname "$a")"; touch "$root/$a" ;;
-    esac
+  # Parse with the remote shell's quoting rules, including spaces in paths.
+  eval "set -- $cmdline"
+  shift
+  for a in "$@"; do
+    mkdir -p "$root/$(dirname "$a")"
+    touch "$root/$a"
   done
   ;;
 printf)
@@ -375,7 +379,8 @@ MIGRATIONS_V2 = [("0001_init.sql", "CREATE TABLE init (id INT);\n"),
                  ("0002_added.sql", "CREATE TABLE added (id INT);\n")]
 
 
-def local_fingerprint(migrations: list[tuple[str, str]]) -> str:
+def local_fingerprint(migrations: list[tuple[str, str]], sources=None,
+                      command="cargo build --workspace") -> str:
     """The same fingerprint remote-task computes locally.
 
     The bash side runs `find | sort -z | xargs sha256sum | sha256sum`.
@@ -389,7 +394,10 @@ def local_fingerprint(migrations: list[tuple[str, str]]) -> str:
     for name, body in sorted(migrations):
         body_hash = hashlib.sha256(body.encode()).hexdigest()
         lines.append(f"{body_hash}  migrations/{name}\n")
-    return hashlib.sha256("".join(lines).encode()).hexdigest()
+    migration_hash = hashlib.sha256("".join(lines).encode()).hexdigest()
+    values = ["guard-v2", migration_hash, command, *sorted(
+        MIGRATOR_SOURCES if sources is None else sources)]
+    return hashlib.sha256(("\0".join(values) + "\0").encode()).hexdigest()
 
 
 def test_no_migrations_dir_is_unchanged():
@@ -419,39 +427,98 @@ def test_no_migrations_dir_is_unchanged():
                     "==> PASS (bench" in out, out)
 
 
-def test_migrator_unconfigured_is_unchanged():
-    """Project has migrations/ but no [task.migrator] block: silent.
+def test_unconfigured_sources_are_discovered():
+    """No hand-kept manifest list is needed, including integration tests."""
+    for declared in (None, ["custom/embed.rs"]):
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            project = setup_project_migrator(tmp / "proj", declared, MIGRATIONS_V2)
+            sites = ["crates/hypatia-migrate/src/main.rs",
+                     "crates/api-rest/tests/common/mod.rs",
+                     "crates/db/tests/credential_rotation.rs"]
+            for source in sites:
+                path = project / source
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('static M: Migrator = sqlx :: migrate ! ("./migrations");')
+            # Excluded caches must not become embedding sources.
+            for directory in ("target", "node_modules", ".git"):
+                (project / directory).mkdir(exist_ok=True)
+                (project / directory / "ignored.rs").write_text('sqlx::migrate!();')
+            remote = tmp / "remote"
+            dest = remote / "bench/proj"
+            dest.mkdir(parents=True)
+            (dest / ".migrations-fingerprint").write_text(local_fingerprint(MIGRATIONS_V1))
+            fake = make_fakebin(tmp, stateful=True)
+            result = run_remote_task(project, fake, False, remote)
+            assert_pass("automatic discovery succeeds", result.returncode == 0, repr(result))
+            expected = sites + (declared or [])
+            assert_pass("every discovered and declared source invalidated",
+                        all((dest / source).exists() for source in expected), repr(result))
+            assert_pass("excluded caches ignored",
+                        f"touching {len(expected)} source(s)" in result.stdout, result.stdout)
 
-    Without a sources list the tool has nothing to touch and a rebuild
-    is outside its reach. The fingerprint is also skipped, so the next
-    run that does opt in starts from a clean slate.
+
+def test_stray_byte_does_not_abort_discovery():
+    """A .rs file with a non-UTF-8 byte must not abort the embedding scan.
+
+    The scan reads every .rs file; one stray byte used to raise
+    UnicodeDecodeError and kill the whole run before the guard could name
+    the embedding site it still has to touch. surrogateescape carries on past
+    it, so the guard still finds and touches the real site when migrations
+    change.
     """
     with tempfile.TemporaryDirectory() as t:
-        project = setup_project_migrator(
-            Path(t) / "proj", sources=None, migrations=MIGRATIONS_V1)
-        fakebin = make_fakebin(Path(t), stateful=True)
-        fake_root = Path(t) / "remote"
-        r = run_remote_task(project, fakebin, repo_bin=False,
-                            fake_remote_root=fake_root)
-        out = r.stdout
-        assert_pass("exit 0", r.returncode == 0, f"stderr={r.stderr!r}")
-        assert_pass("no migration touch line",
-                    "migrations changed" not in out, out)
-        assert_pass("no fingerprint written when not configured",
-                    not (fake_root / "bench" / "proj"
-                         / ".migrations-fingerprint").exists(),
-                    "fingerprint should not exist when [task.migrator] absent")
-        assert_pass("build still reported PASS",
-                    "==> PASS (bench" in out, out)
+        tmp = Path(t)
+        project = setup_project_migrator(tmp / "proj", None, MIGRATIONS_V1)
+        site = "crates/hypatia-migrate/src/main.rs"
+        (project / site).parent.mkdir(parents=True, exist_ok=True)
+        (project / site).write_text(
+            'static M: Migrator = sqlx :: migrate ! ("./migrations");')
+        # A second .rs file holding a stray non-UTF-8 byte. It is never
+        # compiled and embeds no Migrator; the scan must skip over it, not
+        # die on it.
+        (project / "src" / "fixture.rs").parent.mkdir(parents=True, exist_ok=True)
+        (project / "src" / "fixture.rs").write_bytes(b"// caf\xe9\n")
+        remote = tmp / "remote"
+        fake = make_fakebin(tmp, stateful=True)
+        # First run records the baseline fingerprint.
+        first = run_remote_task(project, fake, False, remote)
+        assert_pass("first run records the baseline",
+                    first.returncode == 0, repr(first))
+        # The migration set moves, as a rebase would move it.
+        (project / "migrations" / "0002_added.sql").write_text(
+            MIGRATIONS_V2[1][1])
+        result = run_remote_task(project, fake, False, remote)
+        dest = remote / "bench/proj"
+        assert_pass("second run exits 0 despite the stray byte",
+                    result.returncode == 0, repr(result))
+        assert_pass("the embedding site is discovered and touched",
+                    (dest / site).exists(), repr(result))
 
 
-def test_first_run_writes_fingerprint_no_touch():
-    """A cold cache records the current set; no touch on first sync.
+def test_missing_sources_refuse_and_preserve_fingerprint():
+    for fingerprint in (None, local_fingerprint(MIGRATIONS_V1)):
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            project = setup_project_migrator(tmp / "proj", None, MIGRATIONS_V2)
+            remote = tmp / "remote"
+            dest = remote / "bench/proj"
+            dest.mkdir(parents=True)
+            sentinel = dest / ".migrations-fingerprint"
+            if fingerprint is not None:
+                sentinel.write_text(fingerprint)
+            fake = make_fakebin(tmp, stateful=True)
+            result = run_remote_task(project, fake, False, remote)
+            assert_pass("missing sources refuse", result.returncode != 0, repr(result))
+            assert_pass("diagnostic names directory and remedy",
+                        "migrations" in result.stderr and "task.migrator" in result.stderr, repr(result))
+            assert_pass("failed guard does not advance fingerprint",
+                        sentinel.read_text() == fingerprint if sentinel.exists() else fingerprint is None,
+                        repr(result))
 
-    The first compile is going to embed the migrations from scratch
-    regardless, so a touch adds nothing. Writing the fingerprint
-    afterwards means the *next* run has a baseline to compare against.
-    """
+
+def test_first_run_invalidates_unverified_cache():
+    """No sentinel may mean a warm cache adopting the guard, so invalidate."""
     with tempfile.TemporaryDirectory() as t:
         project = setup_project_migrator(
             Path(t) / "proj", sources=MIGRATOR_SOURCES, migrations=MIGRATIONS_V1)
@@ -461,18 +528,18 @@ def test_first_run_writes_fingerprint_no_touch():
                             fake_remote_root=fake_root)
         out = r.stdout
         assert_pass("exit 0", r.returncode == 0, f"stderr={r.stderr!r}")
-        assert_pass("no migration touch line on first run",
-                    "migrations changed" not in out, out)
+        assert_pass("unverified cache is invalidated on first run",
+                    "migrations changed" in out, out)
         fp_path = fake_root / "bench" / "proj" / ".migrations-fingerprint"
         assert_pass("fingerprint recorded on first sync",
                     fp_path.is_file(), "expected fingerprint to exist")
         assert_pass("fingerprint matches local migration set",
                     fp_path.read_text().strip() == local_fingerprint(MIGRATIONS_V1),
                     fp_path.read_text())
-        assert_pass("no source files were touched on the remote",
-                    not any((fake_root / "bench" / "proj" / s).exists()
+        assert_pass("all sources were touched on the remote",
+                    all((fake_root / "bench" / "proj" / s).exists()
                             for s in MIGRATOR_SOURCES),
-                    "expected no sources to be touched")
+                    "expected sources to be touched")
 
 
 def test_matching_fingerprint_no_touch():
@@ -533,7 +600,7 @@ def test_changed_migrations_touch_sources():
         out = r.stdout
         assert_pass("exit 0", r.returncode == 0, f"stderr={r.stderr!r}")
         assert_pass("announcement line printed",
-                    "migrations changed since last sync" in out, out)
+                    "migrations changed or unverified" in out, out)
         # Names the number of files, so a reviewer can see how broad the
         # rebuild will be without grepping the manifest.
         assert_pass("announcement names the count",
@@ -586,21 +653,26 @@ def test_touch_survives_a_real_rsync():
     with tempfile.TemporaryDirectory() as t:
         tmp = Path(t)
         project = setup_project_migrator(
-            tmp / "proj", sources=MIGRATOR_SOURCES, migrations=MIGRATIONS_V1)
+            tmp / "proj", sources=None, migrations=MIGRATIONS_V1)
         # The sources have to exist for rsync to deliver them, and to be older
         # than the run so a surviving touch is visible as a newer mtime.
         old_time = 1756700000  # a fixed point well before the test runs
         for s in MIGRATOR_SOURCES:
             f = project / s
             f.parent.mkdir(parents=True, exist_ok=True)
-            f.write_text("// holds a Migrator\n")
+            f.write_text('static M: Migrator = sqlx::migrate!("./migrations");\n')
             os.utime(f, (old_time, old_time))
         fakebin = make_fakebin(tmp, stateful=True,
                               extra={"rsync": REAL_RSYNC_STUB})
         fake_root = tmp / "remote"
         # First sync records the baseline fingerprint.
-        run_remote_task(project, fakebin, repo_bin=False,
-                        fake_remote_root=fake_root)
+        first = run_remote_task(project, fakebin, repo_bin=False,
+                                fake_remote_root=fake_root)
+        assert_pass("first automatic run succeeds", first.returncode == 0, repr(first))
+        warm = run_remote_task(project, fakebin, repo_bin=False,
+                               fake_remote_root=fake_root)
+        assert_pass("unchanged warm run avoids rebuild", warm.returncode == 0
+                    and "touching" not in warm.stdout, repr(warm))
         # The migration set moves, as a rebase would move it.
         for name, body in MIGRATIONS_V2:
             (project / "migrations" / name).write_text(body)
@@ -620,6 +692,72 @@ def test_touch_survives_a_real_rsync():
                 "-- a touch before the sync is reverted by rsync -a")
 
 
+
+def test_failed_build_retries_invalidation():
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        project = setup_project_migrator(tmp / "proj", MIGRATOR_SOURCES, MIGRATIONS_V2)
+        remote = tmp / "remote"
+        dest = remote / "bench/proj"
+        dest.mkdir(parents=True)
+        sentinel = dest / ".migrations-fingerprint"
+        old = local_fingerprint(MIGRATIONS_V1)
+        sentinel.write_text(old)
+        failing_ssh = STATEFUL_FAKE_SSH.replace(
+            "  # The build's heredoc form: consume stdin, do nothing.",
+            "  cat >/dev/null; exit 42\n  # failed build")
+        fake = make_fakebin(tmp, stateful=True, extra={"ssh": failing_ssh})
+        failed = run_remote_task(project, fake, False, remote)
+        assert_pass("failed build status", failed.returncode == 42, repr(failed))
+        assert_pass("failed build leaves prior fingerprint", sentinel.read_text() == old)
+        (fake / "ssh").write_text(STATEFUL_FAKE_SSH)
+        retried = run_remote_task(project, fake, False, remote)
+        assert_pass("retry invalidates again", retried.returncode == 0
+                    and "migrations changed" in retried.stdout, repr(retried))
+        assert_pass("successful retry advances fingerprint",
+                    sentinel.read_text().strip() == local_fingerprint(MIGRATIONS_V2))
+
+
+def test_custom_sources_validate_paths():
+    for source in ("missing.rs", "../outside.rs", "target/embed.rs", "linked.rs"):
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            project = setup_project_migrator(tmp / "proj", None, MIGRATIONS_V1)
+            (project / "gates.toml").write_text(manifest_with_migrator([source]))
+            outside = tmp / "outside.rs"
+            outside.write_text("sqlx::migrate!();")
+            (project / "linked.rs").symlink_to(outside)
+            fake = make_fakebin(tmp, stateful=True)
+            result = run_remote_task(project, fake, False, tmp / "remote")
+            assert_pass("invalid source refuses: " + source,
+                        result.returncode != 0 and "migration guard:" in result.stderr, repr(result))
+
+
+def test_command_change_and_legacy_sentinel_invalidate():
+    for old in ("legacy-hash", local_fingerprint(MIGRATIONS_V1, command="cargo test")):
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            project = setup_project_migrator(tmp / "proj", MIGRATOR_SOURCES, MIGRATIONS_V1)
+            remote = tmp / "remote"
+            dest = remote / "bench/proj"
+            dest.mkdir(parents=True)
+            (dest / ".migrations-fingerprint").write_text(old)
+            fake = make_fakebin(tmp, stateful=True)
+            result = run_remote_task(project, fake, False, remote)
+            assert_pass("changed command/legacy cache invalidated", result.returncode == 0
+                        and "touching" in result.stdout, repr(result))
+
+
+def test_source_with_spaces_is_one_remote_path():
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        sources = ["custom dir/embed source.rs"]
+        project = setup_project_migrator(tmp / "proj", sources, MIGRATIONS_V1)
+        remote = tmp / "remote"
+        fake = make_fakebin(tmp, stateful=True)
+        result = run_remote_task(project, fake, False, remote)
+        assert_pass("quoted source touched", result.returncode == 0
+                    and (remote / "bench/proj" / sources[0]).is_file(), repr(result))
 
 def test_failures_have_one_final_verdict():
     """Setup, sync, remote command, and fetch failures retain their status."""
@@ -713,12 +851,18 @@ def main() -> int:
         test_failures_have_one_final_verdict,
         test_killed_run_does_not_pass,
         test_reports_drift_before_final_pass,
+        test_command_change_and_legacy_sentinel_invalidate,
+        test_source_with_spaces_is_one_remote_path,
+        test_failed_build_retries_invalidation,
+        test_custom_sources_validate_paths,
         test_no_mirrors_is_unchanged,
         test_failing_tool_does_not_fail_run,
         test_missing_tool_is_named,
         test_no_migrations_dir_is_unchanged,
-        test_migrator_unconfigured_is_unchanged,
-        test_first_run_writes_fingerprint_no_touch,
+        test_unconfigured_sources_are_discovered,
+        test_stray_byte_does_not_abort_discovery,
+        test_missing_sources_refuse_and_preserve_fingerprint,
+        test_first_run_invalidates_unverified_cache,
         test_matching_fingerprint_no_touch,
         test_changed_migrations_touch_sources,
         test_touch_survives_a_real_rsync,
