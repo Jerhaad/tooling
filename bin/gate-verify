@@ -61,7 +61,30 @@ set -e
 [ "$settled_rc" -eq 0 ] ||
 	echo "WARNING: the worktree above is not settled; gating anyway" >&2
 
-eval "$(manifest "$SRC" gates)"
+output=$(manifest "$SRC" gates)
+eval "$output"
+
+# Documentation and repository metadata; every other path counts as code.
+# This asks whether a diff can go ungated, which is a different question
+# from the coverage walk's SOURCE_EXTS (does a directory ship source).
+is_documentation() {
+	case "${1##*/}" in
+	README|LICENSE|LICENSE.*|LICENCE|LICENCE.*|COPYING|NOTICE|CHANGELOG|AUTHORS|.editorconfig|.gitignore|.gitattributes) return 0 ;;
+	esac
+	case "$1" in
+	*.md|*.rst) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+DOCS=() CODE=()
+for p in "${CHANGED[@]}"; do
+	if is_documentation "$p"; then
+		DOCS+=("$p")
+	else
+		CODE+=("$p")
+	fi
+done
 
 skipped() {
 	local n
@@ -85,9 +108,16 @@ for i in "${!GATE_NAMES[@]}"; do
 	GATES+=("REPO=$(printf '%q' "$SRC") ; ${GATE_RUN[$i]}")
 done
 
+if [ ${#GATES[@]} -eq 0 ] && [ ${#CODE[@]} -eq 0 ]; then
+	echo "nothing to gate:" >&2
+	printf '  %s\n' "${DOCS[@]}" >&2
+	exit 0
+fi
+
+# Named: only the code, so a licence beside an unwired script is not blamed.
 if [ ${#GATES[@]} -eq 0 ]; then
-	echo "no gate matches the changed paths:" >&2
-	printf '  %s\n' "${CHANGED[@]}" >&2
+	echo "no gate matches:" >&2
+	printf '  %s\n' "${CODE[@]}" >&2
 	echo "Add one to gates.toml rather than shipping unverified." >&2
 	exit 1
 fi

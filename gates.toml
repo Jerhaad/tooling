@@ -21,6 +21,11 @@ when = '^(lib/manifest\.py|tests/test_manifest\.py|bin/)'
 run = "python3 tests/test_manifest.py"
 
 [[gates]]
+name = "gate-verify tests"
+when = '^(bin/gate-verify|tests/test_gate_verify\.py)$'
+run = "python3 tests/test_gate_verify.py"
+
+[[gates]]
 name = "pr-ready tests"
 when = '^(bin/pr-ready|tests/test_pr_ready\.py|tests/fixtures/gh_.*\.json)$'
 run = "python3 tests/test_pr_ready.py"
