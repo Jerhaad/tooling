@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Two-line shim installed into a repository's core.hooksPath that delegates
+# to bin/push-guard. Like the other bin/ tools, we resolve our path with
+# readlink -f so an installed symlink lands on the real checkout rather than
+# the link's parent.
+exec "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../bin" && pwd)/push-guard" "$@"
