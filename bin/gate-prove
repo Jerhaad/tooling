@@ -52,17 +52,6 @@ shift
 cd "$SRC"
 git rev-parse --verify --quiet "$BASE" >/dev/null || { echo "no such ref: $BASE" >&2; exit 2; }
 
-# This reverts tracked files and restores them from HEAD, so anything not
-# committed is destroyed rather than restored -- and the restore runs from a
-# trap, where there is nothing left to report it. Refusing a dirty tree is the
-# only honest option: "revert the change" has no meaning against work that is
-# not yet a commit.
-if ! git diff --quiet HEAD; then
-	echo "refusing to run against a dirty tree: commit first, or the revert will discard uncommitted work" >&2
-	git status --short >&2
-	exit 2
-fi
-
 mapfile -t CHANGED < <(git diff --name-only "$BASE"...HEAD)
 [ ${#CHANGED[@]} -gt 0 ] || { echo "no changes against $BASE" >&2; exit 2; }
 
@@ -109,26 +98,57 @@ if git diff --quiet "$BASE" HEAD -- "${SOURCES[@]}"; then
 	exit 3
 fi
 
-# One definition for both runs. The verdict is a comparison, and a comparison
-# between two different commands is no comparison at all, so the caller's
-# `-- test command` override has to win in the same way on each side.
+# The prove runs in a scratch worktree at HEAD, never in the caller's tree: a
+# killed run used to leave the caller half-reverted, since a SIGKILL runs no
+# trap and bash defers a trapped signal until the foreground command ends.
+# Nothing here writes the caller's tree, so uncommitted work there is safe.
+#
+# The scratch is named `<caller>-prove` because remote-task names the builder
+# tree and database after the path's basename: one shared name would let
+# concurrent proves destroy each other's database, and a per-branch name keeps
+# each branch's build cache warm.
+SCRATCH_PARENT=$(mktemp -d -t gate-prove.XXXXXX) || { echo "mktemp failed" >&2; exit 2; }
+# The only path cleanup may delete: compared by equality, so a bug pointing
+# cleanup elsewhere is refused.
+SCRATCH_PARENT_OWNED=$SCRATCH_PARENT
+SCRATCH="$SCRATCH_PARENT/$(basename "$SRC")-prove"
+# A run killed with SIGKILL leaves its scratch registered in the caller's
+# repository; prune it before adding another.
+git -C "$SRC" worktree prune
+git -C "$SRC" worktree add --detach "$SCRATCH" HEAD >/dev/null
+
+# Cleanup on every exit the shell still owns. It deletes only the exact
+# directory mktemp returned: a glob under $TMPDIR would become `/*` with TMPDIR
+# unset.
+cleanup() {
+	if [ -n "${SCRATCH_PARENT:-}" ] && [ -d "$SCRATCH_PARENT" ] \
+			&& [ "$SCRATCH_PARENT" = "${SCRATCH_PARENT_OWNED:-}" ]; then
+		if [ -n "${SCRATCH:-}" ] && [ -d "$SCRATCH" ]; then
+			git -C "$SRC" worktree remove --force "$SCRATCH" 2>/dev/null || true
+		fi
+		rm -rf "$SCRATCH_PARENT"
+	fi
+}
+trap cleanup EXIT TERM INT HUP
+
+# One definition for both runs, since the verdict compares them. A caller's
+# override runs inside the scratch too: run where it was called, it would test
+# the caller's unreverted tree and report a proof that never saw the revert.
 run_suite() {
 	if [ $# -gt 0 ]; then
-		"$@"
+		# (cd ... && "$@") so the override sees the scratch's tree, not
+		# the caller's: the manifest path runs (cd "$SCRATCH" && eval ...)
+		# for the same reason.
+		(cd "$SCRATCH" && "$@")
 	else
 		# The project's own suite, so what proves a test here is what runs in CI.
-		(cd "$SRC" && eval "$(manifest "$SRC" prove.command)")
+		(cd "$SCRATCH" && eval "$(manifest "$SCRATCH" prove.command)")
 	fi
 }
 
-# The suite on the unmodified tree. The verdict this gate gives is a comparison
-# against this run: a build that fails before any test executes -- a regenerated
-# offline cache the revert removes, a renamed recipe -- exits non-zero for
-# reasons that have nothing to do with the test, and without this the gate would
-# report "tests depend on the change" for a branch whose tests never ran.
-#
-# Before the restore trap: a pre-run inside the trap window would restore over a
-# tree the trap is responsible for.
+# The suite on the unmodified scratch. The verdict compares against this run,
+# so a build that fails for reasons unrelated to the tests is not mistaken for
+# a proof.
 set +e
 run_suite "$@"
 pre_rc=$?
@@ -148,24 +168,15 @@ if [ "$pre_rc" -ne 0 ]; then
 	exit 3
 fi
 
-# Restored on every exit path, including the failure that is the expected
-# outcome: leaving a half-reverted tree behind would be worse than any answer
-# this gives.
-# From HEAD, not from the index: `git checkout $BASE -- <paths>` stages the base
-# version as well as writing it, so restoring from the index would restore the
-# reverted copy and leave the branch looking like the fix was never made.
-restore() { git checkout --quiet HEAD -- "${SOURCES[@]}" 2>/dev/null || true; }
-trap restore EXIT
-
 printf '==> reverting %d source file(s), keeping %d test file(s)\n' "${#SOURCES[@]}" "${#TESTS[@]}"
-# A file the branch adds has no version at BASE to check out, so reverting it
-# means deleting it. The restore trap puts it back from HEAD either way.
+# A file the branch adds has no version at BASE, so reverting it means deleting
+# it from the scratch.
 for f in "${SOURCES[@]}"; do
-	if git show "$BASE:$f" >/dev/null 2>&1; then
-		git checkout --quiet "$BASE" -- "$f"
+	if git -C "$SCRATCH" show "$BASE:$f" >/dev/null 2>&1; then
+		git -C "$SCRATCH" checkout --quiet "$BASE" -- "$f"
 	else
-		rm -f "$f"
-		git rm --quiet --cached "$f" 2>/dev/null || true
+		rm -f "$SCRATCH/$f"
+		git -C "$SCRATCH" rm --quiet --cached "$f" 2>/dev/null || true
 	fi
 done
 
