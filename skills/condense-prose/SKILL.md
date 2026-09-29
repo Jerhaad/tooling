@@ -17,6 +17,7 @@ Findings, most-mechanical first:
 
 | Finding | Means | Usual action |
 |---|---|---|
+| `provenance` | a link to the agent session that wrote the change | delete the line. A PR body, commit or doc records what the software does, never how the work was made |
 | `duplicate` | byte-identical block in N files | keep the copy in the file that owns the concern, delete N-1 |
 | `enforced-in-raise` | a backticked token in the prose also appears in a `raise` string | delete the prose; the error message is the enforcement |
 | `echoes-code` | comment words are the next line's identifiers | delete |

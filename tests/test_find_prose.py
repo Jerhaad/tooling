@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Pin that find_prose.py reads Rust and SQL the way it reads the languages it already handled."""
+"""Pin that find_prose.py reads Rust and SQL the way it reads the languages it
+already handled, and that a session-link to the agent that wrote the change is
+flagged as ``provenance``.
+"""
 from __future__ import annotations
 
 import importlib.util
@@ -97,6 +100,18 @@ CREATE TABLE users (id INTEGER PRIMARY KEY);
 -- noqa: long line, intentional, do not flag
 INSERT INTO users (id) VALUES (1);
 """
+
+# A drafted PR body with an agent session link: the exact wording the agent
+# appends by default and that the finder must flag as ``provenance`` so the
+# condense gate can ask the author to delete it.
+BODY_WITH_SESSION_LINK = (
+    "Why this exists.\n"
+    "\n"
+    "Closes #1\n"
+    "\n"
+    "https://claude.ai/code/session_01ABC\n"
+)
+BODY_WITHOUT_SESSION_LINK = "Why this exists.\n\nCloses #1\n"
 
 
 def _load_module() -> ModuleType:
@@ -236,6 +251,38 @@ def case_sql_block_does_not_swallow_trailing_code(failures: list[str]) -> None:
                      f"block on line {b['line']}: {b['text'][:80]!r}")
 
 
+def case_provenance_session_link_is_flagged(failures: list[str]) -> None:
+    """A PR body carrying an agent-session link yields a ``provenance`` finding."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        (cwd / "body.md").write_text(BODY_WITH_SESSION_LINK)
+        proc = run_find_prose("body.md", cwd=cwd)
+        blocks = blocks_for(proc)
+        matching = [b for b in blocks
+                    if "claude.ai/code/session_" in b["text"]]
+        if not matching:
+            fail(failures, "provenance: no block contained the session link",
+                 f"blocks={[b['text'][:60] for b in blocks]}")
+            return
+        for b in matching:
+            if "provenance" not in b["findings"]:
+                fail(failures, "provenance: session-link block missing finding",
+                     f"findings={b['findings']!r} text={b['text'][:80]!r}")
+
+
+def case_provenance_absent_when_no_link(failures: list[str]) -> None:
+    """Without the link, no block carries ``provenance``."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        (cwd / "body.md").write_text(BODY_WITHOUT_SESSION_LINK)
+        proc = run_find_prose("body.md", cwd=cwd)
+        blocks = blocks_for(proc)
+        flagged = [b for b in blocks if "provenance" in b["findings"]]
+        if flagged:
+            fail(failures, "provenance: finding raised without a session link",
+                 f"blocks={[b['text'][:60] for b in flagged]}")
+
+
 def git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", "-C", str(cwd), *args],
                           capture_output=True, text=True, check=False, env={
@@ -295,6 +342,8 @@ def main() -> int:
     case_rust_inner_doc_counted(failures)
     case_sql_migration_flagged(failures)
     case_sql_block_does_not_swallow_trailing_code(failures)
+    case_provenance_session_link_is_flagged(failures)
+    case_provenance_absent_when_no_link(failures)
     case_diff_reports_both_files(failures)
 
     if failures:
