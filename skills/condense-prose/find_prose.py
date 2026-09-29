@@ -55,6 +55,7 @@ def hash_shebang(path: Path, rev: str | None = None) -> bool:
 # Ranked most-mechanical first: a duplicate is a fact in N places, an oversize block
 # is only a suspicion.
 FINDING_ORDER = [
+    "provenance",
     "duplicate",
     "enforced-in-raise",
     "echoes-code",
@@ -72,6 +73,8 @@ ROADMAP = re.compile(
     r"tighten(?:ed)?|left)\s+later|will (?:be|become|land|move|need))\b",
     re.IGNORECASE,
 )
+# A link back to the session that wrote the change: provenance, never product history.
+PROVENANCE = re.compile(r"claude\.ai/code/session_")
 # Tool directives and ASCII dividers are not prose.
 PRAGMA = re.compile(r"^(noqa|type:|pylint|ruff|mypy|flake8|fmt:|isort:|pragma|-\*-)", re.I)
 DIVIDER = re.compile(r"[-=~#*_]{3,}")
@@ -373,6 +376,8 @@ def collect(
         for block in found:
             if block.words > min_words:
                 block.findings.append("oversize")
+            if PROVENANCE.search(block.text):
+                block.findings.append("provenance")
             if ROADMAP.search(block.text):
                 block.findings.append("roadmap")
             if NEGATIVE_SPACE.search(block.text):
