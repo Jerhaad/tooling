@@ -21,8 +21,11 @@ from difflib import SequenceMatcher
 from pathlib import Path
 
 HASH_SUFFIXES = {".toml", ".yml", ".yaml", ".sh", ".cfg", ".ini", ".cmake"}
-SLASH_SUFFIXES = {".h", ".hpp", ".cc", ".cpp", ".hujson", ".js", ".ts", ".tsx"}
-PROSE_SUFFIXES = {".py", ".md"} | HASH_SUFFIXES | SLASH_SUFFIXES
+# `#[...]` attributes are code, not comments, so Rust needs no lexer of its own.
+SLASH_SUFFIXES = {".h", ".hpp", ".cc", ".cpp", ".hujson", ".js", ".ts", ".tsx", ".rs"}
+# `--` needs its own lexer: the hash lexer would keep the second dash.
+SQL_SUFFIXES = {".sql"}
+PROSE_SUFFIXES = {".py", ".md"} | HASH_SUFFIXES | SLASH_SUFFIXES | SQL_SUFFIXES
 # Interpreters whose scripts are conventionally installed without a suffix, so
 # the shebang is the only thing that says what the file is.
 SHEBANG_HASH = ("sh", "bash", "zsh", "ksh", "dash", "python", "ruby", "perl")
@@ -186,6 +189,15 @@ def comment_blocks(rel: str, src: str, lexer: str) -> list[Block]:
             stripped = line.strip()
             if stripped.startswith("#") and not stripped.startswith("#!"):
                 rows.append((lineno, stripped.lstrip("#").strip()))
+    elif lexer == "sql":
+        # SQL comments are `--` lines; strip exactly the two dashes. PRAGMA
+        # below drops a `-- noqa: ...` directive (matches `^noqa`) before it
+        # reaches the grouping loop, so a migration can mix prose headers with
+        # lint hints.
+        for lineno, line in enumerate(src.splitlines(), 1):
+            stripped = line.strip()
+            if stripped.startswith("--") and not stripped.startswith("---"):
+                rows.append((lineno, stripped[2:].strip()))
     else:
         in_block = False
         for lineno, line in enumerate(src.splitlines(), 1):
@@ -351,6 +363,8 @@ def collect(
             found, raised = python_blocks(rel, src)
         elif path.suffix == ".md":
             found, raised = markdown_blocks(rel, src), ""
+        elif path.suffix == ".sql":
+            found, raised = comment_blocks(rel, src, "sql"), ""
         else:
             lexer = "slash" if path.suffix in SLASH_SUFFIXES else "hash"
             found, raised = comment_blocks(rel, src, lexer), ""
