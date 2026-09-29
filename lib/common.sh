@@ -9,6 +9,15 @@ if [ -r "$ENV_FILE" ]; then
 	# shellcheck source=/dev/null
 	. "$ENV_FILE"
 fi
+# A lane and every tool it runs must find the same records from whatever
+# directory each one runs in, which only an absolute path guarantees.
+case "${AGENT_STATE_DIR:-/}" in
+/*) ;;
+*)
+	echo "AGENT_STATE_DIR must be an absolute path, not '$AGENT_STATE_DIR'" >&2
+	exit 2
+	;;
+esac
 
 # -P: bin/ is reached through a symlink, and a logical cd resolves ../lib
 # against the link's parent rather than the checkout's.

@@ -36,7 +36,8 @@ three shapes worth having are:
 --verify defaults to `gate-verify <worktree>`, which picks its gates from the
 diff rather than from whoever wrote the dispatch.
 
-Prints the transcript directory on stdout.
+Prints the run's private directory on stdout. It holds the issue text, every
+attempt's transcript and the lane's HANDOVER.md, and is the lane's TMPDIR.
 EOF
 }
 
@@ -73,7 +74,15 @@ cd "$WORKTREE"
 # relative path would otherwise write a record under a hash nothing reads.
 WORKTREE=$(git rev-parse --show-toplevel)
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
-WORK=$(mktemp -d -t hermes-implement-XXXXXX)
+
+# A private directory per run, exported as the lane's TMPDIR: a lane once ran
+# `rm -rf` in the shared /tmp and deleted other sessions' files. -p, because
+# -t would follow a TMPDIR the caller already set.
+STATE_DIR=${AGENT_STATE_DIR:-$HOME/.local/state/agent-tools}
+RUN_PARENT="$STATE_DIR/hermes-implement-runs"
+mkdir -p "$RUN_PARENT"
+WORK=$(mktemp -d -p "$RUN_PARENT" hermes-implement-XXXXXX)
+export TMPDIR="$WORK" TMP="$WORK" TEMP="$WORK"
 
 
 GH_ARGS=(issue view "$ISSUE")
@@ -94,7 +103,9 @@ only git: nothing outside that directory is yours to change. Config files,
 dotfiles, shared state, another worktree, anything under ~/.config or ~/.hermes
 -- all off limits, even when changing one would make your task succeed. Other
 work runs on this machine while you do, and a file outside your worktree is
-something someone else is depending on right now.
+something someone else is depending on right now. The one exception is
+$WORK, this run's private directory, which is already your TMPDIR and is where
+your HANDOVER.md goes.
 
 **If a tool you need is broken, report it and stop. Do not repair it.** You may
 be right about the cause: a previous run diagnosed a real bug in the
@@ -145,7 +156,6 @@ EVIDENCE_DB="$EVIDENCE_DB/verification_evidence.db"
 # the tree right now; `lane-final` is the record written at exit, naming the
 # commit the lane left and the session's last_edit_at so a later check can
 # tell drift from "the lane finished cleanly".
-STATE_DIR=${AGENT_STATE_DIR:-$HOME/.local/state/agent-tools}
 # A path cannot be a filename: it contains separators. The sha256 of the
 # canonical path is stable across readers, which is what lets lane-settled
 # find this record from the worktree alone.
@@ -302,4 +312,5 @@ if stray:
 PYEOF
 fi
 
+# Kept after every run: callers read HANDOVER.md, or the transcripts on failure.
 echo "$WORK"
