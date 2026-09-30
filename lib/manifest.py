@@ -93,6 +93,7 @@ def main() -> None:
                 ("TASK_MIRRORS_WORKFLOW", mirrors.get("workflow", "")),
                 ("TASK_MIRRORS_JOB", mirrors.get("job", "")),
                 ("TASK_MIGRATOR_DIR", migrator.get("dir", "migrations")),
+                ("TASK_TIMEOUT", entry.get("timeout", "")),
             ]:
                 print(f"{var}={shlex.quote(str(val))}")
             print(bash_array("TASK_FETCH", entry.get("fetch", [])))

@@ -32,6 +32,10 @@ full-command = "just ci-full"
 # Optional. A lock file updated on the builder and never fetched leaves the
 # branch claiming a dependency set it does not have.
 fetch = ["Cargo.lock"]
+# Optional. Wall-clock cap for one task in seconds. Wraps the build in
+# `timeout`; exit 124 becomes `==> FAIL (..., timed out after Ns)`. Default
+# 3600s lives in remote-task.
+# timeout = 7200
 # Optional. Dropped and recreated before the command runs, so a branch never
 # inherits the schema of the one before it. Reaches the command as DATABASE_URL.
 # The tree name is appended to name-prefix, so two branches never share one.

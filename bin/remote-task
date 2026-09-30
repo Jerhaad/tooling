@@ -19,6 +19,8 @@ TASK=bench NAME=unknown REMOTE_TASK_DONE=0
 # run reaches this trap with $? still 0, so PASS also needs REMOTE_TASK_DONE,
 # set by the script's last line. An INT/TERM trap would not help: bash defers
 # it until the foreground ssh returns, holding a killed run open.
+#
+# `timeout` reaches us with exit 124 (its documented timeout status).
 verdict() {
 	local status=$?
 	trap - EXIT
@@ -26,7 +28,13 @@ verdict() {
 		printf '==> PASS (%s: %s)\n' "$TASK" "$NAME" || :
 	else
 		local reason
-		if [ "$status" -eq 0 ]; then reason=interrupted; else reason="exit $status"; fi
+		if [ -n "${FAIL_REASON:-}" ]; then
+			reason=$FAIL_REASON
+		elif [ "$status" -eq 124 ]; then
+			reason="timed out after ${TASK_TIMEOUT}s"
+		elif [ "$status" -eq 75 ]; then
+			reason="timed out after ${LOCK_WAIT}s waiting on the remote bench lock"
+		elif [ "$status" -eq 0 ]; then reason=interrupted; else reason="exit $status"; fi
 		printf '==> FAIL (%s: %s, %s)\n' "$TASK" "$NAME" "$reason" || :
 		[ "$status" -ne 0 ] || status=1
 	fi
@@ -41,6 +49,9 @@ trap verdict EXIT
 LIB=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)
 # shellcheck source=../lib/common.sh
 . "$LIB/common.sh"
+
+# Both flock wait timeouts share this override.
+LOCK_WAIT=${REMOTE_TASK_LOCK_WAIT:-7200}
 
 usage() { echo "usage: remote-task [--task NAME] [--full] [worktree]" >&2; exit 2; }
 
@@ -67,6 +78,7 @@ NAME=$(tree_name "$SRC")
 output=$(python3 "$LIB/manifest.py" "$SRC" --task "$TASK")
 eval "$output"
 [ "$FULL" = 1 ] && [ -n "$TASK_FULL_COMMAND" ] && TASK_COMMAND=$TASK_FULL_COMMAND
+TASK_TIMEOUT=${TASK_TIMEOUT:-3600}
 REMOTE=$(host_for "$TASK_ROLE")
 
 DB_ENV=""
@@ -168,9 +180,45 @@ if [ -n "${REMOTE_LANE:-}" ]; then
 fi
 mkdir -p "$(dirname "$BUILD_LOCK")"
 exec {lockfd}>"$BUILD_LOCK"
-flock "$lockfd"
+if ! flock -w "$LOCK_WAIT" "$lockfd"; then
+	FAIL_REASON="timed out after ${LOCK_WAIT}s waiting on local lock $BUILD_LOCK"
+	echo "remote-task: $FAIL_REASON" >&2
+	exit 1
+fi
 
-ssh "$REMOTE" "flock \$HOME/bench/.lock bash -euo pipefail -s" <<REMOTE_SCRIPT
+# `ssh -tt` (a tty) would echo the script and merge stderr -- wrong answer here.
+# CALLER must be escaped so the builder's shell expands $PPID, not ours.
+# `timeout` puts the build in its own pgrp; `-k 30` hard-kills a TERM-eater.
+#
+# Backgrounded, because bash runs a trap only once a foreground child returns:
+# a TERM, INT or HUP on the wrapper alone would leave ssh connected, so the
+# remote watchdog keeps seeing a caller and the build holds the bench lock
+# until its own timeout. The trap kills ssh, then re-raises the signal so the
+# EXIT trap reports the run as interrupted.
+SSH_PID=
+forward_signal() {
+	local sig=$1
+	if [ -n "$SSH_PID" ] && kill -0 "$SSH_PID" 2>/dev/null; then
+		kill -KILL "$SSH_PID" 2>/dev/null || true
+		wait "$SSH_PID" 2>/dev/null || true
+	fi
+	trap - "$sig"
+	kill -"$sig" "$$" 2>/dev/null || true
+}
+trap 'forward_signal TERM' TERM
+trap 'forward_signal INT' INT
+trap 'forward_signal HUP' HUP
+# `exec` keeps $! as ssh's PID (the subshell execs ssh). Without it, the
+# subshell is a bash that forks ssh as a grandchild, and $! is the bash --
+# killing it leaves ssh running.
+{
+exec ssh "$REMOTE" "CALLER=\$PPID flock -w $LOCK_WAIT -E 75 \$HOME/bench/.lock timeout -k 30 $TASK_TIMEOUT bash -euo pipefail -s" <<REMOTE_SCRIPT
+# Caller guard: refuse to run if the ssh that queued us is gone.
+kill -0 "\$CALLER" 2>/dev/null || { echo "remote-task: caller gone before the lock; not running" >&2; exit 125; }
+# Watchdog: TERM the build's pgrp when the caller disappears.
+( while kill -0 "\$CALLER" 2>/dev/null; do sleep 5; done; kill -TERM 0 2>/dev/null || true ) &
+WD=\$!
+trap 'kill "\$WD" 2>/dev/null || true' EXIT
 export PATH=$REMOTE_PATH
 
 # Each tree keeps its own build cache and the sync excludes it, so nothing ever
@@ -202,6 +250,9 @@ cd $DEST
 $DB_ENV
 $TASK_COMMAND
 REMOTE_SCRIPT
+} &
+SSH_PID=$!
+wait "$SSH_PID"
 
 # A failed build must retry invalidation: the next rsync restores local mtimes.
 # Advance the sentinel only after the command succeeds, so failure cannot mark
