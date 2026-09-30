@@ -44,7 +44,7 @@ directory.
     bin/       the gates, and the drivers that dispatch an issue to an agent
     lib/       the manifest reader and shared host resolution
     pipeline/  the phases: review -> triage -> implement overnight, cleanup at midday
-    skills/    the agent-side procedures the drivers invoke
+    skills/    the procedures the drivers invoke, and the ones a Claude session loads
 
 `~/.hermes/scripts` symlinks to `pipeline/`, because `hermes cron` rejects a
 script resolving outside that directory. Hence `cd -P` throughout: a logical `cd`

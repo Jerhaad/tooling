@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# Review one open pull request with Hermes and park the findings on their own branch.
+#
+# The findings branch is never pushed: REVIEW_NOTES.md on a release branch would
+# be a defect of its own. The diff is against the PR's own base, since diffing a
+# stacked PR against main charges it with its parent's changes.
+set -euo pipefail
+
+# readlink -f: installed as a symlink on PATH, and lib/ sits beside the real file.
+LIB=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)
+# shellcheck source=../lib/common.sh
+. "$LIB/common.sh"
+
+BIN_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+SCRUTINIZE="$BIN_DIR/../skills/hermes-review/scripts/hermes-scrutinize.sh"
+
+HERMES=${HERMES_PYTHON:-${HERMES_HOME:-$HOME/.hermes}/hermes-agent/venv/bin/python}
+PR=""
+PHASE=review
+ANSWERS=""
+REQUESTED_PROFILE=""
+TIMEOUT_PASSED=""
+TIMEOUT_OPT=""
+
+usage() {
+	cat <<'EOF'
+usage: hermes-review-pr --pr N [--phase readback|review] [--answers FILE]
+                        [--profile NAME] [--timeout SECONDS]
+
+readback  Ask what it thinks the scope is, what it will check, what it treats as
+          out of scope, and what it cannot settle alone. Writes READBACK.md and
+          stops. Correct the brief from this before spending the review.
+review    Do the review. --answers FILE is folded into the prompt above the
+          standing priors, so a decision made once does not have to be
+          rediscovered.
+
+Both phases write to $REVIEW_WT_ROOT/review-pr-N, branched from the PR head.
+Nothing is pushed.
+
+REVIEW_WT_ROOT, REVIEW_PRIORS and REVIEW_PROFILE must be set in the operator's
+env file. See hosts.env.example.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--pr) PR="$2"; shift 2 ;;
+	--phase) PHASE="$2"; shift 2 ;;
+	--answers) ANSWERS="$2"; shift 2 ;;
+	--profile) REQUESTED_PROFILE="$2"; shift 2 ;;
+	--timeout) TIMEOUT_PASSED=1; TIMEOUT_OPT="$2"; shift 2 ;;
+	-h | --help) usage; exit 0 ;;
+	*) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
+	esac
+done
+
+case "$PHASE" in
+readback | review) ;;
+*) echo "--phase must be readback or review" >&2; exit 2 ;;
+esac
+
+[[ -n "$PR" ]] || { echo "--pr is required" >&2; usage >&2; exit 2; }
+
+require_env() {
+	local var="$1" hint="$2"
+	if [ -z "${!var:-}" ]; then
+		echo "set $var to $hint (see hosts.env.example)" >&2
+		exit 2
+	fi
+}
+
+# Never an ambient PROFILE: that name is too generic to trust from an
+# operator's environment, and it would send the review to the wrong host.
+if [ -n "$REQUESTED_PROFILE" ]; then
+	PROFILE="$REQUESTED_PROFILE"
+else
+	require_env REVIEW_PROFILE "the default Hermes profile (e.g. minimax)"
+	PROFILE="$REVIEW_PROFILE"
+fi
+
+require_env REVIEW_WT_ROOT "the directory review worktrees live under"
+WT_ROOT="$REVIEW_WT_ROOT"
+
+require_env REVIEW_PRIORS "the priors file path"
+PRIORS="$REVIEW_PRIORS"
+[[ -r "$PRIORS" ]] || { echo "priors file not readable: $PRIORS" >&2; exit 2; }
+
+[[ -x "$SCRUTINIZE" ]] || { echo "scrutinize script not executable: $SCRUTINIZE" >&2; exit 2; }
+
+REPO_DIR=$(git rev-parse --show-toplevel)
+cd "$REPO_DIR"
+
+TIMEOUT=$(review_timeout_for "$PROFILE" "$TIMEOUT_OPT")
+
+# A sweep starts every PR at once, and concurrent fetches into one repository
+# fail on ref locks, so only the fetch and worktree setup are serialised. Fd 8,
+# because fd 9 is the review slot.
+SETUP_LOCK_DIR=$(git rev-parse --git-common-dir)
+SETUP_LOCK="$SETUP_LOCK_DIR/hermes-review-setup.lock"
+exec 8>"$SETUP_LOCK"
+if ! flock 8; then
+	echo "could not acquire $SETUP_LOCK" >&2
+	exit 1
+fi
+
+# origin can be an SSH alias (git@<alias>:owner/name.git) which gh cannot
+# resolve as a --repo value; only the owner/name tail means anything to it.
+SLUG=$(git remote get-url origin | sed -E 's#\.git$##; s#.*[:/]([^/]+/[^/]+)$#\1#')
+
+read -r HEAD_REF BASE_REF < <(
+	gh pr view "$PR" --repo "$SLUG" \
+		--json headRefName,baseRefName --jq '[.headRefName, .baseRefName] | @tsv'
+)
+[[ -n "${HEAD_REF:-}" && -n "${BASE_REF:-}" ]] || { echo "could not resolve refs for PR $PR" >&2; exit 1; }
+
+git fetch --quiet origin "$HEAD_REF" "$BASE_REF"
+
+WT="$WT_ROOT/review-pr-$PR"
+BRANCH="review/pr-$PR"
+# The PR head the worktree was built from. By the review phase the worktree's
+# HEAD is a readback or findings commit, and an ancestor check passes a head
+# force-pushed back to an ancestor, so the review compares against this exactly.
+# It is branch config, so `git branch -D` below drops it with the branch.
+HEAD_KEY="branch.$BRANCH.hermesReviewHead"
+
+# The readback phase rebuilds the worktree; the review phase inherits it, so the
+# answers written between the two phases are reviewed against the same commit
+# that produced the questions.
+if [[ "$PHASE" == readback || ! -e "$WT" || -z "$(git config --get "$HEAD_KEY")" ]]; then
+	[[ -e "$WT" ]] && git worktree remove --force "$WT"
+	git branch -D "$BRANCH" >/dev/null 2>&1 || true
+	git worktree add -b "$BRANCH" "$WT" "origin/$HEAD_REF" --quiet
+	git config "$HEAD_KEY" "$(git rev-parse "origin/$HEAD_REF")"
+elif [[ "$(git config --get "$HEAD_KEY")" != "$(git rev-parse "origin/$HEAD_REF")" ]]; then
+	BUILT_SHA=$(git rev-parse --short "$(git config --get "$HEAD_KEY")")
+	REMOTE_SHA=$(git rev-parse --short "origin/$HEAD_REF")
+	echo "refusing to review stale source: worktree $WT was built from $BUILT_SHA but origin/$HEAD_REF is at $REMOTE_SHA" >&2
+	echo "remove $WT (e.g. with 'git worktree remove --force $WT') and re-run, or re-run readback against the new head" >&2
+	exit 1
+fi
+
+exec 8>&-
+
+commit_artifact() { # path subject
+	REVIEWED_SHA=$(git rev-parse --short "$(git config --get "$HEAD_KEY")")
+	git -C "$WT" add "$1"
+	git -C "$WT" -c user.name="hermes-review" -c user.email="hermes@localhost" \
+		commit --quiet -m "$2
+
+$HEAD_REF at $REVIEWED_SHA, against $BASE_REF, with $PROFILE."
+}
+
+if [[ "$PHASE" == readback ]]; then
+	acquire_review_slot "$PROFILE"
+	DIFF=$(mktemp -t hermes-readback-XXXXXX.diff)
+	git -C "$WT" diff "origin/$BASE_REF...origin/$HEAD_REF" >"$DIFF"
+	# Under set -e a failed hermes would exit here, before the message below.
+	set +e
+	timeout "$TIMEOUT" "$HERMES" -m hermes_cli.main \
+		-p "$PROFILE" --yolo -z "You are about to review a proposed change to the repository at $WT. The diff is at $DIFF.
+
+Do NOT review it yet. Do not write findings. Write a readback first, so the person who briefed you can correct the brief before you spend the review.
+
+Read the diff and whatever source you need, then answer four things:
+
+1. Scope: what you understand this change to be for, in your own words.
+2. Checks: the specific checks you intend to run, and for each, what result would make you raise a finding.
+3. Out of scope: what you will NOT report on, and why you believe it is out of scope.
+4. Open questions: anything whose answer would change what you report, that you cannot settle from the repository alone.
+
+Be concrete under 3 and 4. A vague readback is worse than none. Do not write to any file; reply with the readback itself." >"$WT/READBACK.md" 9>&-
+	RC=$?
+	set -e
+	exec 9>&-
+	if [[ "$RC" -ne 0 ]]; then
+		echo "hermes readback exited $RC (timeout was ${TIMEOUT}s)" >&2
+		exit "$RC"
+	fi
+	commit_artifact READBACK.md "review(pr-$PR): readback before reviewing $HEAD_REF"
+	echo "worktree: $WT"
+	echo "readback: $WT/READBACK.md"
+	echo "next:     answer its section 3 and 4, then --phase review --answers FILE"
+	exit 0
+fi
+
+EXTRA=$(cat "$PRIORS")
+if [[ -n "$ANSWERS" ]]; then
+	[[ -r "$ANSWERS" ]] || { echo "answers file not readable: $ANSWERS" >&2; exit 2; }
+	# Above the standing priors, because a decision made for this change
+	# outranks a general prior it contradicts.
+	EXTRA=$'DECISIONS FROM THE BRIEFING. These answer questions you raised, and they\noverride your own scope judgement where the two disagree.\n\n'"$(cat "$ANSWERS")"$'\n\n'"$EXTRA"
+fi
+
+# Forward only a --timeout the caller gave: a default would outrank the
+# profile's own REVIEW_TIMEOUT_<PROFILE>.
+SCRUTINIZE_ARGS=(--base "origin/$BASE_REF" --profile "$PROFILE" --extra "$EXTRA")
+if [ -n "$TIMEOUT_PASSED" ]; then
+	SCRUTINIZE_ARGS=(--timeout "$TIMEOUT_OPT" "${SCRUTINIZE_ARGS[@]}")
+fi
+
+FINDINGS=$(cd "$WT" && "$SCRUTINIZE" "${SCRUTINIZE_ARGS[@]}")
+
+cp "$FINDINGS" "$WT/REVIEW_NOTES.md"
+commit_artifact REVIEW_NOTES.md "review(pr-$PR): findings against $HEAD_REF"
+
+echo "worktree: $WT"
+echo "branch:   $BRANCH (from origin/$HEAD_REF, not pushed)"
+echo "findings: $WT/REVIEW_NOTES.md"

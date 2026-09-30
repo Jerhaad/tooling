@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Run one phase of the review loop across a list of PRs.
+#
+#
+# Every PR starts at once; REVIEW_SLOTS_<PROFILE> is what bounds how many run.
+set -euo pipefail
+
+# readlink -f: installed as a symlink on PATH, and lib/ sits beside the real file.
+LIB=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)
+# shellcheck source=../lib/common.sh
+. "$LIB/common.sh"
+
+LOGDIR=${HERMES_REVIEW_LOGDIR:-$HOME/wt}
+PHASE=readback
+ANSWERS=""
+TIMEOUT_PASSED=""
+TIMEOUT_OPT=""
+
+usage() {
+	cat <<'EOF'
+usage: hermes-review-sweep [--phase readback|review] [--answers FILE]
+                           [--timeout SECONDS] PR [PR...]
+
+--timeout overrides REVIEW_TIMEOUT_<PROFILE> for every PR in the sweep.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--phase) PHASE="$2"; shift 2 ;;
+	--answers) ANSWERS="$2"; shift 2 ;;
+	--timeout) TIMEOUT_PASSED=1; TIMEOUT_OPT="$2"; shift 2 ;;
+	-h | --help) usage; exit 0 ;;
+	--) shift; break ;;
+	-*) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
+	*) break ;;
+	esac
+done
+
+[[ $# -gt 0 ]] || { usage >&2; exit 2; }
+
+ARGS=(--phase "$PHASE")
+[[ -n "$ANSWERS" ]] && ARGS+=(--answers "$ANSWERS")
+[[ -n "$TIMEOUT_PASSED" ]] && ARGS+=(--timeout "$TIMEOUT_OPT")
+
+mkdir -p "$LOGDIR"
+for pr in "$@"; do
+	(
+		log="$LOGDIR/$PHASE-pr-$pr.log"
+		if hermes-review-pr --pr "$pr" "${ARGS[@]}" >"$log" 2>&1; then
+			echo "pr-$pr $PHASE ok"
+		else
+			echo "pr-$pr $PHASE FAILED (exit $?), see $log"
+		fi
+	) &
+done
+wait
+echo "sweep complete"
