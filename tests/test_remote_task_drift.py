@@ -146,6 +146,10 @@ mkdir -p "$root"
 cmdline="$1"
 # Verb: the first whitespace-separated word.
 verb="${cmdline%% *}"
+# The build's command starts `CALLER=... flock`, so map it onto the flock verb.
+if [ "$verb" = "flock" ] || [ "${cmdline#CALLER=*}" != "$cmdline" ] && [ "${cmdline%flock*}" != "$cmdline" ]; then
+  verb=flock
+fi
 case "$verb" in
 mkdir)
   # Extract the directory: skip `mkdir`, skip any `-X` flags, take the
@@ -704,8 +708,10 @@ def test_failed_build_retries_invalidation():
         old = local_fingerprint(MIGRATIONS_V1)
         sentinel.write_text(old)
         failing_ssh = STATEFUL_FAKE_SSH.replace(
-            "  # The build's heredoc form: consume stdin, do nothing.",
-            "  cat >/dev/null; exit 42\n  # failed build")
+            "  cat > /dev/null\n  ;;",
+            "  cat >/dev/null; exit 42\n  ;;",
+            1,
+        )
         fake = make_fakebin(tmp, stateful=True, extra={"ssh": failing_ssh})
         failed = run_remote_task(project, fake, False, remote)
         assert_pass("failed build status", failed.returncode == 42, repr(failed))
@@ -764,7 +770,7 @@ def test_failures_have_one_final_verdict():
     cases = [
         ("mkdir", {"ssh": "#!/bin/sh\nexit 17\n"}, 17),
         ("sync", {"rsync": "#!/bin/sh\nexit 23\n"}, 23),
-        ("command", {"ssh": "#!/bin/sh\ncase \"$2\" in flock*) cat >/dev/null; exit 42;; esac\n"}, 42),
+        ("command", {"ssh": "#!/bin/sh\ncase \"$2\" in *flock*) cat >/dev/null; exit 42;; esac\n"}, 42),
         ("fetch", {"rsync": "#!/bin/sh\ncase \"$*\" in *fakehost:bench/proj/result*) exit 24;; esac\nexit 0\n"}, 24),
         ("manifest", {}, 1),
     ]
@@ -846,6 +852,905 @@ def test_killed_run_does_not_pass():
                     not any(line.startswith("==> PASS") for line in lines), out)
 
 
+# ---------------------------------------------------------------------------
+# Runs the remote command as a child (not exec'd). The build dispatch
+# records its pid in FAKE_SSH_PIDFILE; preparatory calls (mkdir, fingerprint
+# read, touch, db reset, fetch) intentionally do not, because they are
+# short-lived and would race the test for the pidfile. The build cmdline
+# is the one carrying `CALLER=...flock...`, and that is what the script
+# uses to recognise it. With the pid narrowed to the build, the recorded
+# pid is the one the test's $PPID expands to on the builder.
+RUN_LOCAL_FAKE_SSH = r"""#!/bin/bash
+# Mandatory env: FAKE_SSH_PIDFILE (where to write our pid) and
+# FAKE_SSH_HOME (where the inner bash thinks $HOME is, so the per-test
+# remote lock path lives there).
+: "${FAKE_SSH_PIDFILE:?must be set}"
+export HOME="$FAKE_SSH_HOME"
+host="$1"; shift
+cmdline="$1"
+# Only the build dispatch carries the flock under CALLER; preparatory
+# ssh calls (mkdir, fingerprint read, touch, ...) are short-lived and
+# must not race the test for the pidfile. A stale PID from a finished
+# prep call would have the test "kill" a long-gone process while the
+# real build ssh kept running.
+if [[ "$cmdline" == *CALLER=* && "$cmdline" == *flock* ]]; then
+  echo $$ > "$FAKE_SSH_PIDFILE"
+fi
+# Real sshd starts the user shell with HOME as CWD, so a command like
+# `mkdir -p bench/proj` is relative to HOME. Mirror that: cd into
+# FAKE_SSH_HOME so the paths the build expands match the lock path
+# the test is reading.
+cd "$HOME" || exit 1
+# Detach the inner bash in a new session so killing us does not take
+# the build with it. The watchdog under test is what must keep the
+# build from running unattended -- if the watchdog's TERM ever stops
+# reaching the build, tests 2 and 3 below would silently keep running.
+setsid bash -c "$cmdline" <&0 &
+PID=$!
+wait $PID
+exit $?
+"""
+
+
+# Records pid and runs the cmdline verbatim. CALLER is *not* substituted:
+# whatever value the script put on the wire reaches the inner bash
+# unmodified, so a test that reads `$CALLER` from a marker can compare
+# it to the fake ssh's pid and catch the bug where `$PPID` expands on
+# the wrong machine.
+RUN_LOCAL_FAKE_SSH_VERBATIM = r"""#!/bin/bash
+: "${FAKE_SSH_PIDFILE:?must be set}"
+export HOME="$FAKE_SSH_HOME"
+host="$1"; shift
+cmdline="$1"
+# Same narrowing as RUN_LOCAL_FAKE_SSH: only the build dispatch carries
+# the flock under CALLER. Without it, a test reading the pidfile while
+# the build is still running captures the prep ssh's pid instead.
+if [[ "$cmdline" == *CALLER=* && "$cmdline" == *flock* ]]; then
+  echo $$ > "$FAKE_SSH_PIDFILE"
+fi
+# Run as a child, not exec'd, so the inner bash's $PPID is us -- this
+# is what lets the test compare the recorded CALLER against our pid.
+cd "$HOME" || exit 1
+bash -c "$cmdline" <&0
+exit $?
+"""
+
+
+# Variant of RUN_LOCAL_FAKE_SSH that sleeps 1s before every non-build
+# call. The reproducer for the stale-PID bug the reviewer found in
+# test_queued_waiter_with_dead_caller_never_runs: on a slow runner the
+# prep ssh runs first, exits, and leaves a stale pidfile; the build
+# ssh then runs under a different pid. The test reads the pidfile when
+# it appears and would capture the prep call's stale pid unless the
+# helper only writes for the build invocation. Delaying the prep call
+# makes the bug surface deterministically on any machine.
+RUN_LOCAL_FAKE_SSH_SLOW_PREP = r"""#!/bin/bash
+: "${FAKE_SSH_PIDFILE:?must be set}"
+export HOME="$FAKE_SSH_HOME"
+host="$1"; shift
+cmdline="$1"
+# Same narrowing as RUN_LOCAL_FAKE_SSH: only the build dispatch writes
+# to the pidfile. The sleep on the prep branch is what makes the bug
+# the old behaviour hid reproducible here.
+if [[ "$cmdline" == *CALLER=* && "$cmdline" == *flock* ]]; then
+  echo $$ > "$FAKE_SSH_PIDFILE"
+else
+  sleep 1
+fi
+cd "$HOME" || exit 1
+setsid bash -c "$cmdline" <&0 &
+PID=$!
+wait $PID
+exit $?
+"""
+
+
+def _manifest_with_timeout(timeout: str) -> str:
+    """A gates.toml with `timeout = <value>` on the bench task."""
+    return (
+        "[[task]]\n"
+        'name = "bench"\n'
+        'role = "builder"\n'
+        'command = "sleep 60"\n'
+        f'timeout = {timeout}\n'
+    )
+
+
+def _wait_for_pidfile(path: Path, deadline_s: float = 10.0) -> int:
+    """Block until `path` exists, then return the pid written to it."""
+    end = time.time() + deadline_s
+    while time.time() < end:
+        if path.exists():
+            try:
+                return int(path.read_text().strip())
+            except ValueError:
+                pass
+        time.sleep(0.05)
+    raise AssertionError(
+        f"fake ssh pidfile {path} did not appear within {deadline_s}s")
+
+
+def _count_lock_waiters(lock_path: str,
+                        exclude_pids: set[int] | None = None) -> int:
+    """Count processes whose command line names `lock_path`, skipping
+    `exclude_pids`. Scans /proc because `pgrep -cf` counts itself when its
+    own argv matches the pattern."""
+    exclude = exclude_pids or set()
+    needle = lock_path.encode()
+    n = 0
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid in exclude:
+            continue
+        try:
+            cmdline = entry.joinpath("cmdline").read_bytes()
+        except OSError:
+            # Pids appear and disappear between iterdir and read; the
+            # transient ENOENT is not the test's problem.
+            continue
+        if needle in cmdline:
+            n += 1
+    return n
+
+
+def _read_proc(proc: subprocess.Popen,
+               timeout: float = 5.0) -> tuple[str, str]:
+    """Drain remote-task's output for a failure message, killing it if it
+    stalls past `timeout`."""
+    try:
+        return proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return proc.communicate()
+
+
+def _wait_for_queued_waiter(remote_lock: Path, fake_ssh_pid: int,
+                            proc: subprocess.Popen, marker: Path,
+                            timeout_s: float = 10.0,
+                            poll_interval_s: float = 0.05) -> None:
+    """Block until the build's waiter is queued on `remote_lock`, failing with
+    remote-task's output if the queue never forms, or fake ssh or remote-task
+    exits first."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        n = _count_lock_waiters(str(remote_lock),
+                                exclude_pids={os.getpid()})
+        if n >= 2:
+            return
+        # Remote-task exited on its own (without us ever asking it to).
+        # Whatever it printed is the only signal left about why.
+        rt_rc = proc.poll()
+        if rt_rc is not None:
+            out, err = _read_proc(proc)
+            raise AssertionError(
+                f"remote-task exited (rc={rt_rc}) before the waiter "
+                f"queued on {remote_lock}; stdout={out!r} "
+                f"stderr={err!r} marker_present={marker.exists()}")
+        # Fake ssh died, so the queue can no longer form: fail now.
+        try:
+            os.kill(fake_ssh_pid, 0)
+        except ProcessLookupError:
+            out, err = _read_proc(proc)
+            raise AssertionError(
+                f"fake ssh (pid={fake_ssh_pid}) died before the waiter "
+                f"queued on {remote_lock}; rc={proc.returncode} "
+                f"stdout={out!r} stderr={err!r} "
+                f"marker_present={marker.exists()}")
+        time.sleep(poll_interval_s)
+    out, err = _read_proc(proc)
+    raise AssertionError(
+        f"no waiter queued on {remote_lock} within {timeout_s}s; "
+        f"rc={proc.returncode} stdout={out!r} stderr={err!r} "
+        f"marker_present={marker.exists()}")
+
+
+def test_caller_is_captured_on_the_remote_shell():
+    """CALLER must expand on the builder, not on the local machine."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        proj_root = tmp / "proj"
+        proj_root.mkdir()
+        marker = tmp / "caller_marker"
+        (proj_root / "gates.toml").write_text(
+            "[[task]]\n"
+            'name = "bench"\n'
+            'role = "builder"\n'
+            f'command = "echo $CALLER > {marker}"\n')
+        for args in (
+            ["init", "-q"],
+            ["config", "user.email", "t@t"],
+            ["config", "user.name", "t"],
+            ["add", "-A"],
+            ["commit", "-q", "-m", "init"],
+        ):
+            subprocess.run(["git", "-C", str(proj_root), *args],
+                           check=True, capture_output=True)
+        fakebin = tmp / "fakebin"
+        fakebin.mkdir()
+        (fakebin / "rsync").write_text("#!/bin/sh\nexit 0\n")
+        (fakebin / "rsync").chmod(0o755)
+        (fakebin / "ssh").write_text(RUN_LOCAL_FAKE_SSH_VERBATIM)
+        (fakebin / "ssh").chmod(0o755)
+        pidfile = tmp / "fake_ssh.pid"
+        env = remote_task_env(proj_root, fakebin, repo_bin=False)
+        env["HOME"] = str(proj_root)
+        env["FAKE_SSH_HOME"] = str(proj_root)
+        env["FAKE_SSH_PIDFILE"] = str(pidfile)
+        r = subprocess.run([str(REMOTE_TASK), str(proj_root)],
+                           capture_output=True, text=True, env=env,
+                           timeout=30)
+        fake_ssh_pid = _wait_for_pidfile(pidfile)
+        assert_pass("exit 0", r.returncode == 0,
+                    f"stderr={r.stderr!r}")
+        assert_pass("marker was written", marker.exists(),
+                    f"stdout={r.stdout!r} stderr={r.stderr!r}")
+        recorded = int(marker.read_text().strip())
+        assert_pass(
+            "recorded CALLER equals the fake ssh's pid "
+            "(proof $PPID was expanded on the builder, not locally)",
+            recorded == fake_ssh_pid,
+            f"recorded={recorded} fake_ssh_pid={fake_ssh_pid} "
+            f"-- a bare $PPID on the local side records remote-task's "
+            f"parent, not the builder's")
+
+
+def test_hung_task_is_killed_at_its_limit():
+    """A task that exceeds its `[[task]] timeout` ends in FAIL within seconds."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        proj_root = tmp / "proj"
+        proj_root.mkdir()
+        (proj_root / "gates.toml").write_text(_manifest_with_timeout("2"))
+        subprocess.run(["git", "-C", str(proj_root), "init", "-q"],
+                       check=True)
+        subprocess.run(["git", "-C", str(proj_root), "config",
+                        "user.email", "t@t"], check=True)
+        subprocess.run(["git", "-C", str(proj_root), "config",
+                        "user.name", "t"], check=True)
+        subprocess.run(["git", "-C", str(proj_root), "add", "-A"],
+                       check=True)
+        subprocess.run(["git", "-C", str(proj_root), "commit",
+                        "-q", "-m", "init"], check=True)
+        pidfile = tmp / "fake_ssh.pid"
+        fakebin = tmp / "fakebin"
+        fakebin.mkdir()
+        for name in ("rsync", "ssh"):
+            (fakebin / name).write_text(
+                "#!/bin/sh\nexit 0\n" if name == "rsync"
+                else RUN_LOCAL_FAKE_SSH)
+            (fakebin / name).chmod(0o755)
+        env = remote_task_env(proj_root, fakebin, repo_bin=False)
+        env["FAKE_SSH_PIDFILE"] = str(pidfile)
+        env["FAKE_SSH_HOME"] = str(proj_root)
+        env["HOME"] = str(proj_root)
+        proc = subprocess.Popen([str(REMOTE_TASK), str(proj_root)],
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                text=True, env=env)
+        _wait_for_pidfile(pidfile)
+        try:
+            out, err = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate()
+            raise AssertionError(
+                f"remote-task did not exit within 30s for a 2s timeout: "
+                f"stderr={err!r}")
+        assert_pass("non-zero exit on hung task",
+                    proc.returncode != 0,
+                    f"rc={proc.returncode} stdout={out!r} stderr={err!r}")
+        lines = out.splitlines()
+        last = lines[-1] if lines else ""
+        assert_pass(
+            "FAIL line names the timeout",
+            last.startswith("==> FAIL (bench") and "timed out after 2s" in last,
+            repr(out))
+        # Second run as the lock-release proof: a hung task that
+        # erroneously returned PASS would also leave the remote lock
+        # held for the original 60s, and this run would queue behind
+        # it (or in the worst case take its 2s timeout). Together with
+        # the verdict line, it pins the actual mechanism.
+        proj2_root = tmp / "proj2"
+        proj2_root.mkdir()
+        (proj2_root / "gates.toml").write_text(_manifest_with_timeout("2"))
+        subprocess.run(["git", "-C", str(proj2_root), "init", "-q"],
+                       check=True)
+        subprocess.run(["git", "-C", str(proj2_root), "config",
+                        "user.email", "t@t"], check=True)
+        subprocess.run(["git", "-C", str(proj2_root), "config",
+                        "user.name", "t"], check=True)
+        subprocess.run(["git", "-C", str(proj2_root), "add", "-A"],
+                       check=True)
+        subprocess.run(["git", "-C", str(proj2_root), "commit",
+                        "-q", "-m", "init"], check=True)
+        env2 = dict(env)
+        env2["REMOTE_TASK_LOCK"] = str(tmp / "build2.lock")
+        env2["FAKE_SSH_HOME"] = str(proj2_root)
+        env2["HOME"] = str(proj2_root)
+        second = subprocess.run([str(REMOTE_TASK), str(proj2_root)],
+                               capture_output=True, text=True, env=env2,
+                               timeout=30)
+        assert_pass("second run reaches its own timeout (lock was free)",
+                    second.returncode != 0
+                    and "timed out after 2s" in second.stdout,
+                    repr(second))
+
+
+def test_queued_waiter_with_dead_caller_never_runs():
+    """A waiter in the remote lock whose caller is gone must not run."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        proj_root = tmp / "proj"
+        proj_root.mkdir()
+        marker = tmp / "marker"
+        (proj_root / "gates.toml").write_text(
+            "[[task]]\n"
+            'name = "bench"\n'
+            'role = "builder"\n'
+            f'command = "touch {marker}"\n')
+        subprocess.run(["git", "-C", str(proj_root), "init", "-q"],
+                       check=True)
+        subprocess.run(["git", "-C", str(proj_root), "config",
+                        "user.email", "t@t"], check=True)
+        subprocess.run(["git", "-C", str(proj_root), "config",
+                        "user.name", "t"], check=True)
+        subprocess.run(["git", "-C", str(proj_root), "add", "-A"],
+                       check=True)
+        subprocess.run(["git", "-C", str(proj_root), "commit",
+                        "-q", "-m", "init"], check=True)
+        fakebin = tmp / "fakebin"
+        fakebin.mkdir()
+        for name in ("rsync", "ssh"):
+            (fakebin / name).write_text(
+                "#!/bin/sh\nexit 0\n" if name == "rsync"
+                else RUN_LOCAL_FAKE_SSH)
+            (fakebin / name).chmod(0o755)
+        env = remote_task_env(proj_root, fakebin, repo_bin=False)
+        env["HOME"] = str(proj_root)
+        env["FAKE_SSH_HOME"] = str(proj_root)
+        # The remote lock path the build expands is $HOME/bench/.lock.
+        # Match the parent's FAKE_SSH_HOME so the test holds the same
+        # path the build is queued on.
+        remote_lock = proj_root / "bench" / ".lock"
+        (proj_root / "bench").mkdir(exist_ok=True)
+        # Acquire the remote lock in a background holder so the test
+        # process can release it from a different fork.
+        holder = subprocess.Popen(
+            ["flock", str(remote_lock), "sleep", "30"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            r = subprocess.run(["flock", "-n", str(remote_lock), "true"],
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+            if r.returncode != 0:
+                break
+            time.sleep(0.05)
+        else:
+            holder.kill()
+            raise AssertionError("holder never acquired the remote lock")
+        pidfile = tmp / "fake_ssh.pid"
+        env["FAKE_SSH_PIDFILE"] = str(pidfile)
+        proc = subprocess.Popen([str(REMOTE_TASK), str(proj_root)],
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                text=True, env=env)
+        fake_ssh_pid = _wait_for_pidfile(pidfile)
+        # A fixed sleep raced a slow runner: poll until the waiter is queued.
+        _wait_for_queued_waiter(remote_lock, fake_ssh_pid, proc, marker)
+        try:
+            os.kill(fake_ssh_pid, 9)
+        except ProcessLookupError:
+            out, err = _read_proc(proc)
+            raise AssertionError(
+                f"fake ssh (pid={fake_ssh_pid}) already gone when the "
+                f"test tried to kill it; rc={proc.returncode} "
+                f"stdout={out!r} stderr={err!r} "
+                f"marker_present={marker.exists()}")
+        holder.terminate()
+        try:
+            holder.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            holder.kill()
+            holder.wait()
+        try:
+            out, err = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate()
+            raise AssertionError(
+                f"remote-task did not exit; marker_present={marker.exists()}")
+        assert_pass("no marker touched", not marker.exists(),
+                    f"marker found; stdout={out!r} stderr={err!r}")
+        verdict = next((ln for ln in reversed(out.splitlines())
+                        if ln.startswith(("==> PASS", "==> FAIL"))), "")
+        assert_pass(
+            "no PASS verdict for a waiter whose caller died",
+            not verdict.startswith("==> PASS"),
+            repr(out))
+
+
+def test_queued_waiter_survives_slow_prep_call():
+    """The dead-caller waiter test holds on a slow prep ssh.
+
+    The fix to RUN_LOCAL_FAKE_SSH narrowed its pidfile write to the build
+    invocation, so the test's _wait_for_pidfile call cannot capture a
+    short-lived prep ssh that has already exited. This test reproduces the
+    bug deterministically by adding a 1s sleep to every non-build ssh
+    call and then running the same dead-caller scenario. With the old
+    "every ssh writes the pidfile" behaviour, the prep call's stale PID
+    would arrive first and _wait_for_pidfile would return it; the test
+    would then kill that already-dead PID, the real build ssh would
+    never be killed, and the build would complete -- the very
+    marker_present=True the reviewer found on CI.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        proj_root = tmp / "proj"
+        proj_root.mkdir()
+        marker = tmp / "marker"
+        (proj_root / "gates.toml").write_text(
+            "[[task]]\n"
+            'name = "bench"\n'
+            'role = "builder"\n'
+            f'command = "touch {marker}"\n')
+        subprocess.run(["git", "-C", str(proj_root), "init", "-q"],
+                       check=True)
+        subprocess.run(["git", "-C", str(proj_root), "config",
+                        "user.email", "t@t"], check=True)
+        subprocess.run(["git", "-C", str(proj_root), "config",
+                        "user.name", "t"], check=True)
+        subprocess.run(["git", "-C", str(proj_root), "add", "-A"],
+                       check=True)
+        subprocess.run(["git", "-C", str(proj_root), "commit",
+                        "-q", "-m", "init"], check=True)
+        fakebin = tmp / "fakebin"
+        fakebin.mkdir()
+        for name in ("rsync", "ssh"):
+            (fakebin / name).write_text(
+                "#!/bin/sh\nexit 0\n" if name == "rsync"
+                else RUN_LOCAL_FAKE_SSH_SLOW_PREP)
+            (fakebin / name).chmod(0o755)
+        env = remote_task_env(proj_root, fakebin, repo_bin=False)
+        env["HOME"] = str(proj_root)
+        env["FAKE_SSH_HOME"] = str(proj_root)
+        remote_lock = proj_root / "bench" / ".lock"
+        (proj_root / "bench").mkdir(exist_ok=True)
+        holder = subprocess.Popen(
+            ["flock", str(remote_lock), "sleep", "30"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            r = subprocess.run(["flock", "-n", str(remote_lock), "true"],
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+            if r.returncode != 0:
+                break
+            time.sleep(0.05)
+        else:
+            holder.kill()
+            raise AssertionError("holder never acquired the remote lock")
+        pidfile = tmp / "fake_ssh.pid"
+        env["FAKE_SSH_PIDFILE"] = str(pidfile)
+        proc = subprocess.Popen([str(REMOTE_TASK), str(proj_root)],
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                text=True, env=env)
+        # The pidfile is only written by the build dispatch. With the
+        # prep ssh delayed by 1s, the test would have observed it on the
+        # old behaviour from the prep call's stale pid. Here the build is
+        # the only writer, so what arrives is the build ssh's pid.
+        fake_ssh_pid = _wait_for_pidfile(pidfile)
+        try:
+            os.kill(fake_ssh_pid, 0)
+        except ProcessLookupError:
+            out, err = _read_proc(proc)
+            raise AssertionError(
+                f"fake ssh (pid={fake_ssh_pid}) already gone before "
+                f"the test could kill it -- the build ssh exited but the "
+                f"test read a different pid: rc={proc.returncode} "
+                f"stdout={out!r} stderr={err!r}")
+        _wait_for_queued_waiter(remote_lock, fake_ssh_pid, proc, marker)
+        try:
+            os.kill(fake_ssh_pid, 9)
+        except ProcessLookupError:
+            out, err = _read_proc(proc)
+            raise AssertionError(
+                f"fake ssh (pid={fake_ssh_pid}) already gone when the "
+                f"test tried to kill it; rc={proc.returncode} "
+                f"stdout={out!r} stderr={err!r} "
+                f"marker_present={marker.exists()}")
+        holder.terminate()
+        try:
+            holder.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            holder.kill()
+            holder.wait()
+        try:
+            out, err = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate()
+            raise AssertionError(
+                f"remote-task did not exit; marker_present={marker.exists()}")
+        assert_pass("no marker touched even with a 1s-delayed prep ssh",
+                    not marker.exists(),
+                    f"marker found; stdout={out!r} stderr={err!r}")
+        verdict = next((ln for ln in reversed(out.splitlines())
+                        if ln.startswith(("==> PASS", "==> FAIL"))), "")
+        assert_pass(
+            "no PASS verdict for a waiter whose caller died",
+            not verdict.startswith("==> PASS"),
+            repr(out))
+
+
+def test_running_task_dies_with_its_caller():
+    """Killing the ssh mid-run tears down the build via the watchdog."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        proj_root = tmp / "proj"
+        proj_root.mkdir()
+        marker = tmp / "marker"
+        sleep_pidfile = tmp / "sleep.pid"
+        # Write the sleep's own pid to a file so the test can identify
+        # which sleep belongs to this run -- a generic pgrep would also
+        # match unrelated processes and silently report the wrong pid.
+        (proj_root / "gates.toml").write_text(
+            "[[task]]\n"
+            'name = "bench"\n'
+            'role = "builder"\n'
+            'command = "echo $$ > ' + str(sleep_pidfile)
+            + r'; sleep 60; touch ' + str(marker)
+            + r'"' + "\n")
+        subprocess.run(["git", "-C", str(proj_root), "init", "-q"],
+                       check=True)
+        subprocess.run(["git", "-C", str(proj_root), "config",
+                        "user.email", "t@t"], check=True)
+        subprocess.run(["git", "-C", str(proj_root), "config",
+                        "user.name", "t"], check=True)
+        subprocess.run(["git", "-C", str(proj_root), "add", "-A"],
+                       check=True)
+        subprocess.run(["git", "-C", str(proj_root), "commit",
+                        "-q", "-m", "init"], check=True)
+        fakebin = tmp / "fakebin"
+        fakebin.mkdir()
+        for name in ("rsync", "ssh"):
+            (fakebin / name).write_text(
+                "#!/bin/sh\nexit 0\n" if name == "rsync"
+                else RUN_LOCAL_FAKE_SSH)
+            (fakebin / name).chmod(0o755)
+        env = remote_task_env(proj_root, fakebin, repo_bin=False)
+        env["HOME"] = str(proj_root)
+        env["FAKE_SSH_HOME"] = str(proj_root)
+        pidfile = tmp / "fake_ssh.pid"
+        env["FAKE_SSH_PIDFILE"] = str(pidfile)
+        proc = subprocess.Popen([str(REMOTE_TASK), str(proj_root)],
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                text=True, env=env)
+        _wait_for_pidfile(pidfile)
+        try:
+            _wait_for_pidfile(sleep_pidfile, deadline_s=15)
+        except AssertionError:
+            proc.kill()
+            out, err = proc.communicate()
+            raise AssertionError(
+                f"sleep pidfile never appeared: stdout={out!r} stderr={err!r}")
+        sleep_pid = int(sleep_pidfile.read_text().strip())
+        fake_ssh_pid = int(pidfile.read_text().strip())
+        os.kill(fake_ssh_pid, 9)
+        # Within 15s the sleep must be gone. The watchdog polls every
+        # 5s, and the inner bash's pgrp is the recipient of its TERM.
+        deadline = time.time() + 15
+        gone = False
+        while time.time() < deadline:
+            try:
+                os.kill(sleep_pid, 0)
+            except ProcessLookupError:
+                gone = True
+                break
+            time.sleep(0.2)
+        try:
+            out, err = proc.communicate(timeout=20)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate()
+            raise AssertionError(
+                f"remote-task did not exit; sleep_gone={gone} "
+                f"stdout={out!r} stderr={err!r}")
+        assert_pass("no sleep process remains within 15s",
+                    gone,
+                    f"sleep pid={sleep_pid} still alive; "
+                    f"stdout={out!r} stderr={err!r}")
+        assert_pass("no marker touched",
+                    not marker.exists(),
+                    repr(out))
+        verdict = next((ln for ln in reversed(out.splitlines())
+                        if ln.startswith(("==> PASS", "==> FAIL"))), "")
+        assert_pass("verdict is FAIL",
+                    verdict.startswith("==> FAIL"),
+                    repr(out))
+
+
+def test_killing_wrapper_kills_running_task(sig_name: str = "TERM") -> None:
+    """A TERM, INT or HUP on the wrapper alone must reach its SSH child.
+
+    The remote watchdog fires only when the SSH session goes, so a wrapper
+    that dies leaving ssh connected lets the build finish while holding the
+    bench lock.
+    """
+    sig = {"TERM": signal.SIGTERM,
+           "INT": signal.SIGINT,
+           "HUP": signal.SIGHUP}[sig_name]
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        proj_root = tmp / "proj"
+        proj_root.mkdir()
+        start_marker = tmp / "start"
+        complete_marker = tmp / "complete"
+        # Run sleep 7 -- longer than the watchdog's 5s poll, so a working
+        # fix has time to fire the watchdog before the completion marker.
+        # Short enough that the test can wait for the marker to NOT appear.
+        (proj_root / "gates.toml").write_text(
+            "[[task]]\n"
+            'name = "bench"\n'
+            'role = "builder"\n'
+            'command = "touch ' + str(start_marker)
+            + r'; sleep 7; touch ' + str(complete_marker)
+            + r'"' + "\n"
+            'timeout = 20\n'
+        )
+        for args in (
+            ["init", "-q"],
+            ["config", "user.email", "t@t"],
+            ["config", "user.name", "t"],
+            ["add", "-A"],
+            ["commit", "-q", "-m", "init"],
+        ):
+            subprocess.run(["git", "-C", str(proj_root), *args],
+                           check=True, capture_output=True)
+        fakebin = tmp / "fakebin"
+        fakebin.mkdir()
+        (fakebin / "rsync").write_text("#!/bin/sh\nexit 0\n")
+        (fakebin / "rsync").chmod(0o755)
+        (fakebin / "ssh").write_text(RUN_LOCAL_FAKE_SSH)
+        (fakebin / "ssh").chmod(0o755)
+        env = remote_task_env(proj_root, fakebin, repo_bin=False)
+        env["HOME"] = str(proj_root)
+        env["FAKE_SSH_HOME"] = str(proj_root)
+        pidfile = tmp / "fake_ssh.pid"
+        env["FAKE_SSH_PIDFILE"] = str(pidfile)
+        proc = subprocess.Popen([str(REMOTE_TASK), str(proj_root)],
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                text=True, env=env)
+        # Wait for the build to start; the start marker proves the wrapper
+        # reached the remote side, so the signal sent after this point
+        # exercises the wrapper-to-SSH teardown the watchdog relies on.
+        deadline = time.time() + 15
+        while not start_marker.exists():
+            if proc.poll() is not None:
+                out, err = proc.communicate()
+                raise AssertionError(
+                    f"remote-task died before the build started: "
+                    f"rc={proc.returncode} stdout={out!r} stderr={err!r}")
+            if time.time() > deadline:
+                proc.kill()
+                proc.communicate()
+                raise AssertionError("start marker never appeared")
+            time.sleep(0.05)
+        proc.send_signal(sig)
+        try:
+            out, err = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate()
+            raise AssertionError(
+                f"remote-task did not exit on SIG{sig_name}; "
+                f"stdout={out!r} stderr={err!r}")
+        assert_pass(f"wrapper exits non-zero on SIG{sig_name}",
+                    proc.returncode != 0,
+                    f"rc={proc.returncode} stdout={out!r} stderr={err!r}")
+        # Sleep well past the watchdog's 5s poll + the 7s build sleep so a
+        # leak would still surface here.
+        time.sleep(10)
+        assert_pass("completion marker must NOT be written",
+                    not complete_marker.exists(),
+                    f"completion marker was written; "
+                    f"stdout={out!r} stderr={err!r}")
+        # Lock release: a non-blocking flock on the remote bench lock must
+        # succeed once the build has been killed. The lock path is what the
+        # build expanded -- $FAKE_SSH_HOME/bench/.lock.
+        remote_lock = proj_root / "bench" / ".lock"
+        deadline = time.time() + 15
+        acquired = False
+        while time.time() < deadline:
+            r = subprocess.run(["flock", "-n", str(remote_lock), "true"],
+                              capture_output=True)
+            if r.returncode == 0:
+                acquired = True
+                break
+            time.sleep(0.2)
+        assert_pass("remote bench lock is released after kill",
+                    acquired,
+                    f"remote lock {remote_lock} still held; "
+                    f"stdout={out!r} stderr={err!r}")
+
+
+def test_killing_wrapper_with_term() -> None:
+    test_killing_wrapper_kills_running_task("TERM")
+
+
+def test_killing_wrapper_with_int() -> None:
+    test_killing_wrapper_kills_running_task("INT")
+
+
+def test_killing_wrapper_with_hup() -> None:
+    test_killing_wrapper_kills_running_task("HUP")
+
+
+def test_local_lock_wait_is_bounded():
+    """`flock -w` on the local lock exits with a message naming the lock."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        proj_root = tmp / "proj"
+        proj_root.mkdir()
+        (proj_root / "gates.toml").write_text(
+            "[[task]]\n"
+            'name = "bench"\n'
+            'role = "builder"\n'
+            'command = "echo hi"\n')
+        subprocess.run(["git", "-C", str(proj_root), "init", "-q"],
+                       check=True)
+        subprocess.run(["git", "-C", str(proj_root), "config",
+                        "user.email", "t@t"], check=True)
+        subprocess.run(["git", "-C", str(proj_root), "config",
+                        "user.name", "t"], check=True)
+        subprocess.run(["git", "-C", str(proj_root), "add", "-A"],
+                       check=True)
+        subprocess.run(["git", "-C", str(proj_root), "commit",
+                        "-q", "-m", "init"], check=True)
+        fakebin = tmp / "fakebin"
+        fakebin.mkdir()
+        for name in ("rsync", "ssh"):
+            (fakebin / name).write_text(
+                "#!/bin/sh\nexit 0\n" if name == "rsync"
+                else RUN_LOCAL_FAKE_SSH)
+            (fakebin / name).chmod(0o755)
+        lock_path = tmp / "build.lock"
+        env = remote_task_env(proj_root, fakebin, repo_bin=False)
+        env["HOME"] = str(proj_root)
+        env["FAKE_SSH_HOME"] = str(proj_root)
+        env["REMOTE_TASK_LOCK"] = str(lock_path)
+        env["REMOTE_TASK_LOCK_WAIT"] = "1"
+        # The ssh fake requires FAKE_SSH_PIDFILE even though this test
+        # exercises the local lock -- remote-task calls ssh earlier
+        # (for `mkdir -p bench/proj`) and the fake aborts without the
+        # marker. The marker file itself is unused here.
+        env["FAKE_SSH_PIDFILE"] = str(tmp / "fake_ssh.pid")
+        holder = subprocess.Popen(
+            ["flock", str(lock_path), "sleep", "30"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            r = subprocess.run(["flock", "-n", str(lock_path), "true"],
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+            if r.returncode != 0:
+                break
+            time.sleep(0.05)
+        else:
+            holder.kill()
+            raise AssertionError("holder never acquired the local lock")
+        try:
+            r = subprocess.run([str(REMOTE_TASK), str(proj_root)],
+                               capture_output=True, text=True, env=env,
+                               timeout=20)
+        finally:
+            holder.terminate()
+            try:
+                holder.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                holder.kill()
+                holder.wait()
+        assert_pass("non-zero exit on local lock timeout",
+                    r.returncode != 0,
+                    repr(r))
+        combined = r.stderr + r.stdout
+        assert_pass(
+            "message names the lock path",
+            str(lock_path) in combined,
+            repr(r))
+        assert_pass(
+            "message names the timeout duration",
+            "1s" in combined,
+            repr(r))
+        verdict = next((ln for ln in reversed(r.stdout.splitlines())
+                        if ln.startswith(("==> PASS", "==> FAIL"))), "")
+        assert_pass(
+            "verdict names the local lock",
+            "local lock" in verdict and "1s" in verdict,
+            repr(r))
+
+
+def test_remote_lock_wait_is_bounded():
+    """`flock -w` on the remote bench lock exits with a message naming it."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        proj_root = tmp / "proj"
+        proj_root.mkdir()
+        (proj_root / "gates.toml").write_text(
+            "[[task]]\n"
+            'name = "bench"\n'
+            'role = "builder"\n'
+            'command = "echo hi"\n')
+        for args in (
+            ["init", "-q"],
+            ["config", "user.email", "t@t"],
+            ["config", "user.name", "t"],
+            ["add", "-A"],
+            ["commit", "-q", "-m", "init"],
+        ):
+            subprocess.run(["git", "-C", str(proj_root), *args],
+                           check=True, capture_output=True)
+        fakebin = tmp / "fakebin"
+        fakebin.mkdir()
+        (fakebin / "rsync").write_text("#!/bin/sh\nexit 0\n")
+        (fakebin / "rsync").chmod(0o755)
+        (fakebin / "ssh").write_text(RUN_LOCAL_FAKE_SSH)
+        (fakebin / "ssh").chmod(0o755)
+        env = remote_task_env(proj_root, fakebin, repo_bin=False)
+        env["HOME"] = str(proj_root)
+        env["FAKE_SSH_HOME"] = str(proj_root)
+        env["FAKE_SSH_PIDFILE"] = str(tmp / "fake_ssh.pid")
+        env["REMOTE_TASK_LOCK_WAIT"] = "1"
+        # The build expands `$HOME/bench/.lock` against FAKE_SSH_HOME.
+        # Pre-create the path the test will hold so the holder and the
+        # build reach for the same file.
+        remote_lock = proj_root / "bench" / ".lock"
+        (proj_root / "bench").mkdir(exist_ok=True)
+        holder = subprocess.Popen(
+            ["flock", str(remote_lock), "sleep", "30"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            r = subprocess.run(["flock", "-n", str(remote_lock), "true"],
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+            if r.returncode != 0:
+                break
+            time.sleep(0.05)
+        else:
+            holder.kill()
+            raise AssertionError("holder never acquired the remote lock")
+        try:
+            r = subprocess.run([str(REMOTE_TASK), str(proj_root)],
+                               capture_output=True, text=True, env=env,
+                               timeout=20)
+        finally:
+            holder.terminate()
+            try:
+                holder.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                holder.kill()
+                holder.wait()
+        assert_pass("non-zero exit on remote lock timeout",
+                    r.returncode != 0,
+                    repr(r))
+        verdict = next((ln for ln in reversed(r.stdout.splitlines())
+                        if ln.startswith(("==> PASS", "==> FAIL"))), "")
+        assert_pass(
+            "verdict names the timeout duration",
+            "1s" in verdict,
+            repr(r))
+        assert_pass(
+            "verdict names the remote bench lock",
+            "remote bench lock" in verdict,
+            repr(r))
+
+
 def main() -> int:
     tests = [
         test_failures_have_one_final_verdict,
@@ -866,6 +1771,16 @@ def main() -> int:
         test_matching_fingerprint_no_touch,
         test_changed_migrations_touch_sources,
         test_touch_survives_a_real_rsync,
+        test_hung_task_is_killed_at_its_limit,
+        test_caller_is_captured_on_the_remote_shell,
+        test_queued_waiter_with_dead_caller_never_runs,
+        test_queued_waiter_survives_slow_prep_call,
+        test_running_task_dies_with_its_caller,
+        test_killing_wrapper_with_term,
+        test_killing_wrapper_with_int,
+        test_killing_wrapper_with_hup,
+        test_local_lock_wait_is_bounded,
+        test_remote_lock_wait_is_bounded,
     ]
     failures = []
     for t in tests:

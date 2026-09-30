@@ -177,7 +177,8 @@ def main() -> int:
             out = ""
         if out:
             for var in ("TASK_FULL_COMMAND", "TASK_DB_CONTAINER",
-                        "TASK_DB_USER", "TASK_DB_PORT", "TASK_DB_PREFIX"):
+                        "TASK_DB_USER", "TASK_DB_PORT", "TASK_DB_PREFIX",
+                        "TASK_TIMEOUT"):
                 if f"{var}=''" not in out:
                     failures.append(f"{var} not empty in output: {out!r}")
             if "declare -a TASK_FETCH=()" not in out:
@@ -248,6 +249,56 @@ def main() -> int:
         if "TASK_MIGRATOR_SOURCES=(crates/db/src/lib.rs crates/api-rest/src/lib.rs)" not in out:
             failures.append(
                 f"TASK_MIGRATOR_SOURCES did not contain both entries: {out!r}")
+
+        # `timeout = 0` must survive: coreutils reads it as "no limit".
+        setup(tmpdir)
+        text = (tmpdir / "gates.toml").read_text()
+        new_entry = [
+            "[[task]]",
+            'name = "bench-timeout-test"',
+            'role = "builder"',
+            'command = "cargo build --workspace"',
+            'timeout = 60',
+        ]
+        (tmpdir / "gates.toml").write_text(text + "\n" + "\n".join(new_entry) + "\n")
+        out = assert_pass(tmpdir, "--task", "bench-timeout-test")
+        if "TASK_TIMEOUT='60'" not in out and 'TASK_TIMEOUT="60"' not in out \
+                and "TASK_TIMEOUT=60" not in out:
+            failures.append(
+                f"TASK_TIMEOUT did not contain 60: {out!r}")
+
+        # Enabling the example's `# timeout = 7200` must reach bash as
+        # TASK_TIMEOUT=7200. Under [task.database] it parses as a database
+        # field, and remote-task silently falls back to 3600s.
+        src = EXAMPLE.read_text()
+        # Uncomment the documented timeout line and strip every other comment
+        # so the file round-trips through tomllib.
+        uncommented = src.replace("# timeout = 7200\n", "timeout = 7200\n")
+        (tmpdir / "gates.toml").write_text(uncommented)
+        # Sanity: tomllib accepts the file.
+        try:
+            tomllib.loads(uncommented)
+        except tomllib.TOMLDecodeError as e:
+            failures.append(
+                f"uncommented example is not valid TOML: {e}")
+        out = assert_pass(tmpdir, "--task", "bench")
+        if "TASK_TIMEOUT='7200'" not in out and 'TASK_TIMEOUT="7200"' not in out \
+                and "TASK_TIMEOUT=7200" not in out:
+            failures.append(
+                f"uncommented example did not yield TASK_TIMEOUT=7200: {out!r}")
+        # The line must land on the task, not on its database sub-table.
+        doc = tomllib.loads(uncommented)
+        bench = next(
+            (e for e in doc.get("task", []) if e.get("name") == "bench"), None)
+        if bench is None:
+            failures.append("bench task missing from uncommented example")
+        elif bench.get("timeout") != 7200:
+            failures.append(
+                f"bench task missing timeout=7200; got {bench.get('timeout')!r}")
+        elif (bench.get("database") or {}).get("timeout") is not None:
+            failures.append(
+                f"database sub-table picked up timeout by mistake: "
+                f"{bench.get('database')!r}")
 
         # Bash integration: under `set -euo pipefail`, an unset required field
         # must reach the caller as the manifest's named error, not as an
