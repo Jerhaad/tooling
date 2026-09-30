@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""Annotate reviewer findings with where the quoted code actually is.
+
+Checks each finding's snippet against the file, corrects a drifted line,
+flags a `***` the agent's redaction wrote into its own quote, and says
+whether the location is inside the change. The verdict is in `status`, not
+the exit code: a finding that is not found is a result, not a failure.
+"""
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+from typing import NoReturn
+
+REQUIRED_FIELDS = ("severity", "path", "line", "snippet", "claim",
+                   "settled_by", "recommendation")
+VALID_SEVERITIES = {"high", "medium", "low"}
+USAGE = "usage: finding-check <worktree> <findings.json> [--base REF]"
+
+
+def parse_hunks(diff_text: str) -> dict[str, list[tuple[int, int]]]:
+    """New-side line ranges per path, from a `git diff --unified=0`.
+
+    A pure deletion in a surviving file still gets a one-line range at the
+    deletion point, so a finding about the removed code counts as in the
+    change."""
+    ranges: dict[str, list[tuple[int, int]]] = {}
+    path = None
+    for line in diff_text.splitlines():
+        # The `+++` line names the new side, which is what a finding cites.
+        # A deleted file's is `/dev/null`, and its hunks belong to no path.
+        if line.startswith("+++ "):
+            m = re.match(r"^\+\+\+ b/(.+)$", line)
+            path = m.group(1) if m else None
+            continue
+        m = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", line)
+        if m and path is not None:
+            start = int(m.group(1))
+            count = int(m.group(2)) if m.group(2) is not None else 1
+            end = start + max(count, 1) - 1
+            ranges.setdefault(path, []).append((start, end))
+    return ranges
+
+
+def diff_ranges(worktree: Path, base: str) -> dict[str, list[tuple[int, int]]]:
+    """Changed ranges of `base...HEAD`. Zero context lines, so a range
+    covers only changed lines and a finding beside a hunk is outside it."""
+    result = subprocess.run(
+        ["git", "-C", str(worktree), "diff", "--unified=0",
+         f"{base}...HEAD"],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        die(f"finding-check: {result.stderr.strip() or 'base not resolved'}")
+    return parse_hunks(result.stdout)
+
+
+def in_diff(path: str, line: int,
+            ranges: dict[str, list[tuple[int, int]]]) -> bool:
+    for start, end in ranges.get(path, ()):
+        if start <= line <= end:
+            return True
+    return False
+
+
+def normalise(line: str) -> str:
+    """Reviewers re-indent what they quote."""
+    return re.sub(r"\s+", " ", line.strip())
+
+
+def _only_wildcards(snip_line: str) -> bool:
+    return "***" in snip_line and re.sub(r"\*+", "", snip_line).strip() == ""
+
+
+def snippet_matches(snip_line: str, file_line: str) -> bool:
+    """Equality after normalising, except that `***` stands for whatever the
+    agent redacted, so the literal text around it must appear in order.
+
+    A line that is only `***` would match anything, so it matches only a
+    file line that itself holds `***`."""
+    if "***" not in snip_line:
+        return normalise(snip_line) == normalise(file_line)
+    if _only_wildcards(snip_line):
+        return "***" in file_line
+    segments = snip_line.split("***")
+    norm = normalise(file_line)
+    pos = 0
+    for i, seg in enumerate(segments):
+        if not seg:
+            continue
+        seg_norm = normalise(seg)
+        idx = norm.find(seg_norm, pos)
+        if idx == -1:
+            return False
+        pos = idx + len(seg_norm)
+    return True
+
+
+def locate_snippet(file_lines: list[str], snippet: str,
+                   cited: int) -> tuple[int, str] | None:
+    """The 1-indexed first line of the matching block nearest `cited`."""
+    snip_lines = snippet.splitlines()
+    if not snip_lines:
+        return None
+    matches: list[int] = []
+    for i in range(0, len(file_lines) - len(snip_lines) + 1):
+        if all(snippet_matches(s, file_lines[i + j])
+               for j, s in enumerate(snip_lines)):
+            matches.append(i + 1)  # 1-indexed
+    if not matches:
+        return None
+    nearest = min(matches, key=lambda start: (abs(start - cited), start))
+    return (nearest, "located")
+
+
+def block_has_redaction(file_lines: list[str], start: int,
+                        snippet: str) -> bool:
+    """True when the file holds no `***` on any line where the snippet has
+    one: the `***` was the agent's, not the source's."""
+    snip_lines = snippet.splitlines()
+    for j, s in enumerate(snip_lines):
+        if "***" not in s:
+            continue
+        line_no = start + j
+        if line_no - 1 >= len(file_lines):
+            return False
+        if "***" in file_lines[line_no - 1]:
+            return False
+    return True
+
+
+def _type_name(value: object) -> str:
+    """Python counts `True` as an int; `"line": true` names no line."""
+    if isinstance(value, bool):
+        return "bool"
+    return type(value).__name__
+
+
+def check_finding(finding: dict, worktree: Path,
+                  ranges: dict[str, list[tuple[int, int]]]) -> dict:
+    """Annotate one finding. Each check needs the one before it to have
+    passed, so the order is the classification."""
+    for field in REQUIRED_FIELDS:
+        if field not in finding:
+            return {**finding, "status": "malformed",
+                    "in_diff": False,
+                    "reason": f"missing required field {field!r}"}
+    severity = finding["severity"]
+    # Before set membership, which raises on a list or dict.
+    if not isinstance(severity, str):
+        return {**finding, "status": "malformed", "in_diff": False,
+                "reason": f"field 'severity' must be string, "
+                          f"got {_type_name(severity)}"}
+    if severity not in VALID_SEVERITIES:
+        return {**finding, "status": "malformed",
+                "in_diff": False,
+                "reason": f"severity {severity!r} not in "
+                          f"{sorted(VALID_SEVERITIES)}"}
+
+    line = finding["line"]
+    if isinstance(line, bool) or not isinstance(line, int):
+        return {**finding, "status": "malformed", "in_diff": False,
+                "reason": f"field 'line' must be integer, "
+                          f"got {_type_name(line)}"}
+    for field in ("path", "snippet", "claim", "settled_by",
+                  "recommendation"):
+        value = finding[field]
+        if not isinstance(value, str):
+            return {**finding, "status": "malformed",
+                    "in_diff": False,
+                    "reason": f"field {field!r} must be string, "
+                              f"got {_type_name(value)}"}
+
+    path = finding["path"]
+    snippet = finding["snippet"]
+    # Containment is checked before anything is read: an absolute path, a
+    # `..` or a symlink could otherwise point the tool at any file on disk.
+    worktree_resolved = worktree.resolve(strict=True)
+    try:
+        candidate = (worktree_resolved / path).resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        # ValueError: a NUL byte in the path.
+        return {**finding, "status": "path-missing", "in_diff": False,
+                "reason": f"path {path!r} could not be resolved"}
+    try:
+        candidate.relative_to(worktree_resolved)
+    except ValueError:
+        return {**finding, "status": "path-missing", "in_diff": False,
+                "reason": f"path {path!r} lies outside the worktree"}
+    try:
+        if not candidate.is_file():
+            return {**finding, "status": "path-missing",
+                    "in_diff": False}
+        file_lines = candidate.read_text(errors="replace").splitlines()
+    except OSError:
+        return {**finding, "status": "path-missing", "in_diff": False,
+                "reason": f"path {path!r} could not be read"}
+
+    found = locate_snippet(file_lines, snippet, line)
+    if found is None:
+        return {**finding, "status": "not-found",
+                "line": line, "in_diff": False}
+
+    corrected = found[0]
+    # Git's spelling of the path, so `./a.rs` finds `a.rs` in the diff; the
+    # finding keeps the reviewer's.
+    diff_path = candidate.relative_to(worktree_resolved).as_posix()
+    if "***" in snippet and block_has_redaction(file_lines, corrected,
+                                                snippet):
+        return {**finding, "status": "redaction-artifact",
+                "line": corrected,
+                "in_diff": in_diff(diff_path, corrected, ranges)}
+
+    return {**finding, "status": "located",
+            "line": corrected,
+            "in_diff": in_diff(diff_path, corrected, ranges)}
+
+
+def annotate(finding: object, worktree: Path,
+             ranges: dict[str, list[tuple[int, int]]]) -> dict:
+    """A non-object entry stays in its position as malformed, keeping what
+    the reviewer sent under `value`."""
+    if not isinstance(finding, dict):
+        return {"status": "malformed", "in_diff": False,
+                "reason": f"finding must be a JSON object, got "
+                          f"{_type_name(finding)}",
+                "value": finding}
+    return check_finding(finding, worktree, ranges)
+
+
+def die(message: str) -> "NoReturn":
+    sys.stderr.write(message + "\n")
+    sys.exit(2)
+
+
+def main() -> int:
+    if len(sys.argv) < 3:
+        die(USAGE)
+    worktree = Path(sys.argv[1])
+    findings_path = Path(sys.argv[2])
+    base = "origin/main"
+    args = sys.argv[3:]
+    if "--base" in args:
+        i = args.index("--base")
+        if i + 1 >= len(args):
+            die(USAGE)
+        base = args[i + 1]
+    if not worktree.is_dir():
+        die(f"finding-check: {worktree} is not a directory")
+    if not findings_path.is_file():
+        die(f"finding-check: {findings_path} is not a file")
+
+    try:
+        findings = json.loads(findings_path.read_text())
+    except json.JSONDecodeError as exc:
+        die(f"finding-check: {findings_path}: {exc.msg} "
+            f"(line {exc.lineno} col {exc.colno})")
+    if not isinstance(findings, list):
+        die("finding-check: findings must be a JSON array")
+
+    # The fork point, so commits main gained since do not count as the change.
+    if base == "origin/main":
+        merge_base = subprocess.run(
+            ["git", "-C", str(worktree), "merge-base",
+             "origin/main", "HEAD"],
+            capture_output=True, text=True, check=False,
+        ).stdout.strip()
+        if merge_base:
+            base = merge_base
+
+    ranges = diff_ranges(worktree, base)
+    annotated = [annotate(f, worktree, ranges) for f in findings]
+
+    json.dump(annotated, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+
+    tally = {s: 0 for s in ("located", "redaction-artifact",
+                            "not-found", "path-missing", "malformed")}
+    for f in annotated:
+        tally[f.get("status", "?")] = tally.get(f.get("status", "?"), 0) + 1
+    parts = [f"{k}={tally[k]}" for k in tally if tally[k]]
+    sys.stderr.write("finding-check: " + ", ".join(parts) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    main()
