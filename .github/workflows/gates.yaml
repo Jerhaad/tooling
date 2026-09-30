@@ -1,0 +1,31 @@
+name: Gates
+
+on:
+  pull_request:
+
+# A push supersedes the run before it; only the newest head's verdict is read.
+concurrency:
+  group: gates-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    name: Gates
+    runs-on: ubuntu-latest
+    steps:
+      # The PR head itself, not the merge ref: pr-ready compares the checked
+      # head with the pushed one, and gate-verify diffs it against its base.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      # Several suites commit in scratch repositories, and some strip GIT_*
+      # from the environment first, so the identity has to be config.
+      - run: |
+          git config --global user.name gates
+          git config --global user.email gates@localhost
+
+      - run: bin/gate-verify .
+        env:
+          VERIFY_BASE: origin/${{ github.event.pull_request.base.ref }}
