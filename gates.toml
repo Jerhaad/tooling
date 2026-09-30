@@ -108,6 +108,11 @@ run = "python3 tests/test_triage_on_merge.py"
 # This establishes the file parses and nothing more -- real coverage would
 # pin a behaviour, not a parse, and writing eight suites is a separate task.
 [[gates]]
+name = "findings-ledger tests"
+when = '^(bin/findings-ledger|tests/test_findings_ledger\.py)$'
+run = "python3 tests/test_findings_ledger.py"
+
+[[gates]]
 name = "gate-untested syntax"
 when = '^(bin/gate-untested)$'
 run = "bash -n bin/gate-untested"

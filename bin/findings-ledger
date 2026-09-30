@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""Record review findings posted while a PR was Ready, so a change to the
+review loop can show what still gets past it.
+
+A finding is a review, an inline review comment, or a conversation comment;
+reviewers post most findings as conversation comments. It counts when posted
+inside a Ready interval: from a `ready_for_review` event (or the PR's creation,
+when it opened non-draft) up to the next `convert_to_draft`.
+
+Entries are keyed by (repo, kind, id), so a rerun appends only what is new
+and one ledger can hold several repositories; each carries the comment's URL.
+`head_sha` is the commit a review or inline comment names, and empty for a
+conversation comment: ordinary pushes leave no event to place one. A person
+fills `defect_class` and `loop_stage`; `summary` counts them.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+LEDGER = Path(os.environ.get(
+    "FINDINGS_LEDGER", Path.home() / "queue" / "findings" / "findings.jsonl"))
+
+# GitHub's maximum page size.
+PAGE = 100
+
+
+# ----- gh ------------------------------------------------------------------
+
+def gh_json(args: list[str]) -> object:
+    """Run `gh <args>` and return its parsed JSON. gh exits non-zero on auth
+    failure and on an empty repository -- the caller decides which."""
+    out = subprocess.run(
+        ["gh", *args], capture_output=True, text=True, check=True).stdout
+    return json.loads(out) if out.strip() else None
+
+
+def gh_jq(endpoint: str, jq: str, repo: str | None) -> list:
+    """`gh api <endpoint> --jq EXPR`, returning a JSON array. One page; this
+    is for endpoints the caller paginates by appending ?page=N itself."""
+    # The endpoint path names the repository; `gh api` has no -R.
+    cmd = ["gh", "api", endpoint, "--paginate=false", "--jq", jq]
+    out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+    if not out.strip():
+        return []
+    return json.loads(out)
+
+
+def gh_api_pages(endpoint: str, repo: str | None) -> list:
+    """Every page of a paginated REST endpoint, in order."""
+    all_rows: list = []
+    page = 1
+    while True:
+        sep = "&" if "?" in endpoint else "?"
+        chunk = gh_jq(f"{endpoint}{sep}per_page={PAGE}&page={page}",
+                     ".", repo)
+        if not chunk:
+            break
+        all_rows.extend(chunk)
+        if len(chunk) < PAGE:
+            break
+        page += 1
+    return all_rows
+
+
+# ----- Ready intervals -----------------------------------------------------
+
+TRANSITION_EVENTS = ("ready_for_review", "convert_to_draft")
+
+
+def ready_intervals(
+    created_at: str,
+    events: list[dict],
+    current_is_draft: bool,
+) -> list[tuple[str, str | None]]:
+    """Half-open Ready intervals for one PR, ordered chronologically.
+
+    Each is `[start, end)`, `end` None while the PR is still Ready, so a
+    comment at the instant of `convert_to_draft` falls outside.
+
+    The state before the first transition is the opposite of it; with no
+    transitions the PR has only ever been in its current state.
+    """
+    transitions = sorted(
+        (e["created_at"], e["event"])
+        for e in events
+        if e.get("event") in TRANSITION_EVENTS and e.get("created_at")
+    )
+    if transitions:
+        initial_ready = transitions[0][1] != "ready_for_review"
+    else:
+        initial_ready = not current_is_draft
+
+    intervals: list[tuple[str, str | None]] = []
+    state_ready = initial_ready
+    interval_start: str | None = created_at if initial_ready else None
+    for at, event in transitions:
+        if event == "ready_for_review":
+            if interval_start is not None and state_ready:
+                intervals.append((interval_start, at))
+            interval_start = at
+            state_ready = True
+        else:  # convert_to_draft
+            if state_ready and interval_start is not None:
+                intervals.append((interval_start, at))
+            interval_start = None
+            state_ready = False
+    if state_ready and interval_start is not None:
+        intervals.append((interval_start, None))
+    return intervals
+
+
+def in_ready_intervals(at: str, intervals: list[tuple[str, str | None]]) -> bool:
+    """True iff `at` falls inside one of the half-open Ready intervals."""
+    for start, end in intervals:
+        if at < start:
+            continue
+        if end is None or at < end:
+            return True
+    return False
+
+
+# ----- one PR --------------------------------------------------------------
+
+def pr_findings(pr: int, intervals: list[tuple[str, str | None]],
+                repo: str | None) -> list[dict]:
+    """The findings posted on one PR while it was Ready."""
+    reviews = gh_api_pages(f"repos/{repo}/pulls/{pr}/reviews", repo)
+    inline = gh_api_pages(f"repos/{repo}/pulls/{pr}/comments", repo)
+    conversation = gh_api_pages(f"repos/{repo}/issues/{pr}/comments", repo)
+
+    rows: list[dict] = []
+    for r in reviews:
+        at = r.get("submitted_at") or r.get("created_at") or ""
+        if not in_ready_intervals(at, intervals):
+            continue
+        rows.append({
+            "kind": "review",
+            "id": str(r.get("id") or r.get("databaseId") or ""),
+            "state": r.get("state", ""),
+            "author": ((r.get("author") or {}).get("login")
+                       or r.get("user", {}).get("login") or ""),
+            "created_at": at,
+            "head_sha": r.get("commit_id") or "",
+            "html_url": r.get("html_url") or "",
+            "body": r.get("body") or "",
+        })
+    for c in inline:
+        at = c.get("created_at") or ""
+        if not in_ready_intervals(at, intervals):
+            continue
+        rows.append({
+            "kind": "review_comment",
+            "id": str(c.get("id") or c.get("databaseId") or ""),
+            "author": ((c.get("author") or {}).get("login")
+                       or c.get("user", {}).get("login") or ""),
+            "created_at": at,
+            "head_sha": c.get("commit_id") or "",
+            "html_url": c.get("html_url") or "",
+            "path": c.get("path") or "",
+            "body": c.get("body") or "",
+        })
+    for c in conversation:
+        at = c.get("created_at") or ""
+        if not in_ready_intervals(at, intervals):
+            continue
+        rows.append({
+            "kind": "issue_comment",
+            "id": str(c.get("id") or c.get("databaseId") or ""),
+            "author": ((c.get("author") or {}).get("login")
+                       or c.get("user", {}).get("login") or ""),
+            "created_at": at,
+            "head_sha": "",
+            "html_url": c.get("html_url") or "",
+            "body": c.get("body") or "",
+        })
+    return rows
+
+
+# ----- ledger --------------------------------------------------------------
+
+# Two blank fields per entry are the contract the issue names: a person fills
+# them in. Summary mode counts what they typed.
+ENTRY_BLANK = ("defect_class", "loop_stage")
+
+
+def entry_key(entry: dict) -> tuple:
+    """Ids are unique within a repo+kind; one ledger can carry findings from
+    many repos because this key names the repo too."""
+    return (entry["repo"], entry["kind"], entry["id"])
+
+
+def load_keys(path: Path) -> set:
+    """Read every key already in the ledger. A malformed line is skipped --
+    a person editing the file by hand can corrupt one row without losing
+    the rest, and a partial read is better than refusing the whole file."""
+    keys: set = set()
+    if not path.exists():
+        return keys
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        try:
+            keys.add(entry_key(entry))
+        except KeyError:
+            continue
+    return keys
+
+
+def append_entries(path: Path, entries: list[dict]) -> int:
+    """Append entries to the ledger. Newline-delimited JSON: a process killed
+    mid-write leaves either a complete last line or a truncated one, never
+    a half-record pretending to be valid. Atomic per line."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    n = 0
+    with path.open("a") as fh:
+        for e in entries:
+            fh.write(json.dumps(e, sort_keys=True) + "\n")
+            n += 1
+    return n
+
+
+# ----- subcommands ---------------------------------------------------------
+
+def cmd_collect(args: argparse.Namespace) -> int:
+    repo = args.repo
+    prs = gh_json(
+        ["pr", "list", "--repo", repo, "--state", "all",
+         "--limit", str(args.limit),
+         "--json", "number,headRefOid,isDraft,createdAt"])
+    seen = load_keys(LEDGER)
+    added = skipped = 0
+    for pr in prs:
+        n = pr["number"]
+        created_at = pr.get("createdAt") or ""
+        events = gh_api_pages(f"repos/{repo}/issues/{n}/events", repo)
+        intervals = ready_intervals(
+            created_at, events, bool(pr.get("isDraft")))
+        if not intervals:
+            continue
+        for finding in pr_findings(n, intervals, repo):
+            entry = {
+                "repo": repo,
+                "pr": n,
+                "head_sha": finding["head_sha"],
+                "id": finding["id"],
+                "kind": finding["kind"],
+                "author": finding["author"],
+                "created_at": finding["created_at"],
+                "html_url": finding["html_url"],
+                "body": finding["body"],
+            }
+            if finding["kind"] == "review":
+                entry["state"] = finding.get("state", "")
+            if finding["kind"] == "review_comment":
+                entry["path"] = finding.get("path", "")
+            for f in ENTRY_BLANK:
+                entry[f] = ""
+            key = entry_key(entry)
+            if key in seen:
+                skipped += 1
+                continue
+            append_entries(LEDGER, [entry])
+            seen.add(key)
+            added += 1
+    print(f"findings-ledger: added {added}, skipped {skipped} already-recorded, "
+          f"wrote {LEDGER}")
+    return 0
+
+
+def cmd_summary(args: argparse.Namespace) -> int:
+    """Counts per defect_class and per loop_stage over a date range.
+    Unclassified entries are counted apart, so the totals mean the same
+    thing as people fill fields in."""
+    if not LEDGER.exists():
+        print(f"findings-ledger: no ledger at {LEDGER}", file=sys.stderr)
+        return 1
+    since = args.since or ""
+    until = args.until or ""
+    by_class: dict[str, int] = {}
+    by_stage: dict[str, int] = {}
+    blank = 0
+    in_range = 0
+    for line in LEDGER.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        created = entry.get("created_at", "")
+        if since and created < since:
+            continue
+        if until and created > until:
+            continue
+        in_range += 1
+        cls = entry.get("defect_class", "") or ""
+        stg = entry.get("loop_stage", "") or ""
+        if not cls or not stg:
+            blank += 1
+            continue
+        by_class[cls] = by_class.get(cls, 0) + 1
+        by_stage[stg] = by_stage.get(stg, 0) + 1
+    print(f"findings-ledger: {in_range} entries in range, "
+          f"{blank} not yet classified")
+    print("defect_class:")
+    for k, v in sorted(by_class.items(), key=lambda kv: (-kv[1], kv[0])):
+        print(f"  {v:4d}  {k}")
+    print("loop_stage:")
+    for k, v in sorted(by_stage.items(), key=lambda kv: (-kv[1], kv[0])):
+        print(f"  {v:4d}  {k}")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("collect",
+                       help="walk PRs and append post-Ready findings")
+    c.add_argument("--repo", required=True,
+                   help="owner/name; the GitHub repo to walk")
+    c.add_argument("--limit", type=int, default=300,
+                   help="max PRs to fetch (default 300, matching issue-grade)")
+
+    s = sub.add_parser("summary",
+                       help="count entries per defect_class and loop_stage")
+    s.add_argument("--since", help="ISO-8601 lower bound on created_at")
+    s.add_argument("--until", help="ISO-8601 upper bound on created_at")
+
+    args = ap.parse_args()
+    if args.cmd == "collect":
+        return cmd_collect(args)
+    if args.cmd == "summary":
+        return cmd_summary(args)
+    ap.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
