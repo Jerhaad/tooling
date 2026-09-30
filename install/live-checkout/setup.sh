@@ -19,7 +19,9 @@ WORK=${WORK_REPO:-$HOME/hermes-tools}
 BIN_DIR=${LIVE_BIN_DIR:-$HOME/bin}
 COPY_DIR=${LIVE_COPY_DIR:-$HOME/.local/bin}
 SCRIPTS_DIR=${HERMES_SCRIPTS_DIR:-$HOME/.hermes/scripts}
-SKILL_LINK=${CONDENSE_SKILL_LINK:-$HOME/.claude/skills/condense-prose}
+CLAUDE_SKILLS_DIR=${CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}
+# The skills a Claude session loads. The rest of skills/ belongs to the agent.
+CLAUDE_SKILLS=(condense-prose hermes-review)
 
 CHECK=0
 [ "${1:-}" = "--check" ] && CHECK=1
@@ -93,22 +95,28 @@ for tool in "$LIVE"/bin/*; do
 	run ln -sfn "$tool" "$BIN_DIR/$name"
 done
 
-# The third symlink the issue names. pr-ready resolves the prose finder through
-# it, so leaving it on the working checkout means a scheduled job runs a skill
-# from whatever branch someone left that checkout on.
-say "==> condense-prose skill: $SKILL_LINK -> $LIVE/skills/condense-prose"
-if [ -d "$LIVE/skills/condense-prose" ]; then
-	run mkdir -p "$(dirname "$SKILL_LINK")"
-	run ln -sfn "$LIVE/skills/condense-prose" "$SKILL_LINK"
-else
-	# Where it still resolves is the thing worth knowing: pr-ready reaches the
-	# prose finder through this link, and one into the working checkout is the
-	# hazard this arrangement removes.
-	say "  no skills/condense-prose in $LIVE"
-	if [ -e "$SKILL_LINK" ]; then
-		say "  WARNING: $SKILL_LINK still resolves to $(readlink -f "$SKILL_LINK")"
+# pr-ready resolves the prose finder through its link, so leaving one on the
+# working checkout means a scheduled job runs a skill from whatever branch
+# someone left that checkout on.
+for skill in "${CLAUDE_SKILLS[@]}"; do
+	link="$CLAUDE_SKILLS_DIR/$skill"
+	say "==> $skill skill: $link -> $LIVE/skills/$skill"
+	if [ -d "$LIVE/skills/$skill" ]; then
+		run mkdir -p "$CLAUDE_SKILLS_DIR"
+		# A real directory at the link path would swallow the symlink: ln -n
+		# only replaces a link, so it would nest one inside the directory.
+		if [ -d "$link" ] && [ ! -L "$link" ]; then
+			say "  WARNING: $link is a directory, not a link; move it aside and re-run"
+			continue
+		fi
+		run ln -sfn "$LIVE/skills/$skill" "$link"
+	else
+		say "  no skills/$skill in $LIVE"
+		if [ -e "$link" ]; then
+			say "  WARNING: $link still resolves to $(readlink -f "$link")"
+		fi
 	fi
-fi
+done
 
 say
 if [ "$CHECK" = 1 ]; then

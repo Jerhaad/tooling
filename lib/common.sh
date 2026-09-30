@@ -69,3 +69,46 @@ lock_for() {
 tree_name() { basename "$1" | tr -c 'A-Za-z0-9_' '_' | tr -s '_' | sed 's/_$//'; }
 
 repo_root() { (cd "${1:-$PWD}" && git rev-parse --show-toplevel); }
+
+# Returns holding a review slot for PROFILE on fd 9, waiting for one first.
+# The wait sits outside the review's timeout, because a review queued inside a
+# single-slot model server spends its timeout waiting and dies having written
+# nothing. The caller closes fd 9, and passes `9>&-` to anything it spawns, or
+# that process holds the slot for its whole life.
+acquire_review_slot() {
+	local profile="$1" slots_var slots lock i printed=0
+	slots_var="REVIEW_SLOTS_$(env_name "$profile")"
+	slots=${!slots_var:-1}
+	while true; do
+		for ((i = 1; i <= slots; i++)); do
+			lock="${TMPDIR:-/tmp}/hermes-review-${profile}-${i}.lock"
+			exec 9>"$lock"
+			if flock -n 9; then
+				return 0
+			fi
+			exec 9>&-
+		done
+		if [ "$printed" -eq 0 ]; then
+			echo "waiting for a review slot on profile $profile (have $slots)" >&2
+			printed=1
+		fi
+		sleep 2
+	done
+}
+
+# The explicit value, then REVIEW_TIMEOUT_<PROFILE>, then HERMES_REVIEW_TIMEOUT,
+# then 900. A caller passes the explicit value only when its own --timeout was
+# given: forwarding its default would silently outrank the per-profile value.
+review_timeout_for() {
+	local profile="$1" explicit="${2:-}" var
+	if [ -n "$explicit" ]; then
+		printf '%s\n' "$explicit"
+		return
+	fi
+	var="REVIEW_TIMEOUT_$(env_name "$profile")"
+	if [ -n "${!var:-}" ]; then
+		printf '%s\n' "${!var}"
+		return
+	fi
+	printf '%s\n' "${HERMES_REVIEW_TIMEOUT:-900}"
+}
