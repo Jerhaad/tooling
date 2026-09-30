@@ -32,9 +32,9 @@ usage: hermes-scrutinize.sh [--base REF] [--model MODEL] [--profile NAME]
   --profile    Hermes profile, which selects the model and the host it runs on.
                A hosted profile reviews with a model family unrelated to the
                local boxes, at the cost of sending the diff off the network.
-  --extra      Extra instructions appended to the prompt. Findings improve most
-               when this names the defect classes this repository actually
-               produces, rather than asking for a general review.
+  --extra      Text appended to the prompt: the change's intent and the product
+               decisions behind it. Anything that narrows what to judge hides
+               the defects outside it.
   --timeout    Seconds before the review is abandoned. Resolved per profile:
                the explicit value, then REVIEW_TIMEOUT_<PROFILE>, then
                HERMES_REVIEW_TIMEOUT, then 900.

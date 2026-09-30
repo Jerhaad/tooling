@@ -61,10 +61,12 @@ nothing, and every edit goes through a lane. Your attention goes on judging
 findings; the lanes do the typing.
 
 1. **Review the lane's commit** with `hermes-scrutinize.sh --base origin/main
-   --profile <reviewer>`, and verify the findings as above. Pass what is
-   already settled in `--extra`: a rendered config, a green bench, a finding
-   rejected in an earlier round and why. A reviewer given facts spends its
-   budget judging; one without them re-derives them, or times out trying.
+   --profile <reviewer>`, and verify the findings as above. `--extra` carries
+   the domain: what the change is for, who calls it and how, and the product
+   decisions a reader could not recover from the code, such as which of two
+   defensible behaviours is wanted. Never tell the reviewer what is already
+   verified or what to judge. It answers the question it is asked, so every
+   defect outside that question goes unreported however plain it would be.
 2. **Review the diff yourself too.** A reviewer model reads a diff's design
    consequences well and sweeps the repository for what the diff breaks badly:
    a struct that gained a field while only some of its initializers did, a
@@ -72,8 +74,9 @@ findings; the lanes do the typing.
 3. **Send the surviving fixes to a fresh implementer**, `hermes-implement
    --profile <implementer>` on the same worktree. State each fix's mechanism
    and name the wrong one it is likely to reach for; a lane left to choose
-   picks wrong about a third of the time. A rejected finding goes into the next
-   round's `--extra`; one that belongs to another issue becomes that issue.
+   picks wrong about a third of the time. When a finding is rejected because
+   of a product decision, that decision goes into the next round's `--extra`,
+   not the verdict; one that belongs to another issue becomes that issue.
 4. **Repeat from step 1** on the new commit. Stop when neither the reviewer
    nor you find anything worth changing.
 5. **Condense the prose, then run `pr-ready`.** Run the `condense-prose`
