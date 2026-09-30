@@ -70,13 +70,23 @@ findings; the lanes do the typing.
 2. **Review the diff yourself too.** A reviewer model reads a diff's design
    consequences well and sweeps the repository for what the diff breaks badly:
    a struct that gained a field while only some of its initializers did, a
-   consumer the change never updated. That sweep is yours.
+   consumer the change never updated. That sweep is yours. For a change to
+   identity, state or concurrency, check its brief's case table for a missing
+   combination before reading the code: a lane never writes a case it was not
+   given, so the code cannot show the gap.
 3. **Send the surviving fixes to a fresh implementer**, `hermes-implement
    --profile <implementer>` on the same worktree. State each fix's mechanism
    and name the wrong one it is likely to reach for; a lane left to choose
    picks wrong about a third of the time. When a finding is rejected because
    of a product decision, that decision goes into the next round's `--extra`,
    not the verdict; one that belongs to another issue becomes that issue.
+
+   A brief for a change to identity, state or concurrency carries a table, one
+   row per combination of input and existing state, each with its outcome. A
+   brief that names only the main path gets that path written and tested, and
+   nothing else. A contract the change advertises is tested at the layer that
+   advertises it. A route's error body tested one layer down passed while the
+   route dropped it.
 4. **Repeat from step 1** on the new commit. Stop when neither the reviewer
    nor you find anything worth changing.
 5. **Condense the prose, then run `pr-ready`.** Run the `condense-prose`
