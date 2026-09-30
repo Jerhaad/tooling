@@ -187,3 +187,8 @@ run = "python3 tests/test_find_prose.py"
 name = "finding-check tests"
 when = '^(bin/finding-check|tests/test_finding_check\.py)$'
 run = "python3 tests/test_finding_check.py"
+
+[[gates]]
+name = "push-guard tests"
+when = '^(bin/push-guard|hooks/pre-push|tests/test_push_guard\.py)$'
+run = "python3 tests/test_push_guard.py"

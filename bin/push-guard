@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Refuse a push that would delete files main added after the branch's
+# previous push: a squash that resets onto a moved origin/main records
+# main's new files as deletions, and nothing before push sees that.
+# A PR created ready never meets pr-ready, so this check has to run on
+# every push: install with
+#   git config core.hooksPath /path/to/agent-tools/hooks
+# PUSH_GUARD_BASE picks the branch to check against (default main);
+# PUSH_GUARD_ACK=1 turns the refusal into a warning.
+set -euo pipefail
+
+REMOTE=${1:-}
+BASE_BRANCH=${PUSH_GUARD_BASE:-main}
+
+note() { echo "push-guard: $*" >&2; }
+
+if [ -z "$REMOTE" ]; then
+	note "missing remote name (first arg); skipping"
+	exit 0
+fi
+
+BASE=refs/remotes/$REMOTE/$BASE_BRANCH
+
+if ! git rev-parse --verify --quiet "$BASE" >/dev/null; then
+	note "no local tracking ref for $BASE; skipping"
+	exit 0
+fi
+
+ZERO=0000000000000000000000000000000000000000
+FAIL=0
+ANY_REF=0
+
+# Each line on stdin: <local_ref> <local_sha> <remote_ref> <remote_sha>
+while read -r local_ref local_sha remote_ref remote_sha; do
+	# Tolerate blank or whitespace-only lines without tripping set -e.
+	[ -z "${local_ref:-}" ] && continue
+	ANY_REF=1
+
+	# Skip ref deletions: local sha is all zeros.
+	if [ "$local_sha" = "$ZERO" ]; then
+		continue
+	fi
+
+	# By destination: local_ref can be `HEAD` or a bare SHA
+	# (`git push origin HEAD:feat`), while remote_ref is always the branch.
+	case "$remote_ref" in
+	refs/heads/*) ;;
+	*) continue ;;
+	esac
+
+	# The base branch deleting its own earlier files is history, not a
+	# clobber from a stale branch.
+	if [ "$remote_ref" = "refs/heads/$BASE_BRANCH" ]; then
+		continue
+	fi
+
+	# Skip new branches: with no previous push, there is nothing to
+	# compare against.
+	if [ "$remote_sha" = "$ZERO" ]; then
+		continue
+	fi
+
+	# The remote's last-pushed sha may not be in the local object
+	# store yet (the working checkout never fetched it). When that
+	# happens we cannot compute gained; silently passing is worse
+	# than saying so.
+	if ! git rev-parse --verify --quiet "$remote_sha^{commit}" >/dev/null; then
+		note "$remote_ref: remote sha $remote_sha not found locally; fetching would let the check run"
+		continue
+	fi
+
+	local_sha=$(git rev-parse --verify "$local_sha^{commit}")
+	remote_sha=$(git rev-parse --verify "$remote_sha^{commit}")
+	base_sha=$(git rev-parse --verify "$BASE")
+
+	if ! merge_base=$(git merge-base "$base_sha" "$local_sha"); then
+		note "$remote_ref: no common ancestor with $BASE; skipping"
+		continue
+	fi
+	deleted=$(git diff --name-only --diff-filter=D "$merge_base" "$local_sha")
+	# gained: paths main added between the branch's previously pushed
+	# head and base. This is what a stale-base squash would clobber.
+	gained=$(git log --format= --name-only --diff-filter=A "$remote_sha".."$base_sha")
+
+	if [ -z "$deleted" ] || [ -z "$gained" ]; then
+		continue
+	fi
+
+	# sort | uniq -d over the two lists joined would report a path
+	# merely repeated inside one list; dedupe each side first.
+	deleted=$(printf '%s\n' "$deleted" | sort -u)
+	gained=$(printf '%s\n' "$gained" | sort -u)
+	# Intersection via comm, available everywhere git ships.
+	intersection=$(comm -12 <(printf '%s\n' "$deleted") \
+		<(printf '%s\n' "$gained"))
+	if [ -z "$intersection" ]; then
+		continue
+	fi
+
+	note "$remote_ref would delete paths main added after the branch's last push:"
+	while IFS= read -r path; do
+		printf '  %s\n' "$path" >&2
+	done <<< "$intersection"
+	note "main added these commits after the branch's previous push; the push would re-delete them."
+	if [ "${PUSH_GUARD_ACK:-0}" = "1" ]; then
+		note "PUSH_GUARD_ACK=1: acknowledging and pushing anyway."
+	else
+		note "acknowledge by re-running with PUSH_GUARD_ACK=1, or rebase the branch onto the current $BASE_BRANCH."
+		FAIL=1
+	fi
+done
+
+[ "$ANY_REF" -eq 1 ] || exit 0
+exit "$FAIL"
