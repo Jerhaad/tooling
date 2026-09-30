@@ -210,6 +210,54 @@ if [ "$CONDENSE" -eq 1 ]; then
 	fi
 fi
 
+# The diff pass above cannot see the PR body. Only a `provenance` finding
+# refuses here: other body findings are style a reviewer can raise, while a
+# link to the session that wrote the change is never kept, so --no-condense
+# does not waive it. A body that could not be fetched or scanned refuses, as
+# a CI run that could not be read does above.
+#
+# The finder picks what it reads by extension, so the body goes to a `.md`
+# file; an extensionless one is skipped and every body passes.
+if [ -x "$FIND_PROSE" ]; then
+	echo "==> condense-prose (PR body)" >&2
+	BODY_JSON_FILE=$(mktemp -t pr-ready-body-json-XXXXXX.json)
+	BODY_MD_FILE=$(mktemp -t pr-ready-body-XXXXXX.md)
+	if ! gh pr view "$PR" --json body >"$BODY_JSON_FILE" 2>"$BODY_JSON_FILE.err"; then
+		ERR=$(cat "$BODY_JSON_FILE.err")
+		rm -f "$BODY_JSON_FILE" "$BODY_JSON_FILE.err" "$BODY_MD_FILE"
+		refuse "PR body could not be fetched: ${ERR:-gh pr view exited non-zero}"
+		report
+	fi
+	rm -f "$BODY_JSON_FILE.err"
+	BODY=$(jq -r '.body // ""' <"$BODY_JSON_FILE")
+	rm -f "$BODY_JSON_FILE"
+	if [ -n "$BODY" ]; then
+		printf '%s\n' "$BODY" >"$BODY_MD_FILE"
+		if ! BODY_JSON=$("$FIND_PROSE" --json "$BODY_MD_FILE" 2>"$BODY_MD_FILE.err"); then
+			ERR=$(cat "$BODY_MD_FILE.err")
+			rm -f "$BODY_MD_FILE" "$BODY_MD_FILE.err"
+			refuse "PR body prose finder failed: ${ERR:-$FIND_PROSE exited non-zero}"
+			report
+		fi
+		rm -f "$BODY_MD_FILE" "$BODY_MD_FILE.err"
+		PROVENANCE=$(jq -r '
+			[.[] | select((.findings // []) | index("provenance"))]
+			| .[] | "line \(.line): \(.text)"' <<<"$BODY_JSON")
+		if [ -n "$PROVENANCE" ]; then
+			printf 'provenance line in PR body:\n' >&2
+			while IFS= read -r line; do
+				printf '  - %s\n' "$line" >&2
+			done <<<"$PROVENANCE"
+			refuse "PR body carries a provenance link (--no-condense does not bypass)"
+			report
+		fi
+	else
+		rm -f "$BODY_MD_FILE"
+	fi
+else
+	echo "note: condense-prose not installed at $FIND_PROSE, skipping body check" >&2
+fi
+
 if [ "$CHECK" -eq 1 ]; then
 	echo "PR $PR would be marked ready"
 	exit 0
