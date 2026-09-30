@@ -19,7 +19,8 @@ so a regression on one case cannot be hidden by another.
 No network. A stub `gh` answers every subcommand pr-ready invokes,
 reading from fixtures on disk so the canned JSON is the kind a real
 `gh` actually prints and not something this test only ever feeds
-itself.
+itself. A stub `find_prose.py` emits `$STUB_DATA/find_prose.json`, or `[]`
+when a scenario sets none.
 """
 import json
 import os
@@ -87,6 +88,16 @@ def write_stub_gh(bin_dir: Path, data_dir: Path) -> None:
         "          esac\n"
         "          prev=\"$arg\"\n"
         "        done\n"
+        "        # A scenario can ask the body fetch to fail by creating\n"
+        "        # $STUB_DATA/gh_body_fetch_fail: pr-ready is then expected\n"
+        "        # to refuse with a named failure rather than read an empty\n"
+        "        # body as a pass.\n"
+        "        for f in \"${json[@]}\"; do\n"
+        "          if [ \"$f\" = \"body\" ] && [ -e \"$STUB_DATA/gh_body_fetch_fail\" ]; then\n"
+        "            echo \"gh: could not fetch PR body (simulated)\" >&2\n"
+        "            exit 1\n"
+        "          fi\n"
+        "        done\n"
         "        if [ -n \"$jq_expr\" ]; then\n"
         "          cat \"$STUB_DATA/pr_view.json\" | jq -r \"$jq_expr\"\n"
         "        else\n"
@@ -147,11 +158,66 @@ def write_stub_gate_verify(bin_dir: Path) -> None:
     p.chmod(0o755)
 
 
+def write_stub_find_prose(bin_dir: Path) -> None:
+    """Emits $STUB_DATA/find_prose.json whatever its arguments, or [] when absent."""
+    body = (
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"$*\" >> \"$STUB_DATA/find_prose.log\"\n"
+        "# A scenario can ask the finder to exit non-zero by creating\n"
+        "# $STUB_DATA/find_prose_fail: pr-ready is then expected to refuse\n"
+        "# with a named failure rather than read an empty finding list as\n"
+        "# a pass.\n"
+        "if [ -e \"$STUB_DATA/find_prose_fail\" ]; then\n"
+        "  echo \"find_prose: simulated crash\" >&2\n"
+        "  exit 1\n"
+        "fi\n"
+        "if [ -e \"$STUB_DATA/find_prose.json\" ]; then\n"
+        "  cat \"$STUB_DATA/find_prose.json\"\n"
+        "else\n"
+        "  echo '[]'\n"
+        "fi\n"
+    )
+    p = bin_dir / "find_prose.py"
+    p.write_text(body)
+    p.chmod(0o755)
+
+
+def write_real_finder_wrapper(bin_dir: Path, real_finder: Path) -> Path:
+    """The real finder behind a wrapper that logs each path it is given and keeps
+    a copy of the file, so a test can check what pr-ready handed it.
+    """
+    body = (
+        "#!/usr/bin/env bash\n"
+        f"REAL_FINDER=\"{real_finder}\"\n"
+        "# Log every invocation: a single line of \"$@\" so the test can\n"
+        "# assert the path ends in `.md` -- the regression the wrapper\n"
+        "# exists to catch.\n"
+        "printf '%s\\n' \"$*\" >> \"$STUB_DATA/real_finder.log\"\n"
+        "# Copy the body file (the last arg) so the test can read back\n"
+        "# what the finder actually scanned. A regression that writes\n"
+        "# the fetched JSON to the `.md` file instead of the decoded\n"
+        "# body would still pass an extension check, but the content\n"
+        "# would not match what the test sent through the stub `gh`.\n"
+        "BODY_PATH=\"${@: -1}\"\n"
+        "if [ -e \"$BODY_PATH\" ]; then\n"
+        "  cp \"$BODY_PATH\" \"$STUB_DATA/real_finder_body\"\n"
+        "fi\n"
+        "exec \"$REAL_FINDER\" \"$@\"\n"
+    )
+    p = bin_dir / "real_finder_wrapper.sh"
+    p.write_text(body)
+    p.chmod(0o755)
+    return p
+
+
 def install_fixtures(data_dir: Path, scenario: str, oid: str,
-                     branch: str) -> None:
-    """Copy the canned JSON for a scenario into data_dir, substituting
-    the test repo's actual HEAD OID and branch into pr_view so the
-    local/pushed OID comparison passes."""
+                     branch: str, body: str | None = None) -> None:
+    """Copy a scenario's canned JSON into data_dir with the test repo's HEAD
+    and branch substituted, so the pushed-head comparison passes.
+
+    ``body`` is what ``gh pr view --json body`` returns; None leaves the
+    field out.
+    """
     pr_view = {
         "state": "OPEN",
         "isDraft": True,
@@ -159,6 +225,8 @@ def install_fixtures(data_dir: Path, scenario: str, oid: str,
         "headRefOid": oid,
         "mergeable": "MERGEABLE",
     }
+    if body is not None:
+        pr_view["body"] = body
     (data_dir / "pr_view.json").write_text(json.dumps(pr_view))
 
     if scenario == "all_pass":
@@ -186,15 +254,19 @@ def install_fixtures(data_dir: Path, scenario: str, oid: str,
 
 
 def run_pr_ready(worktree: Path, stub_path: Path, data_dir: Path,
-                 *extra: str) -> subprocess.CompletedProcess:
-    """Invoke pr-ready with a PATH where the stub `gh` and `gate-verify`
-    come first, and STUB_DATA pointing at the scenario's canned JSON.
-    --no-condense keeps the prose finder out of the picture; the
-    installation environment does not have it, but the flag makes that
-    explicit and removes any future surprise."""
+                 *extra: str,
+                 finder: str | None = None) -> subprocess.CompletedProcess:
+    """Run pr-ready with the stubs first on PATH and STUB_DATA at the
+    scenario. ``finder`` overrides CONDENSE_PROSE, a missing path standing
+    for a finder that is not installed.
+    """
     env = os.environ.copy()
     env["PATH"] = f"{stub_path}:{env['PATH']}"
     env["STUB_DATA"] = str(data_dir)
+    if finder is None:
+        env["CONDENSE_PROSE"] = str(stub_path / "find_prose.py")
+    else:
+        env["CONDENSE_PROSE"] = finder
     env.pop("PR_READY_BASE", None)
     env["HOME"] = str(worktree.parent)
     return subprocess.run(
@@ -218,6 +290,7 @@ def main() -> int:
         bin_dir.mkdir()
         write_stub_gh(bin_dir, bin_dir)
         write_stub_gate_verify(bin_dir)
+        write_stub_find_prose(bin_dir)
 
         try:
             # Scenario 1: every CI check has passed. Promote, no
@@ -448,6 +521,417 @@ def main() -> int:
                     "already-ready re-run posted another annotation: "
                     f"{(data / 'comment_body.txt').read_text()!r}"
                 )
+
+            # Scenario 7: a `provenance` finding in the body refuses, naming the
+            # body line, on a branch whose CI would otherwise promote.
+            data = tmp / "data_body_provenance"
+            data.mkdir()
+            install_fixtures(
+                data, "never_started", oid, branch,
+                body=(
+                    "# What changed\n"
+                    "\n"
+                    "Refuses on a provenance link in the body.\n"
+                    "\n"
+                    "Session: https://hermes.example/sessions/abc\n"
+                ),
+            )
+            (data / "find_prose.json").write_text(json.dumps([
+                {
+                    "path": "PR_BODY",
+                    "line": 5,
+                    "kind": "list-item",
+                    "words": 6,
+                    "findings": ["provenance"],
+                    "text": "Session: https://hermes.example/sessions/abc",
+                },
+            ]))
+            r = run_pr_ready(worktree, bin_dir, data)
+            if r.returncode == 0:
+                failures.append(
+                    "body_provenance should refuse (exit 1): "
+                    f"stderr={r.stderr.strip()!r}"
+                )
+            else:
+                msg = r.stderr
+                if "provenance" not in msg:
+                    failures.append(
+                        f"body_provenance reason did not name 'provenance': "
+                        f"{msg!r}"
+                    )
+                if "line 5" not in msg:
+                    failures.append(
+                        f"body_provenance reason did not name the offending "
+                        f"line number (5): {msg!r}"
+                    )
+                # The mktemp file handed to the finder is gone by now.
+                if "Session: https://hermes.example/sessions/abc" not in msg:
+                    failures.append(
+                        f"body_provenance reason did not name the body "
+                        f"line text: {msg!r}"
+                    )
+                if "pr-ready-body-" in msg:
+                    failures.append(
+                        f"body_provenance reason named the mktemp path "
+                        f"(deleted before the refusal prints): {msg!r}"
+                    )
+                if (data / "ready_called").exists():
+                    failures.append(
+                        "body_provenance promoted after refusing"
+                    )
+
+            # Scenario 8: the body carries no `provenance` finding. The
+            # same stub setup emits a non-provenance finding (oversize)
+            # to prove the filter distinguishes kinds: a non-provenance
+            # finding in the body is advisory and must not refuse.
+            data = tmp / "data_body_no_provenance"
+            data.mkdir()
+            install_fixtures(
+                data, "never_started", oid, branch,
+                body="# A heading\n\nA short body that does not link anywhere.\n",
+            )
+            (data / "find_prose.json").write_text(json.dumps([
+                {
+                    "path": "PR_BODY",
+                    "line": 1,
+                    "kind": "heading",
+                    "words": 3,
+                    "findings": ["oversize"],
+                    "text": "A heading",
+                },
+            ]))
+            r = run_pr_ready(worktree, bin_dir, data)
+            if r.returncode != 0:
+                failures.append(
+                    f"body_no_provenance should promote (exit 0): "
+                    f"rc={r.returncode} stderr={r.stderr.strip()!r}"
+                )
+            else:
+                if not (data / "ready_called").exists():
+                    failures.append(
+                        "body_no_provenance did not call `gh pr ready`"
+                    )
+
+            # Scenario 9: --no-condense does not waive a provenance finding.
+            data = tmp / "data_body_provenance_no_condense"
+            data.mkdir()
+            install_fixtures(
+                data, "never_started", oid, branch,
+                body=(
+                    "# What changed\n"
+                    "\n"
+                    "Refuses on a provenance link in the body.\n"
+                    "\n"
+                    "Session: https://hermes.example/sessions/abc\n"
+                ),
+            )
+            (data / "find_prose.json").write_text(json.dumps([
+                {
+                    "path": "PR_BODY",
+                    "line": 5,
+                    "kind": "list-item",
+                    "words": 6,
+                    "findings": ["provenance"],
+                    "text": "Session: https://hermes.example/sessions/abc",
+                },
+            ]))
+            r = run_pr_ready(worktree, bin_dir, data)
+            if r.returncode == 0:
+                failures.append(
+                    "body_provenance with --no-condense should still "
+                    f"refuse: stderr={r.stderr.strip()!r}"
+                )
+            else:
+                msg = r.stderr
+                if "provenance" not in msg:
+                    failures.append(
+                        f"--no-condense reason did not name 'provenance': "
+                        f"{msg!r}"
+                    )
+                if (data / "ready_called").exists():
+                    failures.append(
+                        "--no-condense bypassed the body check"
+                    )
+
+            # Scenario 10: a body that could not be fetched refuses, naming the
+            # failure.
+            data = tmp / "data_body_fetch_fail"
+            data.mkdir()
+            install_fixtures(
+                data, "never_started", oid, branch,
+                body="A body that should never be scanned, because "
+                     "the fetch should fail.\n",
+            )
+            (data / "gh_body_fetch_fail").write_text("")
+            r = run_pr_ready(worktree, bin_dir, data)
+            if r.returncode == 0:
+                failures.append(
+                    "body_fetch_fail should refuse (exit 1): "
+                    f"stderr={r.stderr.strip()!r}"
+                )
+            else:
+                msg = r.stderr
+                if "could not be fetched" not in msg:
+                    failures.append(
+                        f"body_fetch_fail reason did not name the "
+                        f"fetch failure: {msg!r}"
+                    )
+                if "gh: could not fetch PR body (simulated)" not in msg:
+                    failures.append(
+                        f"body_fetch_fail reason did not surface the "
+                        f"underlying gh error: {msg!r}"
+                    )
+                if (data / "ready_called").exists():
+                    failures.append(
+                        "body_fetch_fail promoted after refusing"
+                    )
+                # The fetch failure should refuse before the finder
+                # is even invoked; if the body check did fall through,
+                # ready_called would not exist, but neither would any
+                # provenance refuse line.
+                if "provenance" in msg:
+                    failures.append(
+                        f"body_fetch_fail refused for the wrong "
+                        f"reason (provenance): {msg!r}"
+                    )
+
+            # Scenario 11: a finder that exits non-zero refuses, naming the failure.
+            data = tmp / "data_finder_fail"
+            data.mkdir()
+            install_fixtures(
+                data, "never_started", oid, branch,
+                body=(
+                    "# What changed\n"
+                    "\n"
+                    "Refuses on a finder crash, not on a finding.\n"
+                ),
+            )
+            (data / "find_prose_fail").write_text("")
+            r = run_pr_ready(worktree, bin_dir, data)
+            if r.returncode == 0:
+                failures.append(
+                    "finder_fail should refuse (exit 1): "
+                    f"stderr={r.stderr.strip()!r}"
+                )
+            else:
+                msg = r.stderr
+                if "finder failed" not in msg:
+                    failures.append(
+                        f"finder_fail reason did not name the finder "
+                        f"failure: {msg!r}"
+                    )
+                if "find_prose: simulated crash" not in msg:
+                    failures.append(
+                        f"finder_fail reason did not surface the "
+                        f"underlying finder error: {msg!r}"
+                    )
+                if (data / "ready_called").exists():
+                    failures.append(
+                        "finder_fail promoted after refusing"
+                    )
+                if "provenance" in msg:
+                    failures.append(
+                        f"finder_fail refused for the wrong reason "
+                        f"(provenance): {msg!r}"
+                    )
+
+            # Scenario 12: with no finder installed the PR promotes, and stderr says
+            # the body was not scanned.
+            data = tmp / "data_finder_absent"
+            data.mkdir()
+            install_fixtures(
+                data, "never_started", oid, branch,
+                body="# A heading\n\nA body with no provenance.\n",
+            )
+            r = run_pr_ready(
+                worktree, bin_dir, data,
+                finder=str(tmp / "no-such-finder.py"),
+            )
+            if r.returncode != 0:
+                failures.append(
+                    f"finder_absent should promote (exit 0): "
+                    f"rc={r.returncode} stderr={r.stderr.strip()!r}"
+                )
+            else:
+                if not (data / "ready_called").exists():
+                    failures.append(
+                        "finder_absent did not call `gh pr ready`"
+                    )
+                # Any wording passes as long as it says the body was skipped.
+                notes = [
+                    ln for ln in r.stderr.splitlines()
+                    if ln.startswith("note:") and "body" in ln
+                ]
+                if not notes:
+                    failures.append(
+                        f"finder_absent did not print a body-check "
+                        f"note: stderr={r.stderr!r}"
+                    )
+
+            # Scenarios 13-14 run the real finder, which, unlike the stub,
+            # reads a file only by its extension. An oversize paragraph
+            # proves the finder read the body pr-ready handed it.
+            real_finder = REPO_ROOT / "skills" / "condense-prose" / "find_prose.py"
+            wrapper = write_real_finder_wrapper(bin_dir, real_finder)
+
+            # Scenario 13: the body file pr-ready passes ends in `.md`, and
+            # the real finder reports the paragraph; oversize is advisory.
+            data = tmp / "data_real_finder_oversize"
+            data.mkdir()
+            oversize_body = (
+                "# What changed\n"
+                "\n"
+                "This body paragraph runs well past the forty words the finder "
+                "allows a single block, so the real finder has a finding to "
+                "report about it, and that finding can only appear if the "
+                "finder opened the file pr-ready wrote and read it as prose "
+                "rather than skipping it for its name.\n"
+            )
+            install_fixtures(
+                data, "never_started", oid, branch, body=oversize_body,
+            )
+            r = run_pr_ready(worktree, bin_dir, data, finder=str(wrapper))
+            if r.returncode != 0:
+                failures.append(
+                    f"real_finder_oversize should promote (exit 0): "
+                    f"rc={r.returncode} stderr={r.stderr.strip()!r}"
+                )
+            else:
+                if not (data / "ready_called").exists():
+                    failures.append(
+                        "real_finder_oversize did not call `gh pr ready`"
+                    )
+                log_path = data / "real_finder.log"
+                if not log_path.exists():
+                    failures.append(
+                        "real_finder_oversize: wrapper was never invoked -- "
+                        "the body file the finder reads is what this test "
+                        "is meant to confirm, and a missing log means it "
+                        "was never passed anything"
+                    )
+                else:
+                    log_text = log_path.read_text()
+                    # The last token of the wrapper's log line is the path pr-ready passed.
+                    body_paths = [
+                        ln.split()[-1] for ln in log_text.splitlines() if ln
+                    ]
+                    md_paths = [p for p in body_paths if p.endswith(".md")]
+                    if not md_paths:
+                        failures.append(
+                            "real_finder_oversize: no body path passed to "
+                            "the finder ended in `.md`, so the finder "
+                            "skipped it. Wrapper log:\n"
+                            f"{log_text!r}"
+                        )
+                    else:
+                        # Verify the wrapper captured the right content.
+                        # A regression that wrote the fetched JSON to the
+                        # body file (or any other string) would still pass
+                        # the extension check, but the content here would
+                        # not match what the stub `gh` returned.
+                        captured_body_path = data / "real_finder_body"
+                        if not captured_body_path.exists():
+                            failures.append(
+                                "real_finder_oversize: wrapper did not "
+                                "copy the body file the finder scanned"
+                            )
+                        else:
+                            captured = captured_body_path.read_text()
+                            if captured.strip() != oversize_body.strip():
+                                failures.append(
+                                    "real_finder_oversize: body the "
+                                    "finder scanned does not match the "
+                                    "body the stub `gh` returned. "
+                                    f"Expected {oversize_body!r}, "
+                                    f"got {captured!r}"
+                                )
+                        # The real finder, run on the same body as a `.md` file, reports it.
+                        sample_body = data / "sample_body.md"
+                        sample_body.write_text(oversize_body)
+                        finder_proc = subprocess.run(
+                            [str(real_finder), "--json", str(sample_body)],
+                            capture_output=True, text=True,
+                        )
+                        try:
+                            findings = json.loads(finder_proc.stdout)
+                        except json.JSONDecodeError:
+                            findings = []
+                        kinds = [
+                            f.get("findings", [])
+                            for f in findings
+                            if isinstance(f, dict)
+                        ]
+                        if "oversize" not in [k for sub in kinds for k in sub]:
+                            failures.append(
+                                "real_finder_oversize: the real finder "
+                                "did not emit an `oversize` finding for "
+                                "the oversize body -- the file format "
+                                "the test pins is not the one the real "
+                                "finder reads. Findings: "
+                                f"{findings!r}"
+                            )
+                        sample_body.unlink()
+
+            # Scenario 14: a short body the real finder has nothing to
+            # say about. pr-ready promotes, the wrapper still received a
+            # `.md` path (which is the regression assertion), and the
+            # real finder run directly against the same body emits no
+            # findings.
+            data = tmp / "data_real_finder_ordinary"
+            data.mkdir()
+            ordinary_body = "# A heading\n\nA short body that links nowhere.\n"
+            install_fixtures(
+                data, "never_started", oid, branch, body=ordinary_body,
+            )
+            r = run_pr_ready(worktree, bin_dir, data, finder=str(wrapper))
+            if r.returncode != 0:
+                failures.append(
+                    f"real_finder_ordinary should promote (exit 0): "
+                    f"rc={r.returncode} stderr={r.stderr.strip()!r}"
+                )
+            else:
+                if not (data / "ready_called").exists():
+                    failures.append(
+                        "real_finder_ordinary did not call `gh pr ready`"
+                    )
+                log_path = data / "real_finder.log"
+                if not log_path.exists():
+                    failures.append(
+                        "real_finder_ordinary: wrapper was never invoked"
+                    )
+                else:
+                    log_text = log_path.read_text()
+                    body_paths = [
+                        ln.split()[-1] for ln in log_text.splitlines() if ln
+                    ]
+                    md_paths = [p for p in body_paths if p.endswith(".md")]
+                    if not md_paths:
+                        failures.append(
+                            "real_finder_ordinary: no body path passed to "
+                            "the finder ended in `.md`. Wrapper log:\n"
+                            f"{log_text!r}"
+                        )
+                    else:
+                        # A body the real finder has nothing to say about.
+                        sample_body = data / "sample_body.md"
+                        sample_body.write_text(ordinary_body)
+                        finder_proc = subprocess.run(
+                            [str(real_finder), "--json", str(sample_body)],
+                            capture_output=True, text=True,
+                        )
+                        try:
+                            findings = json.loads(finder_proc.stdout)
+                        except json.JSONDecodeError:
+                            findings = []
+                        if findings:
+                            failures.append(
+                                "real_finder_ordinary: the real finder "
+                                "emitted findings against the ordinary "
+                                "body, so this scenario no longer pins "
+                                "the case it claims to. Findings: "
+                                f"{findings!r}"
+                            )
+                        sample_body.unlink()
 
         except AssertionError as e:
             failures.append(f"unexpected assertion error: {e}")
