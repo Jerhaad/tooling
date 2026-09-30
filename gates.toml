@@ -160,3 +160,8 @@ run = "python3 tests/test_squash.py"
 name = "find_prose tests"
 when = '^(skills/condense-prose/find_prose\.py|tests/test_find_prose\.py)$'
 run = "python3 tests/test_find_prose.py"
+
+[[gates]]
+name = "finding-check tests"
+when = '^(bin/finding-check|tests/test_finding_check\.py)$'
+run = "python3 tests/test_finding_check.py"
