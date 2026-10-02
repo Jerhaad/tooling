@@ -6,6 +6,12 @@
 # the tree rather than by unwinding commits.
 set -euo pipefail
 
+# readlink -f, not `cd -P`: these are installed as symlinks into a bin
+# directory on PATH, and BASH_SOURCE holds the symlink's own path.
+LIB=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)
+# shellcheck source=../lib/common.sh
+. "$LIB/common.sh"
+
 HERMES=${HERMES_PYTHON:-${HERMES_HOME:-$HOME/.hermes}/hermes-agent/venv/bin/python}
 TIMEOUT=${HERMES_IMPLEMENT_TIMEOUT:-5400}
 
@@ -204,6 +210,7 @@ run() {
 	# --no-restore-cwd: a resumed session otherwise returns to the directory it
 	# recorded, which for this agent is its bound project folder rather than the
 	# worktree it was handed. It has committed in the wrong repository that way.
+	# hermes inherits fd 8, the GPU group lock, which spans every retry.
 	timeout "$TIMEOUT" "$HERMES" -m hermes_cli.main ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} "$@" --no-restore-cwd -z "$prompt" --skills swe-updater,swe-tester --yolo \
 		>"$WORK/$label.stdout" 2>"$WORK/$label.stderr"
 	local rc=$?
@@ -211,6 +218,9 @@ run() {
 	echo "$label: hermes exited $rc" >&2
 	tail -3 "$WORK/$label.stdout" >&2
 }
+
+# Held across every attempt: retries are one run's worth of GPU work.
+acquire_gpu_lock "$PROFILE"
 
 run attempt1 "$PROMPT"
 
@@ -236,6 +246,8 @@ for ((i = 2; i <= ATTEMPTS; i++)); do
 	[[ "$(git rev-parse HEAD)" != "$BASE" ]] && break
 	run "attempt$i" "$REMAINING" --continue
 done
+
+exec 8>&- 2>/dev/null || true
 
 if [[ "$(git rev-parse HEAD)" == "$BASE" ]]; then
 	echo "FAILED: $ATTEMPTS attempts left $BRANCH at $BASE" >&2

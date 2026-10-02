@@ -10,6 +10,11 @@
 # sibling script it wanted becomes "./name" against the repository it just
 # entered.
 PIPELINE_DIR=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# lib/common.sh provides the per-GPU-group lock the issue opened with. Sourced
+# here so every pipeline script can call acquire_gpu_lock without re-deriving
+# the helper location.
+# shellcheck source=../lib/common.sh
+. "$PIPELINE_DIR/../lib/common.sh"
 
 CONF="${AGENT_PIPELINE_ENV:-$HOME/.config/agent-pipeline/env}"
 if [ -r "$CONF" ]; then
