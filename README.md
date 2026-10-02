@@ -60,6 +60,7 @@ the first failure.
 |---|---|
 | `remote-task`     | sync the tree to a host, run a project command under a lock, fetch artefacts back |
 | `remote-run`      | send part of the tree to a host that has a tool this one lacks, run the project's recipe there |
+| `lane-watch`      | follow a running hermes lane's conversation as it happens |
 | `gate-prove`      | revert the source, keep the tests, require a failure — the tests depend on the change, not that the change is right |
 | `gate-untested`   | fail a branch that adds surface with no test anywhere |
 | `redaction-check` | fail a branch carrying an agent's `***` rewrite into the source |
