@@ -30,14 +30,22 @@ work=$(mktemp -d -t hermes-notes-XXXXXX)
 git show "$branch:REVIEW_NOTES.md" >"$work/REVIEW_NOTES.md" 2>/dev/null || exit 0
 mkdir -p "$QUEUE"
 
-flock "$LOCK" timeout "${PIPELINE_TRIAGE_TIMEOUT:-3600}" $HERMES -p "$PROFILE" \
-	-z "Triage a set of review findings against the repository at $REPO, following the swe-triage skill.
+# The GPU lock nests inside the pipeline flock, with its wait outside the
+# timeout.
+(
+	exec 9>"$LOCK"
+	flock 9
+	acquire_gpu_lock "$PROFILE"
+	timeout "${PIPELINE_TRIAGE_TIMEOUT:-3600}" $HERMES -p "$PROFILE" \
+		-z "Triage a set of review findings against the repository at $REPO, following the swe-triage skill.
 
 The findings are at $work/REVIEW_NOTES.md. They describe the tree as it was when they were written, which is not the tree you are looking at. For each finding, do the skill's Phase 1 against the current code and report the verdict with a path:line citation; for the ones still real, do Phases 2 through 5.
 Carry each finding's severity through verbatim from the notes as a '**Severity:** <value>' line directly under the verdict. The next phase files an issue for the Security and Correctness ones and it reads that line, so a finding without it is a finding nobody acts on.
 
 Write one file, $out, with a section per finding in the skill's output shape. Do not modify anything in $REPO and do not touch the issue tracker." \
-	--skills swe-triage --yolo >"$work/stdout" 2>"$work/stderr" || true
+		--skills swe-triage --yolo >"$work/stdout" 2>"$work/stderr" || true
+	exec 8>&- 2>/dev/null || true
+)
 
 [[ -s "$out" ]] || { echo "review notes $date: triage produced nothing ($work)"; exit 0; }
 

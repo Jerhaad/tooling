@@ -165,9 +165,14 @@ def test_waiting_message_prints_once():
         agent = tmp / "agent"
         agent.write_text(FAKE_AGENT)
         agent.chmod(0o755)
-        slot = tmp / "hermes-review-rev-1.lock"
+        # acquire_review_slot moved its lock files to AGENT_STATE_DIR so two
+        # callers with different TMPDIRs contend on the same slot. Pin that
+        # here too -- this test fails if the lock file's location changes.
+        state_dir = tmp / "state"
+        env = dict(os.environ, HERMES_PYTHON=str(agent), AGENT_STATE_DIR=str(state_dir))
+        slot = state_dir / "hermes-review-rev-1.lock"
+        slot.parent.mkdir(parents=True, exist_ok=True)
         slot.touch()
-        env = dict(os.environ, HERMES_PYTHON=str(agent), TMPDIR=str(tmp))
         # flock the lock from a separate process so hermes-scrutinize.sh's
         # own flock -n 9 fails for as long as we need it to.
         holder = subprocess.Popen(["flock", str(slot), "sleep", "6"],
@@ -184,6 +189,64 @@ def test_waiting_message_prints_once():
                    if "waiting for a review slot" in line]
         assert len(waiting) == 1, \
             f"expected exactly one 'waiting' line, got {len(waiting)}: {p.stderr!r}"
+
+
+def test_lock_path_no_longer_depends_on_tmpdir():
+    # The lock moved from ${TMPDIR:-/tmp} to AGENT_STATE_DIR precisely so two
+    # callers with different TMPDIRs contend on the same slot. A lane sets
+    # its own TMPDIR, and the previous code put the lock file there, so two
+    # callers could each have held the lock for "slot 1" and run together.
+    # This test pins the new behaviour: a holder that locks the state-dir
+    # lock file from one TMPDIR blocks a reviewer whose TMPDIR is different.
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo = make_repo(tmp)
+        agent = tmp / "agent"
+        agent.write_text(FAKE_AGENT)
+        agent.chmod(0o755)
+        state_dir = tmp / "state"
+        state_dir.mkdir()
+        # Caller A: its own TMPDIR (could be a lane), the new shared state
+        # directory, and a holder process keeping slot 1 taken.
+        env_a = dict(os.environ, HERMES_PYTHON=str(agent),
+                     AGENT_STATE_DIR=str(state_dir),
+                     TMPDIR=str(tmp / "tmpdir-a"))
+        (tmp / "tmpdir-a").mkdir()
+        slot = state_dir / "hermes-review-rev-1.lock"
+        slot.touch()
+        holder = subprocess.Popen(["flock", str(slot), "sleep", "6"],
+                                  stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL)
+        try:
+            # Caller B uses a *different* TMPDIR; without the AGENT_STATE_DIR
+            # move it would have its own lock file and not contend.
+            env_b = dict(os.environ, HERMES_PYTHON=str(agent),
+                         AGENT_STATE_DIR=str(state_dir),
+                         TMPDIR=str(tmp / "tmpdir-b"))
+            (tmp / "tmpdir-b").mkdir()
+            # Long timeout so the holder would still be alive when B's
+            # reviewer tries to run; if B finds the slot it has been a
+            # silent regression.
+            p = subprocess.run([str(SCRIPT), "--profile", "rev",
+                                "--timeout", "30"],
+                               cwd=repo, env=env_b, capture_output=True,
+                               text=True, timeout=25)
+        finally:
+            holder.wait()
+        # The reviewer should have waited for the lock and failed when its
+        # own timeout fired; the exact exit code from `timeout` is 124.
+        # What matters for the regression is that B did NOT complete its
+        # review before the holder released -- which the holder.log and
+        # agent.log timestamps would show. We assert on a wait line
+        # appearing in stderr instead: that line only exists when
+        # acquire_review_slot's retry loop ran, which only runs when the
+        # second caller found the slot taken.
+        waiting = [line for line in p.stderr.splitlines()
+                   if "waiting for a review slot" in line]
+        assert waiting, (
+            f"reviewer with TMPDIR=tmpdir-b did not contend for the slot "
+            f"under tmpdir-a's TMPDIR: nothing was waiting on stderr. "
+            f"stdout={p.stdout!r} stderr={p.stderr!r}")
 
 
 def run_one(*, slots: str | None = None, timeout: str | None = None,
@@ -221,6 +284,58 @@ def test_timeout_precedence_explicit_overrides_per_profile():
     # the script returns 0. Without the precedence this would also exit 124.
     rc = run_one(timeout_env={"REVIEW_TIMEOUT_REV": "1"}, timeout="10")
     assert rc == 0, f"expected 0 from --timeout 10 overriding REVIEW_TIMEOUT_REV=1, got {rc}"
+
+
+def test_two_scrutinize_calls_on_same_gpu_group_serialize():
+    # End-to-end of the GPU lock from the script's perspective: two
+    # reviewers with *different* profiles but the same GPU group serialise.
+    # Different profiles means the review-slot lock does not serialise them
+    # (test_different_profiles_run_together already pins that), so the
+    # only thing holding them apart is the GPU group lock. The second's
+    # start must wait for the first's end.
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo = make_repo(tmp)
+        agent = tmp / "agent"
+        agent.write_text(FAKE_AGENT)
+        agent.chmod(0o755)
+        state_dir = tmp / "state"
+        # Two profiles -- rev-a and rev-b -- both mapped to the same GPU
+        # group. The review-slot lock has them in separate pools, so they
+        # would otherwise run together.
+        env = dict(os.environ,
+                   HERMES_PYTHON=str(agent),
+                   AGENT_STATE_DIR=str(state_dir),
+                   GPU_GROUP_REV_A="logan-3099",
+                   GPU_GROUP_REV_B="logan-3099",
+                   TMPDIR=str(tmp))
+        profiles = ("rev-a", "rev-b")
+        procs = [subprocess.Popen([str(SCRIPT), "--profile", p],
+                                  cwd=repo, env=env,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True)
+                 for p in profiles]
+        for p in procs:
+            out, err = p.communicate(timeout=60)
+            assert p.returncode == 0, f"exit {p.returncode}: {err}"
+            assert Path(out.strip()).name == "FINDINGS.md", out
+        events = []
+        for line in (tmp / "agent.log").read_text().splitlines():
+            kind, profile, ts = line.split()
+            events.append((kind, profile, float(ts)))
+        # Two reviewers on one GPU group must not overlap: the second
+        # `start` lands after the first `end`. The lock wait happens
+        # *outside* the agent's sleep, so the second's `start` is at least
+        # 2 seconds after the first's `end` -- the polling interval
+        # acquire_gpu_lock waits before retrying.
+        sorted_e = sorted(events, key=lambda e: e[2])
+        first_end = next((ts for k, _, ts in sorted_e if k == "end"), None)
+        starts_before = sum(1 for k, _, ts in sorted_e
+                            if k == "start" and ts < first_end)
+        assert starts_before == 1, (
+            f"two reviewers on one GPU group overlapped (only the GPU "
+            f"lock could have serialised them; the review-slot lock "
+            f"treats them as different profiles): {events}")
 
 
 # ---------------------------------------------------------------------------

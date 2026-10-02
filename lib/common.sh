@@ -75,13 +75,16 @@ repo_root() { (cd "${1:-$PWD}" && git rev-parse --show-toplevel); }
 # single-slot model server spends its timeout waiting and dies having written
 # nothing. The caller closes fd 9, and passes `9>&-` to anything it spawns, or
 # that process holds the slot for its whole life.
+# The state directory, because a lane sets its own TMPDIR.
 acquire_review_slot() {
-	local profile="$1" slots_var slots lock i printed=0
+	local profile="$1" slots_var slots lock i dir printed=0
 	slots_var="REVIEW_SLOTS_$(env_name "$profile")"
 	slots=${!slots_var:-1}
+	dir="${AGENT_STATE_DIR:-$HOME/.local/state/agent-tools}"
+	mkdir -p "$dir"
 	while true; do
 		for ((i = 1; i <= slots; i++)); do
-			lock="${TMPDIR:-/tmp}/hermes-review-${profile}-${i}.lock"
+			lock="$dir/hermes-review-${profile}-${i}.lock"
 			exec 9>"$lock"
 			if flock -n 9; then
 				return 0
@@ -90,6 +93,32 @@ acquire_review_slot() {
 		done
 		if [ "$printed" -eq 0 ]; then
 			echo "waiting for a review slot on profile $profile (have $slots)" >&2
+			printed=1
+		fi
+		sleep 2
+	done
+}
+
+# Returns holding the lock for PROFILE's GPU group (GPU_GROUP_<PROFILE>, or
+# GPU_GROUP_DEFAULT for the root profile) on fd 8, or holding nothing when no
+# group is set. Two models sharing GPUs swap on every alternating call, so
+# their callers queue here instead, outside their timeouts. Closing fd 8
+# releases it.
+acquire_gpu_lock() {
+	local profile="$1" var group dir printed=0
+	var="GPU_GROUP_$(env_name "${profile:-DEFAULT}")"
+	group="${!var:-}"
+	[ -z "$group" ] && return 0
+	dir="${AGENT_STATE_DIR:-$HOME/.local/state/agent-tools}"
+	mkdir -p "$dir"
+	while true; do
+		exec 8>"$dir/gpu-$group.lock"
+		if flock -n 8; then
+			return 0
+		fi
+		exec 8>&-
+		if [ "$printed" -eq 0 ]; then
+			echo "waiting for GPU group $group (profile $profile)" >&2
 			printed=1
 		fi
 		sleep 2

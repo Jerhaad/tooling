@@ -120,6 +120,7 @@ EOF
 
 PROFILE_NAME="${PROFILE:-default}"
 acquire_review_slot "$PROFILE_NAME"
+acquire_gpu_lock "$PROFILE_NAME"
 TIMEOUT=$(review_timeout_for "$PROFILE_NAME" "$TIMEOUT_OPT")
 
 set +e
@@ -127,10 +128,13 @@ HERMES_ARGS=(-z "$PROMPT" --skills swe-reviewer --yolo)
 [[ -n "$PROFILE" ]] && HERMES_ARGS=(-p "$PROFILE" "${HERMES_ARGS[@]}")
 [[ -n "$MODEL" ]] && HERMES_ARGS+=(-m "$MODEL")
 # 9>&-: a process hermes leaves behind would otherwise hold the lock forever.
-timeout "$TIMEOUT" "$HERMES" -m hermes_cli.main "${HERMES_ARGS[@]}" >"$WORK/stdout.txt" 2>"$WORK/stderr.txt" 9>&-
+# 8>&-: same for the GPU group lock; the parent holds fd 8 only for this
+# single review, and the child should not.
+timeout "$TIMEOUT" "$HERMES" -m hermes_cli.main "${HERMES_ARGS[@]}" >"$WORK/stdout.txt" 2>"$WORK/stderr.txt" 8>&- 9>&-
 RC=$?
-# The 9>&- above closed the slot for the child only; release it here too.
+# The 8>&- 9>&- above closed both for the child only; release them here too.
 exec 9>&-
+exec 8>&-
 set -e
 
 if [[ "$RC" -ne 0 ]]; then
