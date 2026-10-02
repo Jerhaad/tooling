@@ -119,6 +119,7 @@ EOF
 )
 
 BASE=$(git rev-parse HEAD)
+BASE_SHORT=$(git rev-parse --short HEAD)
 # UTC, matching how hermes stamps last_edit_at, so the stray-write check below
 # sees only this run.
 START_ISO=$(date -u +%Y-%m-%dT%H:%M:%S)
@@ -217,11 +218,19 @@ run attempt1 "$PROMPT"
 # that names committing as the goal gets an unverified commit, which is the one
 # outcome worse than no commit at all -- it satisfies every check the caller can
 # cheaply make.
-REMAINING="The task is not finished. Resume it with tool calls, not with a plan.
-It is done when '$VERIFY' has passed on the tree you are about to commit, that
-commit is on $BRANCH, and $WORK/HANDOVER.md exists. Run the verification even if
-you believe the code is correct: the last run of this task committed code that
-did not compile."
+#
+# A fix round's branch already has commits, so "done when a commit is on the
+# branch" holds on entry: name the base and ask for a new commit on top of it.
+REMAINING=$(cat <<EOF
+The task is not finished. Resume it with tool calls, not with a plan.
+HEAD on $BRANCH is still $BASE_SHORT -- nothing has been committed for this
+task. The deliverable is a new commit on top of $BASE_SHORT whose tree passes
+'$VERIFY', plus $WORK/HANDOVER.md. The issue is #$ISSUE at $WORK/issue.txt
+$EXTRA
+Follow the same brief the first attempt got: implement the change, run the
+verification, commit on $BRANCH, write $WORK/HANDOVER.md, and stop.
+EOF
+)
 
 for ((i = 2; i <= ATTEMPTS; i++)); do
 	[[ "$(git rev-parse HEAD)" != "$BASE" ]] && break
