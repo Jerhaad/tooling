@@ -1,11 +1,20 @@
 name: Gates
 
+# A PR runs the gates its diff selects. Main runs every gate on each push and
+# weekly, so a suite no PR touches, or a runner change under it, still fails.
 on:
   pull_request:
+  push:
+    branches:
+      - main
+  schedule:
+    # UTC.
+    - cron: "0 6 * * 1"
 
-# A push supersedes the run before it; only the newest head's verdict is read.
+# A push supersedes the run before it. Non-PR runs key on the ref, since an
+# empty PR number would put them all in one group.
 concurrency:
-  group: gates-${{ github.event.pull_request.number }}
+  group: gates-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -14,10 +23,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # The PR head itself, not the merge ref: pr-ready compares the checked
-      # head with the pushed one, and gate-verify diffs it against its base.
+      # head with the pushed one. Push and schedule runs use github.sha.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
 
       # Several suites commit in scratch repositories, and some strip GIT_*
@@ -29,6 +38,14 @@ jobs:
       # task-mirror-check expands `just <recipe>` through `just --show`.
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq just
 
-      - run: bin/gate-verify .
+      - name: gate the diff
+        if: github.event_name == 'pull_request'
+        run: bin/gate-verify .
         env:
           VERIFY_BASE: origin/${{ github.event.pull_request.base.ref }}
+
+      - name: run every gate
+        if: github.event_name != 'pull_request'
+        run: bin/gate-verify . --all
+        env:
+          VERIFY_BASE: origin/main

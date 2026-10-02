@@ -11,7 +11,8 @@
 # run reports everything wrong with the branch.
 #
 # The gates themselves live in the project's gates.toml. This decides which of
-# them the diff has earned, runs them, and reports.
+# them the diff has earned, runs them, and reports. --all runs every gate
+# whatever the diff, which is how main gets a verdict of its own.
 set -euo pipefail
 
 # readlink -f, not `cd -P`: these are installed as symlinks into a bin
@@ -28,22 +29,26 @@ BASE=${VERIFY_BASE:-origin/main}
 # the one that selected it is wrong in a way neither of them can see.
 export VERIFY_BASE=$BASE
 
-usage() { echo "usage: gate-verify <worktree> [--skip NAME]... [--list]" >&2; exit 2; }
+usage() { echo "usage: gate-verify <worktree> [--all] [--skip NAME]... [--list]" >&2; exit 2; }
 [ $# -ge 1 ] || usage
 SRC=$(repo_root "$1")
 shift
-LIST=0 SKIP=()
+LIST=0 SKIP=() ALL=0
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--skip) [ $# -ge 2 ] || usage; SKIP+=("$2"); shift 2 ;;
 	--list) LIST=1; shift ;;
+	--all) ALL=1; shift ;;
 	*) usage ;;
 	esac
 done
 
 cd "$SRC"
 mapfile -t CHANGED < <(git diff --name-only "$BASE"...HEAD)
-[ ${#CHANGED[@]} -gt 0 ] || { echo "no changes against $BASE" >&2; exit 2; }
+if [ "$ALL" -eq 0 ] && [ ${#CHANGED[@]} -eq 0 ]; then
+	echo "no changes against $BASE" >&2
+	exit 2
+fi
 
 # Warn, do not block: gating an unsettled tree is sometimes correct, and the
 # gate's job is to exercise what the tree contains, not to police how it got
@@ -98,7 +103,8 @@ for i in "${!GATE_NAMES[@]}"; do
 	skipped "$name" && continue
 	# An empty `when` is a gate with no precondition -- cheap and
 	# language-independent, so it runs on every branch.
-	if [ -n "$when" ] && ! printf '%s\n' "${CHANGED[@]}" | grep -qE "$when"; then
+	if [ "$ALL" -eq 0 ] && [ -n "$when" ] \
+		&& ! printf '%s\n' "${CHANGED[@]}" | grep -qE "$when"; then
 		continue
 	fi
 	NAMES+=("$name")
@@ -108,7 +114,7 @@ for i in "${!GATE_NAMES[@]}"; do
 	GATES+=("REPO=$(printf '%q' "$SRC") ; ${GATE_RUN[$i]}")
 done
 
-if [ ${#GATES[@]} -eq 0 ] && [ ${#CODE[@]} -eq 0 ]; then
+if [ ${#GATES[@]} -eq 0 ] && [ "$ALL" -eq 0 ] && [ ${#CODE[@]} -eq 0 ]; then
 	echo "nothing to gate:" >&2
 	printf '  %s\n' "${DOCS[@]}" >&2
 	exit 0
@@ -122,7 +128,11 @@ if [ ${#GATES[@]} -eq 0 ]; then
 	exit 1
 fi
 
-printf '==> %d file(s) changed; running: %s\n\n' "${#CHANGED[@]}" "$(IFS=, ; echo "${NAMES[*]}")"
+if [ "$ALL" -eq 1 ]; then
+	printf '==> --all: running every gate (%d file(s) changed)\n\n' "${#CHANGED[@]}"
+else
+	printf '==> %d file(s) changed; running: %s\n\n' "${#CHANGED[@]}" "$(IFS=, ; echo "${NAMES[*]}")"
+fi
 
 if [ "$LIST" = 1 ]; then
 	# SHOWN, not GATE_RUN: the latter is every gate in the manifest, and indexing
