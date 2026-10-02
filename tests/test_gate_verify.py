@@ -340,6 +340,111 @@ def case_gated_code_with_ungated(tmp: Path) -> list[str]:
     return failures
 
 
+def case_all_runs_gate_when_does_not_match_diff(tmp: Path) -> list[str]:
+    """--all bypasses the `when` filter, so a gate whose regex does not
+    match the diff still runs. Without --all the same diff would gate
+    nothing."""
+    repo = make_repo(tmp / "all_unmatched", with_gates=False)
+    # A single gate whose `when` matches an empty extension. The diff
+    # below edits a `.py` file, so the regex misses -- a non-`--all`
+    # run would skip this gate.
+    (repo / "gates.toml").write_text(
+        "[[gates]]\nname = 'sentinel'\nwhen = '\\.rs$'\n"
+        "run = 'sh -c \"echo GATE-RAN\"'\n")
+    git(repo, "add", "gates.toml")
+    git(repo, "commit", "-q", "-m", "manifest")
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    (repo / "lib").mkdir()
+    (repo / "lib" / "thing.py").write_text("# touch\n")
+    git(repo, "add", "lib/thing.py")
+    git(repo, "commit", "-q", "-m", "py diff")
+    # Without --all: gate is filtered out, no gate runs, refusal.
+    no_all = run_gate_verify(repo)
+    failures = []
+    if no_all.returncode != 1:
+        failures.append(
+            f"non-`--all` should refuse (no gate matches): rc={no_all.returncode} "
+            f"stderr={no_all.stderr.strip()}")
+    # With --all: every gate runs, sentinel fires.
+    listed = run_gate_verify(repo, "--all", "--list")
+    ran = run_gate_verify(repo, "--all")
+    if listed.returncode or "sentinel" not in listed.stdout:
+        failures.append(f"--all did not select unmatched gate: {listed.stdout!r}")
+    if ran.returncode != 0 or "GATE-RAN" not in ran.stdout:
+        failures.append(f"--all did not run unmatched gate: rc={ran.returncode} "
+                     f"stdout={ran.stdout.strip()}")
+    return failures
+
+
+def case_all_works_with_empty_diff(tmp: Path) -> list[str]:
+    """On main, `git diff origin/main...HEAD` is empty, which under a
+    normal run is a refusal. --all turns that refusal into a verdict:
+    every gate runs against the tree as it stands on main."""
+    repo = make_repo(tmp / "all_empty", with_gates=False)
+    # No second commit -- the branch tip equals origin/main, so the diff
+    # is empty.
+    (repo / "gates.toml").write_text(
+        "[[gates]]\nname = 'sentinel'\nwhen = ''\n"
+        "run = 'sh -c \"echo GATE-RAN\"'\n")
+    git(repo, "add", "gates.toml")
+    git(repo, "commit", "-q", "-m", "manifest")
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    # Without --all: refusal with "no changes against $BASE".
+    no_all = run_gate_verify(repo)
+    failures = []
+    if no_all.returncode == 0 or "no changes against" not in no_all.stderr:
+        failures.append(
+            f"empty diff should refuse without --all: rc={no_all.returncode} "
+            f"stderr={no_all.stderr.strip()}")
+    # With --all: empty diff is acceptable, sentinel runs.
+    ran = run_gate_verify(repo, "--all")
+    if ran.returncode != 0 or "GATE-RAN" not in ran.stdout:
+        failures.append(
+            f"--all did not run on empty diff: rc={ran.returncode} "
+            f"stdout={ran.stdout.strip()} stderr={ran.stderr.strip()}")
+    return failures
+
+
+def case_all_skip_still_excludes(tmp: Path) -> list[str]:
+    """--all selects every gate; --skip still removes the named one.
+    A run that bypassed `when` but bypassed `--skip` too would be hard
+    to use: a broken gate could not be excluded for one run."""
+    repo = make_repo(tmp / "all_skip", with_gates=False)
+    # Two unconditional gates; both run under --all by default.
+    (repo / "gates.toml").write_text(
+        "[[gates]]\nname = 'first'\nwhen = ''\n"
+        "run = 'sh -c \"echo FIRST-RAN\"'\n"
+        "[[gates]]\nname = 'second'\nwhen = ''\n"
+        "run = 'sh -c \"echo SECOND-RAN\"'\n")
+    git(repo, "add", "gates.toml")
+    git(repo, "commit", "-q", "-m", "manifest")
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    (repo / "lib").mkdir()
+    (repo / "lib" / "thing.py").write_text("# touch\n")
+    git(repo, "add", "lib/thing.py")
+    git(repo, "commit", "-q", "-m", "trigger")
+    # Without --skip: both gates fire.
+    listed = run_gate_verify(repo, "--all", "--list")
+    failures = []
+    if listed.returncode != 0:
+        failures.append(f"--all --list refused: {listed.stderr.strip()}")
+        return failures
+    names = selected_names(listed.stdout)
+    if "first" not in names or "second" not in names:
+        failures.append(f"--all did not select both: {names!r}")
+    # With --skip second: only first appears.
+    skipped = run_gate_verify(repo, "--all", "--list", "--skip", "second")
+    if skipped.returncode != 0:
+        failures.append(f"--all --skip refused: {skipped.stderr.strip()}")
+        return failures
+    names = selected_names(skipped.stdout)
+    if "second" in names:
+        failures.append(f"--skip did not exclude 'second' under --all: {names!r}")
+    if "first" not in names:
+        failures.append(f"--skip excluded too much under --all: {names!r}")
+    return failures
+
+
 def main() -> int:
     failures = []
     with tempfile.TemporaryDirectory() as t:
@@ -357,6 +462,12 @@ def main() -> int:
             ("a doc under bin/ is not code", case_bin_doc_is_not_code),
             ("gated code plus ungated non-doc path still passes",
              case_gated_code_with_ungated),
+            ("--all runs a gate whose `when` does not match the diff",
+             case_all_runs_gate_when_does_not_match_diff),
+            ("--all works with an empty diff",
+             case_all_works_with_empty_diff),
+            ("--skip still excludes a gate under --all",
+             case_all_skip_still_excludes),
         ]:
             try:
                 failures.extend(fn(tmp))
