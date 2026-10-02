@@ -390,14 +390,18 @@ def test_unable_to_compare_when_no_just():
                                                 "job": "rust-tests"}),
                             WORKFLOW_THREE_STEPS,
                             justfile_text=justfile)
-        # Strip `just` from PATH but keep bash and python3 reachable. The
-        # wrapper shells out to bash; the helper shells out to `just`.
         env = dict(os.environ)
-        # Locate bash and python3 before we cut PATH down.
-        bash_bin = shutil.which("bash")
-        py_bin = shutil.which("python3")
-        assert bash_bin and py_bin, "test environment must have bash and python3"
-        env["PATH"] = os.path.dirname(bash_bin) + ":" + os.path.dirname(py_bin)
+        # PATH holds symlinks to only the tools this code path runs, so `just`
+        # is unreachable even where it is installed beside bash.
+        needed = ("bash", "python3", "git", "dirname", "readlink")
+        resolved = {name: shutil.which(name) for name in needed}
+        missing = [name for name, path in resolved.items() if not path]
+        assert not missing, f"test environment missing tools: {missing}"
+        sandbox = Path(t) / "minimal_path"
+        sandbox.mkdir()
+        for name, real in resolved.items():
+            os.symlink(real, sandbox / name)
+        env["PATH"] = str(sandbox)
         r = subprocess.run([str(WRAPPER), str(wt)], capture_output=True,
                            text=True, env=env)
         out = r.stdout
