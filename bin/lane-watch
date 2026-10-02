@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""Follow a hermes lane's conversation live.
+
+    lane-watch <worktree-path-or-fragment> [--profile P] [--all] [--since EPOCH]
+
+Lanes run hermes in quiet mode, so nothing reaches their stdout until the run
+ends. Every message is written to the profile's state.db as it happens, so
+this tails the newest session whose working directory matches. --all prints
+the whole session so far before following.
+
+Database location mirrors bin/hermes-implement: $HERMES_HOME (default
+~/.hermes) is the root; --profile P reads profiles/P/state.db, no --profile
+reads the root state.db. LANE_WATCH_POLL (default 2) overrides the poll
+interval so tests can run faster.
+
+--since EPOCH waits for a session started at or after EPOCH, so a watcher
+opened before its lane starts ignores the worktree's earlier, finished one.
+With --since it keeps waiting after a session ends: a retry reopens the same
+session (hermes --continue), which resumes from the same cursor, and a newer
+session is followed from its start. Without --since it exits when the
+session ends.
+"""
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+
+def short(text, n):
+    text = " ".join((text or "").split())
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def describe(role, content, tool_calls, tool_name):
+    if role == "assistant" and tool_calls:
+        try:
+            calls = json.loads(tool_calls)
+        except ValueError:
+            calls = []
+        out = []
+        if content:
+            out.append(f"\033[36massistant\033[0m {short(content, 300)}")
+        for c in calls:
+            fn = c.get("function", {})
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except ValueError:
+                args = {}
+            arg = args.get("command") or args.get("path") or args.get("query") or fn.get("arguments", "")
+            out.append(f"\033[33m→ {fn.get('name', '?')}\033[0m {short(str(arg), 200)}")
+        return "\n".join(out)
+    if role == "tool":
+        return f"\033[2m  ← {tool_name or 'tool'}: {short(content, 160)}\033[0m"
+    if role == "user":
+        return f"\033[35muser\033[0m {short(content, 200)}"
+    return f"\033[36m{role}\033[0m {short(content, 400)}"
+
+
+def die(msg, code=1):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def find_session(con, fragment, since):
+    """Newest session whose cwd matches fragment, optionally restricted
+    to started_at >= since. Returns (sid, ended_at) or (None, None)."""
+    if since:
+        row = con.execute(
+            "SELECT id, ended_at FROM sessions "
+            "WHERE cwd LIKE ? AND started_at >= ? "
+            "ORDER BY started_at DESC LIMIT 1",
+            (f"%{fragment}%", since),
+        ).fetchone()
+    else:
+        row = con.execute(
+            "SELECT id, ended_at FROM sessions WHERE cwd LIKE ? "
+            "ORDER BY started_at DESC LIMIT 1",
+            (f"%{fragment}%",),
+        ).fetchone()
+    if not row:
+        return None, None
+    return row[0], row[1]
+
+
+def follow(con, sid, label, all_messages, last=0):
+    """Print sid's messages after `last` until the session ends; return the
+    cursor so a reopened session resumes without repeats."""
+    if not all_messages and last == 0:
+        last = con.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM messages WHERE session_id = ?",
+            (sid,)).fetchone()[0]
+    print(f"following {label} session {sid} (Ctrl-C to stop)", flush=True)
+    poll = float(os.environ.get("LANE_WATCH_POLL", "2"))
+    while True:
+        for mid, role, content, tool_calls, tool_name in con.execute(
+            "SELECT id, role, content, tool_calls, tool_name FROM messages "
+            "WHERE session_id = ? AND id > ? ORDER BY id",
+            (sid, last),
+        ):
+            last = mid
+            print(describe(role, content, tool_calls, tool_name), flush=True)
+        ended = con.execute(
+            "SELECT ended_at FROM sessions WHERE id = ?", (sid,)).fetchone()[0]
+        if ended:
+            print("session ended")
+            return last
+        time.sleep(poll)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("where", help="worktree path, or any fragment of it")
+    ap.add_argument("--profile", default=None,
+                    help="profile whose state.db to read; default reads the root database")
+    ap.add_argument("--all", action="store_true", help="print the session so far first")
+    ap.add_argument("--since", type=float, default=None,
+                    help="epoch (seconds); only follow sessions started at or after this time")
+    args = ap.parse_args()
+
+    hermes_home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    if args.profile:
+        db = hermes_home / "profiles" / args.profile / "state.db"
+        label = f"{args.profile} profile"
+    else:
+        db = hermes_home / "state.db"
+        label = "root"
+    if not db.is_file():
+        die(f"no database at {db} (HERMES_HOME={hermes_home}, {label})")
+
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    except sqlite3.Error as e:
+        die(f"cannot open {db}: {e}")
+
+    # The follow loop: pick the newest session matching the fragment.
+    # With --since, wait for one with started_at >= EPOCH to exist; without
+    # --since, the newest-wins rule applies and a missing match is fatal.
+    # After the session we follow ends, --since keeps the watcher alive for
+    # one of two reasons: hermes --continue reopens the same row by
+    # clearing ended_at (started_at is unchanged), or a fresh attempt
+    # starts a new row. A reopen resumes from the cursor the watcher
+    # already had, so the pre-end messages are not reprinted; a strictly
+    # newer session is followed from its start. The tmux window
+    # hermes-implement opens already waits for Enter, so a person
+    # closes the watcher. Without --since the watcher exits when the
+    # session ends.
+    poll = float(os.environ.get("LANE_WATCH_POLL", "2"))
+    last_sid = None
+    last_cursor = 0
+    last_started = 0.0
+    while True:
+        sid, _ended = find_session(con, args.where, args.since)
+        if sid is None:
+            if args.since is None:
+                die(f"no {label} session with a cwd matching {args.where!r}")
+            time.sleep(poll)
+            continue
+        # A new session (different id) restarts the cursor; a
+        # same-session reopen keeps the cursor so its pre-end messages
+        # are not reprinted.
+        if sid != last_sid:
+            last_cursor = 0
+        row = con.execute("SELECT started_at FROM sessions WHERE id = ?",
+                          (sid,)).fetchone()
+        if row:
+            last_started = row[0]
+        # First follow: --since (or --all) replays from the start. A
+        # resume never replays -- the cursor already covers what was
+        # printed.
+        replay = (args.all or args.since is not None) and last_cursor == 0
+        last_cursor = follow(con, sid, label, replay, last=last_cursor)
+        last_sid = sid
+        # Without --since, the caller did not ask us to keep looking.
+        if args.since is None:
+            return
+        # With --since, wait for the same session to reopen, or for a
+        # strictly newer session to appear. A reopen leaves started_at
+        # unchanged, so ended_at is the unambiguous signal; a new
+        # message beyond the cursor is a fallback in case ended_at was
+        # not cleared cleanly.
+        print("session ended; waiting for it to reopen or a new one to start",
+              flush=True)
+        while True:
+            row = find_session(con, args.where, args.since)
+            if row[0] is not None:
+                new_sid, _ = row
+                if new_sid == last_sid:
+                    # Same session: did it reopen?
+                    ended = con.execute(
+                        "SELECT ended_at FROM sessions WHERE id = ?",
+                        (new_sid,)).fetchone()[0]
+                    if not ended:
+                        break
+                    # Or did a new message appear beyond the cursor?
+                    new_max = con.execute(
+                        "SELECT COALESCE(MAX(id), 0) FROM messages "
+                        "WHERE session_id = ?", (new_sid,)).fetchone()[0]
+                    if new_max > last_cursor:
+                        break
+                else:
+                    # Different id: a strictly newer session for the
+                    # worktree. Only follow it if it started after the
+                    # one we just followed.
+                    new_started = con.execute(
+                        "SELECT started_at FROM sessions WHERE id = ?",
+                        (new_sid,)).fetchone()[0]
+                    if new_started > last_started:
+                        break
+            time.sleep(poll)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass

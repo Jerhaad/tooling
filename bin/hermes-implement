@@ -6,6 +6,10 @@
 # the tree rather than by unwinding commits.
 set -euo pipefail
 
+# readlink -f: hermes-implement is installed as a symlink on PATH, and lane-watch
+# lives beside the real file. BASH_SOURCE holds the symlink's own path; readlink
+# resolves it.
+BIN_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
 HERMES=${HERMES_PYTHON:-${HERMES_HOME:-$HOME/.hermes}/hermes-agent/venv/bin/python}
 TIMEOUT=${HERMES_IMPLEMENT_TIMEOUT:-5400}
 
@@ -211,6 +215,20 @@ run() {
 	echo "$label: hermes exited $rc" >&2
 	tail -3 "$WORK/$label.stdout" >&2
 }
+
+# Opt-in: a tmux window that follows this lane with lane-watch. hermes stays
+# this script's child, and a window that cannot open never fails the lane.
+if [[ -n "${LANE_WATCH_TMUX_SESSION:-}" ]] && command -v tmux >/dev/null 2>&1 &&
+	tmux has-session -t "$LANE_WATCH_TMUX_SESSION" 2>/dev/null; then
+	# --since: a fix round reuses the worktree, and the newest session there
+	# is otherwise the previous lane's finished one.
+	LANE_WATCH_ARGS=("$BIN_DIR/lane-watch" "$WORKTREE" --since "$(date -u +%s)")
+	[[ -n "$PROFILE" ]] && LANE_WATCH_ARGS+=(--profile "$PROFILE")
+	# Kept open after the lane ends, so its last messages stay readable.
+	( tmux new-window -d -t "$LANE_WATCH_TMUX_SESSION" -n "$ISSUE" \
+		"$(printf '%q ' "${LANE_WATCH_ARGS[@]}"); read -r _" ) >/dev/null 2>&1 || true
+	unset LANE_WATCH_ARGS
+fi
 
 run attempt1 "$PROMPT"
 
