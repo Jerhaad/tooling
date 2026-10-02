@@ -6,10 +6,13 @@
 # the tree rather than by unwinding commits.
 set -euo pipefail
 
-# readlink -f: hermes-implement is installed as a symlink on PATH, and lane-watch
-# lives beside the real file. BASH_SOURCE holds the symlink's own path; readlink
-# resolves it.
+# readlink -f: these are installed as symlinks into a bin directory on PATH,
+# lane-watch and lib/ live beside the real file, and BASH_SOURCE holds the
+# symlink's own path.
 BIN_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+# shellcheck source=../lib/common.sh
+. "$BIN_DIR/../lib/common.sh"
+
 HERMES=${HERMES_PYTHON:-${HERMES_HOME:-$HOME/.hermes}/hermes-agent/venv/bin/python}
 TIMEOUT=${HERMES_IMPLEMENT_TIMEOUT:-5400}
 
@@ -208,6 +211,7 @@ run() {
 	# --no-restore-cwd: a resumed session otherwise returns to the directory it
 	# recorded, which for this agent is its bound project folder rather than the
 	# worktree it was handed. It has committed in the wrong repository that way.
+	# hermes inherits fd 8, the GPU group lock, which spans every retry.
 	timeout "$TIMEOUT" "$HERMES" -m hermes_cli.main ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} "$@" --no-restore-cwd -z "$prompt" --skills swe-updater,swe-tester --yolo \
 		>"$WORK/$label.stdout" 2>"$WORK/$label.stderr"
 	local rc=$?
@@ -229,6 +233,9 @@ if [[ -n "${LANE_WATCH_TMUX_SESSION:-}" ]] && command -v tmux >/dev/null 2>&1 &&
 		"$(printf '%q ' "${LANE_WATCH_ARGS[@]}"); read -r _" ) >/dev/null 2>&1 || true
 	unset LANE_WATCH_ARGS
 fi
+
+# Held across every attempt: retries are one run's worth of GPU work.
+acquire_gpu_lock "$PROFILE"
 
 run attempt1 "$PROMPT"
 
@@ -254,6 +261,8 @@ for ((i = 2; i <= ATTEMPTS; i++)); do
 	[[ "$(git rev-parse HEAD)" != "$BASE" ]] && break
 	run "attempt$i" "$REMAINING" --continue
 done
+
+exec 8>&- 2>/dev/null || true
 
 if [[ "$(git rev-parse HEAD)" == "$BASE" ]]; then
 	echo "FAILED: $ATTEMPTS attempts left $BRANCH at $BASE" >&2
