@@ -80,7 +80,12 @@ survive -- a finding it cannot locate is a finding it will discard.
 $([ -n "$PREV_NOTES" ] && printf 'The previous review is below. Carry every one of its findings forward\nverbatim, including the ones you believe are fixed.\n\nDo not re-check them against the tree. The next phase verifies every finding\nand files issues from its verdicts, so checking here is work done twice by two\nmodels that can disagree -- and the one that disagrees here is the one nobody\nreads. Dropping a finding you judge fixed is how a real one disappears without\nanything recording the decision.\n\n%s' "$PREV_NOTES")"
 
 AGENT_OUT=$(mktemp -t review-agent-XXXXXX.log)
-trap 'rm -f "$AGENT_OUT"' EXIT
+trap 'exec 8>&- 2>/dev/null || true; rm -f "$AGENT_OUT"' EXIT
+
+# The GPU group lock is taken in addition to the review's own constraints:
+# this phase runs hermes, and hermes holds the GPUs. The wait sits outside
+# the timeout, so a swap queued behind a reviewer cannot drain the timeout.
+acquire_gpu_lock "$PROFILE"
 
 timeout "${PIPELINE_REVIEW_TIMEOUT:-5400}" $HERMES -p "$PROFILE" \
 	--no-restore-cwd -z "$PROMPT" --skills swe-reviewer --yolo >"$AGENT_OUT" 2>&1 || true

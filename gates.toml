@@ -157,6 +157,21 @@ name = "hermes review tests"
 when = '^(skills/hermes-review/scripts/hermes-scrutinize\.sh|tests/test_hermes_scrutinize\.py)$'
 run = "python3 tests/test_hermes_scrutinize.py"
 
+# The GPU group lock and its three contracts: serialise on one group, run
+# across groups, no-op without one. Both common.sh's function and the
+# helpers in bin/ and pipeline/ that call it.
+[[gates]]
+name = "GPU group lock tests"
+when = '^(lib/common\.sh|tests/test_gpu_lock\.py|bin/hermes-implement|skills/hermes-review/scripts/hermes-scrutinize\.sh)$'
+run = "python3 tests/test_gpu_lock.py"
+
+# hermes-implement takes the GPU group lock once and holds it across every
+# retry, so a flapping model cannot race itself across GPUs.
+[[gates]]
+name = "hermes-implement lock-across-retry tests"
+when = '^(bin/hermes-implement|tests/test_hermes_implement\.py)$'
+run = "python3 tests/test_hermes_implement.py"
+
 # Syntax floor for the two review drivers; their shared logic is in
 # lib/common.sh and the review script, which the suite above pins.
 [[gates]]
