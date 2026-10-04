@@ -80,9 +80,22 @@ if [ ${#TESTS[@]} -eq 0 ]; then
 	[ ${#INLINE[@]} -gt 0 ] && printf '  inline tests only, cannot be proven: %s\n' "${INLINE[@]}" >&2
 	exit 1
 fi
+# Tests with no source to revert -- a Rust test of a fixture another part of
+# the change produced -- are unprovable, not a failure: the gate never measured
+# whether they depend on the change.
 if [ ${#SOURCES[@]} -eq 0 ]; then
-	echo "FAIL: tests changed but no source did; nothing to revert" >&2
-	exit 1
+	OTHERS=()
+	for f in "${CHANGED[@]}"; do
+		for t in "${TESTS[@]}"; do [ "$f" = "$t" ] && continue 2; done
+		OTHERS+=("$f")
+	done
+	echo "UNPROVABLE: tests changed but no source did; nothing to revert" >&2
+	if [ ${#OTHERS[@]} -eq 0 ]; then
+		echo "            no other file changed" >&2
+	else
+		printf '            non-test files: %s\n' "${OTHERS[@]}" >&2
+	fi
+	exit 3
 fi
 
 # Whether the revert would change anything is a question about two commits, so

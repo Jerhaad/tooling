@@ -48,7 +48,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 GATE_PROVE = REPO_ROOT / "bin" / "gate-prove"
 
 
-def build_repo(tmpdir: Path, *, test_post_condition: str) -> str:
+def build_repo(tmpdir: Path, *, test_post_condition: str,
+               with_source: bool = True,
+               extra_branch_files: dict[str, str] | None = None) -> str:
     """Make a throwaway repo with one base commit and one branch commit.
 
     `test_post_condition` is the shell snippet a test script under
@@ -60,6 +62,17 @@ def build_repo(tmpdir: Path, *, test_post_condition: str) -> str:
     source value is `BRANCH_VALUE`; the base's is `BASE_VALUE`. The
     snippet's job is to decide whether the current value matches what
     a test on the branch would expect.
+
+    `with_source=False` skips src.sh entirely, so the diff carries
+    only the test file. The unprovable cases pin this: the gate has
+    nothing to revert, and the answer must distinguish "tests + a
+    fixture" from "tests alone".
+
+    `extra_branch_files` writes extra paths on the branch only, so a
+    diff that adds a test plus a non-source file (a fixture, a
+    client) reaches the unprovable branch with the file listed.
+    Paths are relative to the repo root; intermediate directories
+    are created.
 
     Returns the SHA of the base commit, for PROVE_BASE.
     """
@@ -73,7 +86,8 @@ def build_repo(tmpdir: Path, *, test_post_condition: str) -> str:
         f"{test_post_condition}\n"
     )
 
-    (tmpdir / "src.sh").write_text(src_base)
+    if with_source:
+        (tmpdir / "src.sh").write_text(src_base)
     (tmpdir / "tests").mkdir()
     (tmpdir / "tests" / "test_smoke.sh").write_text(test_script)
     (tmpdir / "tests" / "test_smoke.sh").chmod(0o755)
@@ -103,10 +117,16 @@ def build_repo(tmpdir: Path, *, test_post_condition: str) -> str:
     # test_smoke.sh is rewritten so the diff against base has a real
     # test change, not a touch.
     git("checkout", "-q", "-b", "feat")
-    (tmpdir / "src.sh").write_text(src_branch)
+    if with_source:
+        (tmpdir / "src.sh").write_text(src_branch)
     (tmpdir / "tests" / "test_smoke.sh").write_text(
         test_script + "# feature branch\n")
     (tmpdir / "tests" / "test_smoke.sh").chmod(0o755)
+    if extra_branch_files:
+        for rel, content in extra_branch_files.items():
+            p = tmpdir / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content)
     git("add", "-A")
     git("commit", "-q", "-m", "feat")
     return base_sha
@@ -305,6 +325,88 @@ def case_nothing_to_revert(failures: list) -> None:
             failures.append(
                 "nothing to revert: the suite ran before the gate worked out "
                 "there was nothing to measure")
+
+
+def case_tests_only_unprovable(failures: list) -> None:
+    """A diff that changes only a test file -- no source, no fixture,
+    no anything else -- has nothing the gate can revert. The gate
+    must say so as unprovable, not as a failure: the tests may very
+    well depend on the change, but the gate has no way to measure
+    that, and the verdict is not 'the tests do not depend on the
+    change'. The UNPROVABLE message must say no other file changed,
+    so a reader can tell this from a diff that ships a fixture too."""
+    with tempfile.TemporaryDirectory() as t:
+        tmpdir = Path(t)
+        snippet = ": # unused, the suite never runs on this branch\n"
+        base_sha = build_repo(tmpdir, test_post_condition=snippet,
+                              with_source=False)
+        # Confirm the diff really is just the test: if src.sh sneaked
+        # back in, this test would be measuring the wrong branch.
+        diff = subprocess.run(
+            ["git", "-C", str(tmpdir), "diff", "--name-only",
+             base_sha, "HEAD"],
+            capture_output=True, text=True, check=True).stdout.splitlines()
+        if diff != ["tests/test_smoke.sh"]:
+            failures.append(
+                "tests only: setup produced the wrong diff: "
+                f"expected ['tests/test_smoke.sh'], got {diff!r}")
+        r = run_prove(tmpdir, base_sha)
+        assert_exit("tests only", 3, r, failures)
+        combined = (r.stdout + r.stderr).lower()
+        if "unprovable" not in combined:
+            failures.append(
+                f"tests only: exit 3 reached, but message did not say "
+                f"UNPROVABLE: stderr={r.stderr.strip()!r}")
+        if "nothing to revert" not in combined:
+            failures.append(
+                f"tests only: message did not say nothing to revert: "
+                f"stderr={r.stderr.strip()!r}")
+        if "no other file changed" not in combined:
+            failures.append(
+                f"tests only: message did not say no other file changed "
+                f"(so a reader cannot tell this from tests+fixture): "
+                f"stderr={r.stderr.strip()!r}")
+        assert_clean_tree(tmpdir, "tests only", failures)
+
+
+def case_tests_plus_fixture_unprovable(failures: list) -> None:
+    """A diff that adds a test plus a non-source file (a JSON fixture,
+    a Python client) has nothing the gate can revert either. The
+    UNPROVABLE answer must name the non-test files the diff did
+    change, so a reader knows what was on the branch and can decide
+    whether to expand `prove.sources` to cover it or accept the
+    verdict as-is. The contract is the same as the tests-only case:
+    neither is a failure."""
+    with tempfile.TemporaryDirectory() as t:
+        tmpdir = Path(t)
+        snippet = ": # unused, the suite never runs on this branch\n"
+        base_sha = build_repo(
+            tmpdir, test_post_condition=snippet, with_source=False,
+            extra_branch_files={"tests/fixtures/data.json": "{}\n"})
+        r = run_prove(tmpdir, base_sha)
+        assert_exit("tests plus fixture", 3, r, failures)
+        combined = (r.stdout + r.stderr).lower()
+        if "unprovable" not in combined:
+            failures.append(
+                f"tests plus fixture: exit 3 reached, but message did "
+                f"not say UNPROVABLE: stderr={r.stderr.strip()!r}")
+        if "nothing to revert" not in combined:
+            failures.append(
+                f"tests plus fixture: message did not say nothing to "
+                f"revert: stderr={r.stderr.strip()!r}")
+        # The fixture must be named; that is the test's whole point.
+        if "tests/fixtures/data.json" not in (r.stdout + r.stderr):
+            failures.append(
+                f"tests plus fixture: message did not name the fixture "
+                f"tests/fixtures/data.json: stderr={r.stderr.strip()!r}")
+        # The wrong-case signal from the old code: "FAIL:" must not
+        # appear alongside exit 3, so a fix that prints FAIL and then
+        # exits 3 is not the contract the issue asked for.
+        if r.stderr.lstrip().startswith("FAIL"):
+            failures.append(
+                f"tests plus fixture: stderr starts with FAIL on an "
+                f"unprovable verdict: stderr={r.stderr.strip()!r}")
+        assert_clean_tree(tmpdir, "tests plus fixture", failures)
 
 
 def _tree_name(path: str) -> str:
@@ -634,6 +736,8 @@ def main() -> int:
     case_passes_then_passes(failures)
     case_command_missing(failures)
     case_nothing_to_revert(failures)
+    case_tests_only_unprovable(failures)
+    case_tests_plus_fixture_unprovable(failures)
     case_scratch_named_after_caller(failures)
     case_prune_stale_registration(failures)
     case_override_runs_against_scratch(failures)
@@ -643,7 +747,11 @@ def main() -> int:
         for f in failures:
             print(f"FAIL {f}")
         return 1
-    print("PASS gate-prove: red->3, pass-then-fail->0, pass-then-pass->1,\n     missing command->3, nothing to revert->3 without running the suite\n     --override->0 against the scratch")
+    print("PASS gate-prove: red->3, pass-then-fail->0, pass-then-pass->1,\n"
+          "     missing command->3, nothing to revert->3 without running the suite\n"
+          "     tests-only->3 saying no other file changed,\n"
+          "     tests+fixture->3 naming the non-test files\n"
+          "     --override->0 against the scratch")
     return 0
 
 
