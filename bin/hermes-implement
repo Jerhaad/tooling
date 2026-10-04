@@ -262,7 +262,7 @@ for ((i = 2; i <= ATTEMPTS; i++)); do
 	run "attempt$i" "$REMAINING" --continue
 done
 
-exec 8>&- 2>/dev/null || true
+exec 8>&-
 
 if [[ "$(git rev-parse HEAD)" == "$BASE" ]]; then
 	echo "FAILED: $ATTEMPTS attempts left $BRANCH at $BASE" >&2

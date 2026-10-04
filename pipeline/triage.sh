@@ -44,7 +44,7 @@ Carry each finding's severity through verbatim from the notes as a '**Severity:*
 
 Write one file, $out, with a section per finding in the skill's output shape. Do not modify anything in $REPO and do not touch the issue tracker." \
 		--skills swe-triage --yolo >"$work/stdout" 2>"$work/stderr" || true
-	exec 8>&- 2>/dev/null || true
+	exec 8>&-
 )
 
 [[ -s "$out" ]] || { echo "review notes $date: triage produced nothing ($work)"; exit 0; }

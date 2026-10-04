@@ -167,6 +167,13 @@ def test_hermes_implement_holds_gpu_lock_across_retry():
             f"hermes-implement failed: rc={proc.returncode} "
             f"stdout={proc.stdout!r} stderr={proc.stderr!r}")
 
+        # Neither attempt committed, so the run must say so on stderr. The
+        # lock release after the loop once redirected the rest of the
+        # script's stderr to /dev/null, and this line was the first casualty.
+        assert "FAILED:" in proc.stderr, (
+            f"no FAILED line after attempts that never committed: "
+            f"stderr={proc.stderr!r}")
+
         # Both attempts must have run.
         calls = log.read_text().splitlines()
         # Each fake call appends one line. We expect 2 calls (attempt 1
