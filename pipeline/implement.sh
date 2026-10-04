@@ -109,7 +109,7 @@ Its output from the last run is below. Fix what it names and nothing else: this
 is a repair, not a second attempt at the feature.
 
 $(tail -60 "/tmp/nightly-resume-$n.log")" >/dev/null 2>&1 || true
-			exec 8>&- 2>/dev/null || true
+			exec 8>&-
 		)
 
 		# The agent fixes; committing the fix is mechanism, and it does not
