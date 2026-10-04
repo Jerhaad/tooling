@@ -49,6 +49,12 @@ if [ -z "$MSG_TEXT" ] && [ -z "$MSG_FILE" ]; then
 	exit 2
 fi
 
+# Before the cd: a relative -F names a file from where the caller stands, and
+# after it a same-named file at the root would be read instead.
+if [ -n "$MSG_FILE" ] && [ "${MSG_FILE#/}" = "$MSG_FILE" ]; then
+	MSG_FILE="$PWD/$MSG_FILE"
+fi
+
 SRC=$(repo_root "$PWD")
 cd "$SRC"
 

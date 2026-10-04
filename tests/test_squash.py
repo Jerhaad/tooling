@@ -175,6 +175,73 @@ def case_missing_F_file_refuses(failures):
         assert_eq("HEAD unchanged after missing-F refusal", pre, head(repo), failures)
 
 
+def case_relative_F_from_subdir_uses_subdir_file(failures):
+    # A relative -F FILE run from a subdirectory must be resolved against the
+    # caller's CWD, not the repository root. Without the fix, the file path is
+    # silently re-anchored under the root after `cd`, so a basename collision
+    # commits the wrong message. See issue #86.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo = init_repo(tmpdir)
+        make_branch_with_commits(repo, n=2)
+
+        nested = repo / "nested"
+        nested.mkdir()
+        (nested / "message.txt").write_text("intended squash message\n")
+        (repo / "message.txt").write_text("wrong root message\n")
+
+        r = run_squash(nested, "--base", "main", "-F", "message.txt")
+
+        assert_rc("subdir -F exit code", 0, r, failures)
+
+        msg = git(repo, "log", "-1", "--format=%B").stdout
+        assert_eq("subdir -F uses subdir file, not root shadow",
+                  "intended squash message\n\n", msg, failures)
+
+
+def case_relative_F_missing_at_caller_refuses(failures):
+    # When the caller's directory has no matching file, squash must refuse
+    # regardless of whether the root happens to hold a file with the same
+    # name. Without the fix, the relative path is re-anchored at the root and
+    # the root's shadow file is silently used. See issue #86.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo = init_repo(tmpdir)
+        make_branch_with_commits(repo, n=2)
+
+        nested = repo / "nested"
+        nested.mkdir()
+        (repo / "message.txt").write_text("root shadow\n")
+        pre = head(repo)
+
+        r = run_squash(nested, "--base", "main", "-F", "message.txt")
+
+        assert_rc("missing-at-caller -F exit code", 2, r, failures)
+        assert_in("missing-at-caller -F named", "not readable", r.stderr, failures)
+        assert_eq("HEAD unchanged after missing-at-caller refusal",
+                  pre, head(repo), failures)
+
+
+def case_absolute_F_used_verbatim(failures):
+    # An absolute -F FILE must be used as given, even when the caller's CWD
+    # contains a file with the same basename. The fix should leave absolute
+    # paths untouched. See issue #86.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo = init_repo(tmpdir)
+        make_branch_with_commits(repo, n=2)
+
+        nested = repo / "nested"
+        nested.mkdir()
+        abs_msg = repo / "absolute.txt"
+        abs_msg.write_text("absolute path message\n")
+        (nested / "absolute.txt").write_text("caller shadow\n")
+
+        r = run_squash(nested, "--base", "main", "-F", str(abs_msg))
+
+        assert_rc("absolute -F exit code", 0, r, failures)
+        msg = git(repo, "log", "-1", "--format=%B").stdout
+        assert_eq("absolute -F uses absolute path, not caller shadow",
+                  "absolute path message\n\n", msg, failures)
+
+
 def case_head_at_fork_exits_zero(failures):
     with tempfile.TemporaryDirectory() as tmpdir:
         repo = init_repo(tmpdir)
@@ -233,14 +300,17 @@ def main():
         return 1
     print("PASS squash: moving-base -> 1 commit + tree unchanged; "
           "dirty index/tracked/no-message/missing-F refuse; "
-          "head-at-fork/one-commit exit 0; commit failure restores HEAD")
+          "head-at-fork/one-commit exit 0; commit failure restores HEAD; "
+          "relative -F resolves from caller's CWD (issue #86)")
     return 0
 
 
 CASES = (case_moving_base_preserves_tree, case_dirty_index_refuses,
          case_dirty_working_tree_refuses, case_no_message_refuses,
-         case_missing_F_file_refuses, case_head_at_fork_exits_zero,
-         case_single_commit_exits_zero, case_commit_failure_restores_head)
+         case_missing_F_file_refuses, case_relative_F_from_subdir_uses_subdir_file,
+         case_relative_F_missing_at_caller_refuses, case_absolute_F_used_verbatim,
+         case_head_at_fork_exits_zero, case_single_commit_exits_zero,
+         case_commit_failure_restores_head)
 
 if __name__ == "__main__":
     sys.exit(main())
