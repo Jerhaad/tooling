@@ -278,6 +278,55 @@ def case_declared_gates_are_authoritative(tmp: Path) -> list[str]:
     return failures
 
 
+def case_unprovable_gate_not_treated_as_failure(tmp: Path) -> list[str]:
+    """A gate that exits 3 says it could not answer, which is neither
+    a pass nor a failure: a gate that gathered no evidence must not
+    appear in a list headed "FAILED". This is the property the
+    issue pins: a test-only branch makes gate-prove exit 3, and
+    gate-verify must list it as UNPROVABLE rather than refuse the
+    branch."""
+    failures = []
+    for label, path, when in [
+        ("unprovable-unconditional", "LICENSE", ""),
+        ("unprovable-conditional", "src/lib.rs", r"\.rs$"),
+    ]:
+        repo = make_repo(tmp / label, with_gates=False)
+        (repo / "gates.toml").write_text(
+            "[[gates]]\nname = 'unprovable'\nwhen = '" + when + "'\n"
+            "run = 'sh -c \"echo UNPROVABLE-MARKER; exit 3\"'\n")
+        git(repo, "add", "gates.toml")
+        git(repo, "commit", "-q", "-m", "manifest")
+        git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+        target = repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("changed\n")
+        git(repo, "add", path)
+        git(repo, "commit", "-q", "-m", "change")
+        r = run_gate_verify(repo)
+        if r.returncode != 0:
+            failures.append(
+                f"{label}: gate-verify refused an unprovable gate "
+                f"(rc={r.returncode} stderr={r.stderr.strip()!r})")
+        if "FAILED" in (r.stdout + r.stderr):
+            failures.append(
+                f"{label}: unprovable gate was reported as FAILED: "
+                f"stdout={r.stdout!r} stderr={r.stderr!r}")
+        if "UNPROVABLE" not in r.stderr:
+            failures.append(
+                f"{label}: gate-verify did not list the gate as "
+                f"UNPROVABLE on its UNPROVABLE line: "
+                f"stderr={r.stderr!r}")
+        if "unprovable" not in r.stderr:
+            failures.append(
+                f"{label}: UNPROVABLE line did not name the gate: "
+                f"stderr={r.stderr!r}")
+        if "UNPROVABLE-MARKER" not in r.stdout:
+            failures.append(
+                f"{label}: the gate itself was not run: "
+                f"stdout={r.stdout!r}")
+    return failures
+
+
 def case_unknown_source_and_invalid_manifest_refuse(tmp: Path) -> list[str]:
     failures = []
     for label, manifest, path in [
@@ -451,6 +500,8 @@ def main() -> int:
         tmp = Path(t)
         for label, fn in [
             ("declared gates remain authoritative", case_declared_gates_are_authoritative),
+            ("unprovable gate is not treated as failure",
+             case_unprovable_gate_not_treated_as_failure),
             ("unknown source and invalid manifests refuse", case_unknown_source_and_invalid_manifest_refuse),
             ("docs-only diff", case_docs_only),
             ("ungated code refuses with the script named",
