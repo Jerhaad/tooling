@@ -7,6 +7,8 @@ cases write one and assert the lane still wins, or refuses outright.
 import os
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 LIB = Path(__file__).resolve().parent.parent / "lib" / "common.sh"
@@ -40,6 +42,27 @@ def base_env(envfile: Path, **extra) -> dict:
     env.pop("LANE_POOL_SOLO", None)
     env.update(extra)
     return env
+
+
+def pick(home: Path, lanes: str, wait: int = 0, **extra) -> tuple[int, str, str]:
+    """Run pick_builder_lane for tree `t` and print the lane and lock it took."""
+    envfile = write_env([f'export BUILDER_LANES="{lanes}"',
+                         'export LANE_POOL_A=a', 'export LANE_POOL_B=b'])
+    env = base_env(envfile, HOME=str(home), LOCK_WAIT=str(wait), PICK_LANE_POLL="0",
+                   **extra)
+    return source_common(env, 'pick_builder_lane t; printf "%s|%s" "$REMOTE_LANE" "$BUILD_LOCK"')
+
+
+def hold(lock: Path) -> subprocess.Popen:
+    """Hold `lock` from another process, as a concurrent run would."""
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.Popen(["flock", str(lock), "sleep", "60"])
+    deadline = time.monotonic() + 5
+    while subprocess.run(["flock", "-n", str(lock), "true"]).returncode == 0:
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"could not hold {lock}")
+        time.sleep(0.05)
+    return proc
 
 
 def main() -> int:
@@ -132,11 +155,58 @@ def main() -> int:
     if rc != 0 or out != "user@cluster-host":
         failures.append(f"a lane rebound the cluster role: rc={rc} out={out!r} err={err!r}")
 
+    # 8. BUILDER_LANES: the first idle lane wins, a held one is skipped, the
+    # tree's last lane goes first while idle, and all-busy gives up.
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        locks = home / ".local/state/agent-tools"
+        rc, out, err = pick(home, "a b")
+        if rc != 0 or out != f"a|{locks}/a.lock":
+            failures.append(f"idle lanes did not pick the first: rc={rc} out={out!r} err={err!r}")
+
+        (locks / "builder-lane/t").write_text("b\n")
+        rc, out, err = pick(home, "a b")
+        if rc != 0 or out != f"b|{locks}/b.lock":
+            failures.append(f"the tree's last lane was not preferred: rc={rc} out={out!r} err={err!r}")
+
+        holder = hold(locks / "b.lock")
+        try:
+            rc, out, err = pick(home, "a b")
+            if rc != 0 or out != f"a|{locks}/a.lock":
+                failures.append(f"a busy last lane was not skipped: rc={rc} out={out!r} err={err!r}")
+            if (locks / "builder-lane/t").read_text() != "a\n":
+                failures.append("the pick was not recorded for the tree")
+
+            other = hold(locks / "a.lock")
+            try:
+                rc, out, err = pick(home, "a b")
+                if rc == 0:
+                    failures.append(f"every lane busy still picked one: {out!r}")
+            finally:
+                other.kill()
+                other.wait()
+        finally:
+            holder.kill()
+            holder.wait()
+
+    # 9. An override lock's directory is created; an unopenable lock returns 2.
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        override = home / "new/dir/x.lock"
+        rc, out, err = pick(home, "a", REMOTE_TASK_LOCK=str(override))
+        if rc != 0 or out != f"a|{override}":
+            failures.append(f"override lock in a new directory: rc={rc} out={out!r} err={err!r}")
+
+        (home / "file").write_text("")
+        rc, out, err = pick(home, "a", REMOTE_TASK_LOCK=str(home / "file/x.lock"))
+        if rc != 2:
+            failures.append(f"an unopenable lock did not return 2: rc={rc} out={out!r} err={err!r}")
+
     for f in failures:
         print(f"FAIL {f}")
     if failures:
         return 1
-    print("PASS REMOTE_LANE selects the lane host and the lane lock")
+    print("PASS REMOTE_LANE selects the lane host and the lane lock; BUILDER_LANES picks an idle lane")
     return 0
 
 

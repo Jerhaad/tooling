@@ -75,6 +75,38 @@ export_lane_build_env() {
 	esac
 }
 
+# `pick_builder_lane <tree>` returns 0 holding the first idle lane's pool lock,
+# with REMOTE_LANE, BUILD_LOCK and lockfd set; 1 if all stay busy; 2 if a lock
+# cannot be opened. It polls, because blocking on one lane waits behind a build
+# while another sits idle. The tree's last lane goes first, since moving a tree
+# costs a cold compile.
+pick_builder_lane() {
+	local tree=$1 lane last deadline lanes=()
+	local record="$HOME/.local/state/agent-tools/builder-lane/$tree"
+	read -ra lanes <<<"$BUILDER_LANES"
+	last=$(cat "$record" 2>/dev/null || true)
+	if [ -n "$last" ] && [[ " ${lanes[*]} " == *" $last "* ]]; then
+		lanes=("$last" "${lanes[@]}")
+	fi
+	mkdir -p "$(dirname "$record")"
+	deadline=$((SECONDS + LOCK_WAIT))
+	while :; do
+		for lane in "${lanes[@]}"; do
+			REMOTE_LANE=$lane
+			BUILD_LOCK=$(lock_for)
+			mkdir -p "$(dirname "$BUILD_LOCK")" || return 2
+			exec {lockfd}>"$BUILD_LOCK" || return 2
+			if flock -n "$lockfd"; then
+				printf '%s\n' "$lane" >"$record"
+				return 0
+			fi
+			exec {lockfd}>&-
+		done
+		[ "$SECONDS" -lt "$deadline" ] || return 1
+		sleep "${PICK_LANE_POLL:-10}"
+	done
+}
+
 # A non-interactive ssh reads no profile, so a version manager that puts tools on
 # PATH from an interactive shell puts nothing there. Override for a host that
 # keeps its shims elsewhere.
