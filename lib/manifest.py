@@ -103,6 +103,10 @@ def main() -> None:
         names = ", ".join(e.get("name", "?") for e in doc.get("task", [])) or "none"
         sys.exit(f"{MANIFEST}: no [[task]] named {want!r} (have: {names})")
 
+    if query == "roles":
+        print(" ".join(sorted({t["role"] for t in doc.get("task", []) if "role" in t})))
+        return
+
     if query == "gates":
         # Three parallel arrays because bash has no array of records. Order is
         # the file's, so the manifest decides what runs first.

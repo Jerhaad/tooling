@@ -89,6 +89,7 @@ for n in "${STRANDED[@]:0:${PIPELINE_RESUME_MAX:-2}}"; do
 			exec 9>"$LOCK"
 			flock 9
 			acquire_gpu_lock "$PROFILE"
+			export_lane_build_env "$wt"
 			timeout "${PIPELINE_REPAIR_TIMEOUT:-3600}" $HERMES_BIN \
 				-p "$PROFILE" --no-restore-cwd --yolo -z \
 "The work in $wt is committed and fails the project's gate. Fix it there.

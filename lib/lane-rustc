@@ -1,0 +1,13 @@
+#!/bin/sh
+# A cargo build in a lane's worktree leaves gigabytes of target/ on the dispatch
+# host. A cargo shim on PATH never runs: the agent's login shell resets PATH.
+# `--print` calls are target probes that cargo fmt and metadata need.
+case " $* " in
+*" --print"*) ;;
+*" --crate-name "*)
+	echo "Rust does not compile on this host. Build and test on a builder with" >&2
+	echo "remote-task <worktree>, or gate-verify <worktree> for every gate." >&2
+	exit 1
+	;;
+esac
+exec "$@"

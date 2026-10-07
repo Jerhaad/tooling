@@ -65,6 +65,16 @@ lock_for() {
 	printf '%s' "$HOME/.local/state/agent-tools/$pool.lock"
 }
 
+# A project that declares a builder task compiles there, so its lanes are
+# refused a local rustc.
+export_lane_build_env() {
+	local roles
+	roles=$(manifest "$1" roles 2>/dev/null) || return 0
+	case " $roles " in
+	*" builder "*) export RUSTC_WRAPPER="$TOOLS_LIB/lane-rustc" ;;
+	esac
+}
+
 # A non-interactive ssh reads no profile, so a version manager that puts tools on
 # PATH from an interactive shell puts nothing there. Override for a host that
 # keeps its shims elsewhere.
