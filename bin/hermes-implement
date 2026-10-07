@@ -83,6 +83,7 @@ RUN_PARENT="$STATE_DIR/hermes-implement-runs"
 mkdir -p "$RUN_PARENT"
 WORK=$(mktemp -d -p "$RUN_PARENT" hermes-implement-XXXXXX)
 export TMPDIR="$WORK" TMP="$WORK" TEMP="$WORK"
+export_lane_build_env "$WORKTREE"
 
 
 GH_ARGS=(issue view "$ISSUE")
