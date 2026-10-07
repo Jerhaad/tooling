@@ -79,7 +79,44 @@ output=$(python3 "$LIB/manifest.py" "$SRC" --task "$TASK")
 eval "$output"
 [ "$FULL" = 1 ] && [ -n "$TASK_FULL_COMMAND" ] && TASK_COMMAND=$TASK_FULL_COMMAND
 TASK_TIMEOUT=${TASK_TIMEOUT:-3600}
+
+# Two locks, one per contended resource.
+#
+# The remote lock serialises the reaping below, which removes directories a
+# concurrent run may be about to build in, and the one database container every
+# tree resets. It is remote because runs reach a host from more than one agent.
+#
+# The local lock guards the hypervisors: builders are the largest guests on
+# memory-overcommitted nodes, so builds on two different hosts can still exhaust
+# one memory pool. A lane with its own LANE_POOL has its own lock. It is taken
+# before the host is resolved, because with BUILDER_LANES the lock that comes
+# free decides the host.
+if [ -z "${REMOTE_LANE:-}" ] && [ -n "${BUILDER_LANES:-}" ] && [ "$TASK_ROLE" = builder ]; then
+	picked=0
+	pick_builder_lane "$NAME" || picked=$?
+	if [ "$picked" -ne 0 ]; then
+		if [ "$picked" -eq 1 ]; then
+			FAIL_REASON="timed out after ${LOCK_WAIT}s with every lane in BUILDER_LANES busy"
+		else
+			FAIL_REASON="cannot open local lock $BUILD_LOCK"
+		fi
+		echo "remote-task: $FAIL_REASON" >&2
+		exit 1
+	fi
+else
+	BUILD_LOCK=$(lock_for)
+	mkdir -p "$(dirname "$BUILD_LOCK")"
+	exec {lockfd}>"$BUILD_LOCK"
+	if ! flock -w "$LOCK_WAIT" "$lockfd"; then
+		FAIL_REASON="timed out after ${LOCK_WAIT}s waiting on local lock $BUILD_LOCK"
+		echo "remote-task: $FAIL_REASON" >&2
+		exit 1
+	fi
+fi
 REMOTE=$(host_for "$TASK_ROLE")
+if [ -n "${REMOTE_LANE:-}" ]; then
+	echo "==> lane ${REMOTE_LANE}: host=$REMOTE lock=$BUILD_LOCK"
+fi
 
 DB_ENV=""
 if [ -n "$TASK_DB_CONTAINER" ]; then
@@ -151,40 +188,11 @@ if [ -n "$TASK_DB_CONTAINER" ]; then
 	DB_ENV="export DATABASE_URL=postgres://$TASK_DB_USER@localhost:$TASK_DB_PORT/$DB"
 fi
 
-# Two locks, because there are two contended resources and they are not on the
-# same machine.
-#
-# The remote one guards the host's bench directory as a whole. Caches are per
-# tree, so a build cannot link one branch's crate against another's the way a
-# shared cache let it -- what needs serialising is the reaping below, which
-# removes directories a concurrent run may be about to build in, and the one
-# database container every tree resets. It has to be remote, because runs reach
-# a host from more than one agent.
-#
-# The local one guards the hypervisors. Builders are the largest guests on
-# memory-overcommitted nodes -- allocation runs to 1.3-1.7x real RAM -- so two
-# builds on two *different* hosts still land on one pool of memory, and the peak
-# is what takes guests down. A per-host lock cannot see that, which is how
-# "a second builder buys parallelism" was true of CPU and false of RAM. Every
-# dispatch leaves from this machine, so one lock here serialises the builders
-# that share a memory pool; a lane with its own LANE_POOL has its own lock.
 # How many build caches the host keeps, this run's own included. A number
 # rather than an age, because the disk is spent by how many exist. It is an
 # override rather than a constant since the right value is a property of the
 # builder's disk, which this tool cannot see.
 KEEP_CACHES=${REMOTE_TASK_KEEP_CACHES:-6}
-
-BUILD_LOCK=$(lock_for)
-if [ -n "${REMOTE_LANE:-}" ]; then
-	echo "==> lane ${REMOTE_LANE}: host=$REMOTE lock=$BUILD_LOCK"
-fi
-mkdir -p "$(dirname "$BUILD_LOCK")"
-exec {lockfd}>"$BUILD_LOCK"
-if ! flock -w "$LOCK_WAIT" "$lockfd"; then
-	FAIL_REASON="timed out after ${LOCK_WAIT}s waiting on local lock $BUILD_LOCK"
-	echo "remote-task: $FAIL_REASON" >&2
-	exit 1
-fi
 
 # `ssh -tt` (a tty) would echo the script and merge stderr -- wrong answer here.
 # CALLER must be escaped so the builder's shell expands $PPID, not ours.
