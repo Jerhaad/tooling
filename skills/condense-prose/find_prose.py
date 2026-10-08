@@ -31,26 +31,26 @@ PROSE_SUFFIXES = {".py", ".md"} | HASH_SUFFIXES | SLASH_SUFFIXES | SQL_SUFFIXES
 SHEBANG_HASH = ("sh", "bash", "zsh", "ksh", "dash", "python", "ruby", "perl")
 
 
-def hash_shebang(path: Path, rev: str | None = None) -> bool:
-    """Whether a suffixless file's first line names a #-commenting interpreter.
+def hash_commented(path: Path, rev: str | None = None) -> bool:
+    """Whether a file with no known suffix, like `bin/gate-verify` or
+    `hosts.env.example`, opens with a #-shebang or a `#` comment.
 
-    A tool installed on PATH usually has no extension -- `bin/gate-verify`, not
-    `bin/gate-verify.sh` -- so suffix alone skips exactly the scripts most
-    likely to be read by someone other than their author.
+    `@generated` files such as `Cargo.lock` open with a comment nobody wrote.
     """
-    if path.suffix:
-        return False
     try:
         if rev:
             first = run(["git", "show", f"{rev}:{path}"]).split("\n", 1)[0]
         else:
             with path.open("r", errors="replace") as fh:
-                first = fh.readline()
+                first = fh.readline(200)
     except (OSError, UnicodeDecodeError, subprocess.CalledProcessError):
         return False
-    if not first.startswith("#!"):
+    first = first.rstrip("\n")
+    if "@generated" in first:
         return False
-    return any(name in first for name in SHEBANG_HASH)
+    if first.startswith("#!"):
+        return any(name in first for name in SHEBANG_HASH)
+    return first == "#" or first.startswith("# ")
 
 # Ranked most-mechanical first: a duplicate is a fact in N places, an oversize block
 # is only a suspicion.
@@ -488,7 +488,7 @@ def main() -> int:
         candidates = [
             Path(p)
             for p in touched
-            if (Path(p).suffix in PROSE_SUFFIXES or hash_shebang(Path(p), rev))
+            if (Path(p).suffix in PROSE_SUFFIXES or hash_commented(Path(p), rev))
             and (rev or Path(p).is_file())
         ]
     else:
@@ -498,10 +498,10 @@ def main() -> int:
                 candidates += [
                     p
                     for p in path.rglob("*")
-                    if (p.suffix in PROSE_SUFFIXES or (p.is_file() and hash_shebang(p)))
+                    if (p.suffix in PROSE_SUFFIXES or (p.is_file() and hash_commented(p)))
                     and ".git" not in p.parts
                 ]
-            elif path.suffix in PROSE_SUFFIXES or hash_shebang(path):
+            elif path.suffix in PROSE_SUFFIXES or hash_commented(path):
                 candidates.append(path)
 
     blocks = collect(sorted(set(candidates)), root, args.min_words, rev)
