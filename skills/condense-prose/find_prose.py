@@ -144,7 +144,12 @@ def changed_lines(base: str, paths: list[str]) -> dict[str, set[int]]:
             if match:
                 start = int(match.group(1))
                 count = int(match.group(2) or 1)
-                touched[current].update(range(start, start + count + 1))
+                # `+start,count` covers start..start+count-1. A pure deletion
+                # (count 0) touches both lines that border its gap.
+                if count:
+                    touched[current].update(range(start, start + count))
+                else:
+                    touched[current].update({start, start + 1})
     return touched
 
 
