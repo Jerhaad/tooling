@@ -334,6 +334,144 @@ def case_diff_reports_both_files(failures: list[str]) -> None:
                  f"paths={sorted(paths)}")
 
 
+def _oversize_rust_block(num_lines: int = 3, words_per_line: int = 65) -> str:
+    """A `///` comment well over the 40-word threshold."""
+    return "\n".join(
+        "/// " + " ".join(f"w{i}" for i in range(words_per_line))
+        for _ in range(num_lines)
+    ) + "\n"
+
+
+def _distinct_oversize_rust_block(num_lines: int = 3, words_per_line: int = 65) -> str:
+    """Like `_oversize_rust_block` with distinct lines: with identical lines git
+    anchors a deletion hunk on the last copy, not the deleted one."""
+    return "\n".join(
+        "/// " + " ".join(f"L{n}w{i}" for i in range(words_per_line))
+        for n in range(num_lines)
+    ) + "\n"
+
+
+def _setup_comment_in_repo(repo: Path, comment: str, leading: str = "") -> None:
+    """Commit `leading + comment` as `lib.rs`, the base the case's diff runs against."""
+    (repo / "lib.rs").write_text(leading + comment)
+    git(repo, "add", "lib.rs")
+    git(repo, "commit", "-q", "-m", "set up doc comment")
+
+
+def case_diff_added_fn_above_unchanged_comment_not_reported(failures: list[str]) -> None:
+    """An unchanged comment stays unreported when a function lands just above it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = init_repo(Path(tmp))
+        comment = _oversize_rust_block()
+        _setup_comment_in_repo(repo, comment,
+                               leading="fn first() {}\nfn second() {}\n")
+        text = (repo / "lib.rs").read_text().splitlines(keepends=True)
+        text.insert(2, "fn third() {}\n")
+        (repo / "lib.rs").write_text("".join(text))
+        git(repo, "add", "lib.rs")
+        git(repo, "commit", "-q", "-m", "add function above comment")
+
+        proc = run_find_prose("lib.rs", "--diff", "HEAD~1..HEAD", cwd=repo)
+        if proc.returncode != 0:
+            fail(failures, "diff-fn-above: scanner returned non-zero",
+                 f"rc={proc.returncode} stderr={proc.stderr!r}")
+            return
+        blocks = blocks_for(proc)
+        if any(b["path"] == "lib.rs" for b in blocks):
+            fail(failures, "diff-fn-above: comment reported though unchanged",
+                 f"blocks={[(b['path'], b['line']) for b in blocks]}")
+
+
+def case_diff_added_line_inside_comment_is_reported(failures: list[str]) -> None:
+    """A line added inside a comment flags it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = init_repo(Path(tmp))
+        comment = _oversize_rust_block(num_lines=5)
+        _setup_comment_in_repo(repo, comment,
+                               leading="fn first() {}\nfn second() {}\n")
+        text = (repo / "lib.rs").read_text().splitlines(keepends=True)
+        # Insert a new comment line in the middle of the block (between
+        # line 4 and line 5 of the file -- the second and third /// lines).
+        text.insert(4, "/// " + " ".join(f"insert{i}" for i in range(60)) + "\n")
+        (repo / "lib.rs").write_text("".join(text))
+        git(repo, "add", "lib.rs")
+        git(repo, "commit", "-q", "-m", "add line inside comment")
+
+        proc = run_find_prose("lib.rs", "--diff", "HEAD~1..HEAD", cwd=repo)
+        blocks = blocks_for(proc)
+        if not any(b["path"] == "lib.rs" for b in blocks):
+            fail(failures, "diff-inside-comment: comment not reported",
+                 f"blocks={blocks!r}")
+
+
+def case_diff_deleted_line_inside_comment_is_reported(failures: list[str]) -> None:
+    """A line deleted inside a comment flags it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = init_repo(Path(tmp))
+        comment = _oversize_rust_block(num_lines=5)
+        _setup_comment_in_repo(repo, comment,
+                               leading="fn first() {}\nfn second() {}\n")
+        text = (repo / "lib.rs").read_text().splitlines(keepends=True)
+        # Delete the third /// line (1-indexed line 5 of the file, the
+        # middle of the 5-line comment block).
+        del text[4]
+        (repo / "lib.rs").write_text("".join(text))
+        git(repo, "add", "lib.rs")
+        git(repo, "commit", "-q", "-m", "delete line from comment")
+
+        proc = run_find_prose("lib.rs", "--diff", "HEAD~1..HEAD", cwd=repo)
+        blocks = blocks_for(proc)
+        if not any(b["path"] == "lib.rs" for b in blocks):
+            fail(failures, "diff-deleted-inside-comment: comment not reported",
+                 f"blocks={blocks!r}")
+
+
+def case_diff_deleted_code_line_above_unchanged_comment_not_reported(failures: list[str]) -> None:
+    """An unchanged comment stays unreported when a code line two above it is deleted."""
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = init_repo(Path(tmp))
+        comment = _oversize_rust_block()
+        _setup_comment_in_repo(
+            repo, comment,
+            leading="fn first() {}\nfn doomed() {}\nfn between() {}\n\n",
+        )
+        text = (repo / "lib.rs").read_text().splitlines(keepends=True)
+        # Delete line 2 (``fn doomed()``); ``fn between()`` shifts to
+        # line 2 and the comment to lines 4+.
+        del text[1]
+        (repo / "lib.rs").write_text("".join(text))
+        git(repo, "add", "lib.rs")
+        git(repo, "commit", "-q", "-m", "delete code line above comment")
+
+        proc = run_find_prose("lib.rs", "--diff", "HEAD~1..HEAD", cwd=repo)
+        blocks = blocks_for(proc)
+        if any(b["path"] == "lib.rs" for b in blocks):
+            fail(failures,
+                 "diff-deleted-code-above: comment reported though unchanged",
+                 f"blocks={[(b['path'], b['line']) for b in blocks]}")
+
+
+def case_diff_deleted_first_line_of_comment_is_reported(failures: list[str]) -> None:
+    """Deleting a comment's first line flags what remains of it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = init_repo(Path(tmp))
+        comment = _distinct_oversize_rust_block()
+        _setup_comment_in_repo(repo, comment)
+        text = (repo / "lib.rs").read_text().splitlines(keepends=True)
+        # Delete line 1 (the first /// line).
+        del text[0]
+        (repo / "lib.rs").write_text("".join(text))
+        git(repo, "add", "lib.rs")
+        git(repo, "commit", "-q", "-m", "delete first line of comment")
+
+        proc = run_find_prose("lib.rs", "--diff", "HEAD~1..HEAD", cwd=repo)
+        blocks = blocks_for(proc)
+        if not any(b["path"] == "lib.rs" for b in blocks):
+            fail(failures,
+                 "diff-deleted-first-of-comment: comment not reported",
+                 f"blocks={blocks!r}")
+
+
 def case_hash_commented_files_scanned(failures: list[str]) -> None:
     """A file no suffix identifies is scanned when its first line is a shebang
     or a `#` comment, and skipped when it is generated or uncommented."""
@@ -370,6 +508,11 @@ def main() -> int:
     case_provenance_session_link_is_flagged(failures)
     case_provenance_absent_when_no_link(failures)
     case_diff_reports_both_files(failures)
+    case_diff_added_fn_above_unchanged_comment_not_reported(failures)
+    case_diff_added_line_inside_comment_is_reported(failures)
+    case_diff_deleted_line_inside_comment_is_reported(failures)
+    case_diff_deleted_code_line_above_unchanged_comment_not_reported(failures)
+    case_diff_deleted_first_line_of_comment_is_reported(failures)
     case_hash_commented_files_scanned(failures)
 
     if failures:
