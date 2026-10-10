@@ -472,6 +472,148 @@ def case_diff_deleted_first_line_of_comment_is_reported(failures: list[str]) -> 
                  f"blocks={blocks!r}")
 
 
+def case_diff_deleted_file_does_not_touch_previous_file(failures: list[str]) -> None:
+    """A deleted file's `+++ /dev/null` hunk must not mark lines in the file
+    sorted before it as touched, and a file edited after the deletion must
+    still be reported."""
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = init_repo(Path(tmp))
+        # File names sort the deletion between the two edits in git's output.
+        (repo / "a.rs").write_text(_oversize_rust_block() + "fn first() {}\nfn second() {}\n")
+        (repo / "b.json").write_text("{\"a\":\"b\"}\n")
+        (repo / "c.rs").write_text("fn first() {}\nfn second() {}\n")
+        git(repo, "add", "a.rs", "b.json", "c.rs")
+        git(repo, "commit", "-q", "-m", "seed a.rs, b.json, c.rs")
+
+        text = (repo / "a.rs").read_text().splitlines(keepends=True)
+        # Insert a function on a line far below the doc comment.
+        text.append("fn third() {}\n")
+        (repo / "a.rs").write_text("".join(text))
+        (repo / "b.json").unlink()
+        # Add a 60+ word doc comment to c.rs.
+        comment = _oversize_rust_block(num_lines=1, words_per_line=60)
+        (repo / "c.rs").write_text(comment + "fn first() {}\nfn second() {}\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "edit a.rs, delete b.json, comment c.rs")
+
+        proc = run_find_prose("a.rs", "b.json", "c.rs",
+                              "--diff", "HEAD~1..HEAD", cwd=repo)
+        if proc.returncode != 0:
+            fail(failures, "diff-deleted-prev: scanner returned non-zero",
+                 f"rc={proc.returncode} stderr={proc.stderr!r}")
+            return
+        blocks = blocks_for(proc)
+        paths = {b["path"] for b in blocks}
+        if "a.rs" in paths:
+            fail(failures, "diff-deleted-prev: a.rs doc comment reported though unchanged",
+                 f"paths={sorted(paths)}")
+        if "c.rs" not in paths:
+            fail(failures, "diff-deleted-prev: c.rs comment not reported after deletion",
+                 f"paths={sorted(paths)}")
+
+
+def case_diff_single_ref_skips_files_main_added_after_fork(failures: list[str]) -> None:
+    """Files main added after the fork stay out of a single-ref diff."""
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = init_repo(Path(tmp))
+        # Branch point: a.rs is two short functions, no comment.
+        (repo / "a.rs").write_text("fn first() {}\nfn second() {}\n")
+        git(repo, "add", "a.rs")
+        git(repo, "commit", "-q", "-m", "branch point")
+        git(repo, "checkout", "-q", "-b", "feature")
+
+        # Branch commit: a long doc comment lands at the top of a.rs.
+        prose = _oversize_rust_block()
+        (repo / "a.rs").write_text(prose + "fn first() {}\nfn second() {}\n")
+        git(repo, "add", "a.rs")
+        git(repo, "commit", "-q", "-m", "feature adds a 60+ word comment")
+
+        # Main moves on: a new file with its own 60+ word comment lands.
+        git(repo, "checkout", "-q", "main")
+        main_file = "//! " + " ".join(f"mainword{i}" for i in range(60)) + "\nfn feature() {}\n"
+        (repo / "new_main_file.rs").write_text(main_file)
+        git(repo, "add", "new_main_file.rs")
+        git(repo, "commit", "-q", "-m", "main moves on")
+
+        # Back on the branch: ``--diff main`` must skip main's new file but
+        # still report the branch's own prose change.
+        git(repo, "checkout", "-q", "feature")
+        proc = run_find_prose(".", "--diff", "main", cwd=repo)
+        if proc.returncode != 0:
+            fail(failures, "diff-single-ref: scanner returned non-zero",
+                 f"rc={proc.returncode} stderr={proc.stderr!r}")
+            return
+        blocks = blocks_for(proc)
+        paths = {b["path"] for b in blocks}
+        if "new_main_file.rs" in paths:
+            fail(failures, "diff-single-ref: main-only file reported",
+                 f"paths={sorted(paths)}")
+        if "a.rs" not in paths:
+            fail(failures, "diff-single-ref: branch's own prose not reported",
+                 f"paths={sorted(paths)}")
+
+
+def case_diff_explicit_two_dot_range_keeps_today_behavior(failures: list[str]) -> None:
+    """An explicit ``A..B`` is used as given, so the branch's own change is reported."""
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = init_repo(Path(tmp))
+        (repo / "a.rs").write_text("fn first() {}\nfn second() {}\n")
+        git(repo, "add", "a.rs")
+        git(repo, "commit", "-q", "-m", "branch point")
+        git(repo, "checkout", "-q", "-b", "feature")
+
+        prose = _oversize_rust_block()
+        (repo / "a.rs").write_text(prose + "fn first() {}\nfn second() {}\n")
+        git(repo, "add", "a.rs")
+        git(repo, "commit", "-q", "-m", "feature adds a 60+ word comment")
+
+        git(repo, "checkout", "-q", "main")
+        main_file = "//! " + " ".join(f"mainword{i}" for i in range(60)) + "\nfn feature() {}\n"
+        (repo / "new_main_file.rs").write_text(main_file)
+        git(repo, "add", "new_main_file.rs")
+        git(repo, "commit", "-q", "-m", "main moves on")
+
+        git(repo, "checkout", "-q", "feature")
+        proc = run_find_prose(".", "--diff", "main..HEAD", cwd=repo)
+        if proc.returncode != 0:
+            fail(failures, "diff-two-dot: scanner returned non-zero",
+                 f"rc={proc.returncode} stderr={proc.stderr!r}")
+            return
+        blocks = blocks_for(proc)
+        paths = {b["path"] for b in blocks}
+        # The branch's own prose change is in ``A..B`` and must surface.
+        if "a.rs" not in paths:
+            fail(failures, "diff-two-dot: branch's own prose not reported",
+                 f"paths={sorted(paths)}")
+
+
+def case_diff_uncommitted_edit_on_branch_is_reported(failures: list[str]) -> None:
+    """An uncommitted edit on a branch lands in the diff because the merge
+    base is the only rev, so ``git diff`` compares it against the working tree."""
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = init_repo(Path(tmp))
+        # Branch point: lib.rs is two short functions, no comment.
+        (repo / "lib.rs").write_text("fn first() {}\nfn second() {}\n")
+        git(repo, "add", "lib.rs")
+        git(repo, "commit", "-q", "-m", "branch point")
+        git(repo, "checkout", "-q", "-b", "feature")
+
+        # Left uncommitted: only a diff against the working tree sees it.
+        prose = _oversize_rust_block()
+        (repo / "lib.rs").write_text(prose + "fn first() {}\nfn second() {}\n")
+
+        proc = run_find_prose(".", "--diff", "main", cwd=repo)
+        if proc.returncode != 0:
+            fail(failures, "diff-uncommitted-on-branch: scanner returned non-zero",
+                 f"rc={proc.returncode} stderr={proc.stderr!r}")
+            return
+        blocks = blocks_for(proc)
+        paths = {b["path"] for b in blocks}
+        if "lib.rs" not in paths:
+            fail(failures, "diff-uncommitted-on-branch: uncommitted edit not reported",
+                 f"paths={sorted(paths)}")
+
+
 def case_hash_commented_files_scanned(failures: list[str]) -> None:
     """A file no suffix identifies is scanned when its first line is a shebang
     or a `#` comment, and skipped when it is generated or uncommented."""
@@ -513,6 +655,10 @@ def main() -> int:
     case_diff_deleted_line_inside_comment_is_reported(failures)
     case_diff_deleted_code_line_above_unchanged_comment_not_reported(failures)
     case_diff_deleted_first_line_of_comment_is_reported(failures)
+    case_diff_deleted_file_does_not_touch_previous_file(failures)
+    case_diff_single_ref_skips_files_main_added_after_fork(failures)
+    case_diff_explicit_two_dot_range_keeps_today_behavior(failures)
+    case_diff_uncommitted_edit_on_branch_is_reported(failures)
     case_hash_commented_files_scanned(failures)
 
     if failures:
