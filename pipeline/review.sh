@@ -60,6 +60,15 @@ PREV_BRANCH=$(git -C "$WORK" for-each-ref --format='%(refname:short)' --sort=-re
 
 git -C "$WORK" checkout --quiet -B "$BRANCH"
 
+# The prompt is one argv string, and Linux caps one at 128 KiB. The previous
+# review only grows, and a whole-repository scope lists every file, so both go
+# in files the prompt names. Outside $WORK, which the run resets and cleans.
+CTX=$(mktemp -d -t review-ctx-XXXXXX)
+AGENT_OUT=$(mktemp -t review-agent-XXXXXX.log)
+trap 'exec 8>&-; rm -rf "$AGENT_OUT" "$CTX"' EXIT
+printf '%s\n' "$CHANGED" >"$CTX/changed-files.txt"
+if [ -n "$PREV_NOTES" ]; then printf '%s\n' "$PREV_NOTES" >"$CTX/previous-review.md"; fi
+
 PROMPT="Review the repository at $WORK and write REVIEW_NOTES.md at its root.
 
 The branch, the commit and the push are already handled: you are on $BRANCH and
@@ -69,18 +78,14 @@ commit, git push, or git branch. Do not clone anything.
 Scope: $SCOPE.
 Reviewed commit: $HEAD_SHA
 
-Files touched since the last review:
-$CHANGED
+Files touched since the last review, one per line: $CTX/changed-files.txt
 
 Follow the swe-reviewer skill for what to look for, how to classify, and the
 shape of the file. Every finding needs a precise path:line, because the next
 phase re-checks each one against the tree and files an issue for the ones that
 survive -- a finding it cannot locate is a finding it will discard.
 
-$([ -n "$PREV_NOTES" ] && printf 'The previous review is below. Carry every one of its findings forward\nverbatim, including the ones you believe are fixed.\n\nDo not re-check them against the tree. The next phase verifies every finding\nand files issues from its verdicts, so checking here is work done twice by two\nmodels that can disagree -- and the one that disagrees here is the one nobody\nreads. Dropping a finding you judge fixed is how a real one disappears without\nanything recording the decision.\n\n%s' "$PREV_NOTES")"
-
-AGENT_OUT=$(mktemp -t review-agent-XXXXXX.log)
-trap 'exec 8>&-; rm -f "$AGENT_OUT"' EXIT
+$(if [ -n "$PREV_NOTES" ]; then printf 'The previous review is in %s. Carry every one of its findings forward\nverbatim, including the ones you believe are fixed.\n\nDo not re-check them against the tree. The next phase verifies every finding\nand files issues from its verdicts, so checking here is work done twice by two\nmodels that can disagree -- and the one that disagrees here is the one nobody\nreads. Dropping a finding you judge fixed is how a real one disappears without\nanything recording the decision.' "$CTX/previous-review.md"; fi)"
 
 # The GPU group lock is taken in addition to the review's own constraints:
 # this phase runs hermes, and hermes holds the GPUs. The wait sits outside
