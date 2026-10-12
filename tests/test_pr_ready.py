@@ -171,6 +171,18 @@ def write_stub_find_prose(bin_dir: Path) -> None:
         "  echo \"find_prose: simulated crash\" >&2\n"
         "  exit 1\n"
         "fi\n"
+        "# The diff pass alone can be given its own crash or output, as a\n"
+        "# merge-base failure breaks only that pass.\n"
+        "case \" $* \" in *\" --diff \"*)\n"
+        "  if [ -e \"$STUB_DATA/find_prose_diff_fail\" ]; then\n"
+        "    echo \"find_prose: simulated crash\" >&2\n"
+        "    exit 1\n"
+        "  fi\n"
+        "  if [ -e \"$STUB_DATA/find_prose_diff.json\" ]; then\n"
+        "    cat \"$STUB_DATA/find_prose_diff.json\"\n"
+        "    exit 0\n"
+        "  fi ;;\n"
+        "esac\n"
         "if [ -e \"$STUB_DATA/find_prose.json\" ]; then\n"
         "  cat \"$STUB_DATA/find_prose.json\"\n"
         "else\n"
@@ -255,10 +267,12 @@ def install_fixtures(data_dir: Path, scenario: str, oid: str,
 
 def run_pr_ready(worktree: Path, stub_path: Path, data_dir: Path,
                  *extra: str,
-                 finder: str | None = None) -> subprocess.CompletedProcess:
+                 finder: str | None = None,
+                 condense: bool = False) -> subprocess.CompletedProcess:
     """Run pr-ready with the stubs first on PATH and STUB_DATA at the
     scenario. ``finder`` overrides CONDENSE_PROSE, a missing path standing
-    for a finder that is not installed.
+    for a finder that is not installed. ``condense`` runs the diff pass,
+    which every other scenario skips with --no-condense.
     """
     env = os.environ.copy()
     env["PATH"] = f"{stub_path}:{env['PATH']}"
@@ -271,7 +285,7 @@ def run_pr_ready(worktree: Path, stub_path: Path, data_dir: Path,
     env["HOME"] = str(worktree.parent)
     return subprocess.run(
         ["bash", str(PR_READY), "42", str(worktree),
-         "--no-condense", *extra],
+         *([] if condense else ["--no-condense"]), *extra],
         capture_output=True, text=True, env=env,
     )
 
@@ -932,6 +946,49 @@ def main() -> int:
                                 f"{findings!r}"
                             )
                         sample_body.unlink()
+
+            # Scenarios 15-18 run the diff pass. A finder that crashed or
+            # printed something unreadable must refuse with a reason and exit
+            # 1, not end the script on the finder's own status.
+            def diff_pass(name, finder_out=None, crash=False):
+                data = tmp / f"data_diff_{name}"
+                data.mkdir()
+                install_fixtures(data, "never_started", oid, branch,
+                                 body="# What changed\n\nA short body.\n")
+                if finder_out is not None:
+                    (data / "find_prose_diff.json").write_text(finder_out)
+                if crash:
+                    (data / "find_prose_diff_fail").write_text("")
+                return data, run_pr_ready(worktree, bin_dir, data, condense=True)
+
+            # Scenario 15: the finder exits non-zero on the diff.
+            data, r = diff_pass("crash", crash=True)
+            if r.returncode != 1 or (data / "ready_called").exists():
+                failures.append(f"diff_crash should refuse: stderr={r.stderr.strip()!r}")
+            elif ("finder failed on the diff" not in r.stderr
+                  or "find_prose: simulated crash" not in r.stderr):
+                failures.append(f"diff_crash did not name the failure: {r.stderr!r}")
+
+            # Scenario 16: the finder prints something other than a JSON array.
+            data, r = diff_pass("garbage", finder_out="Traceback: not json\n")
+            if r.returncode != 1 or (data / "ready_called").exists():
+                failures.append(f"diff_garbage should refuse: stderr={r.stderr.strip()!r}")
+            elif "other than a JSON array" not in r.stderr:
+                failures.append(f"diff_garbage did not name the failure: {r.stderr!r}")
+
+            # Scenario 17: an empty finding list promotes.
+            data, r = diff_pass("clean", finder_out="[]\n")
+            if r.returncode != 0 or not (data / "ready_called").exists():
+                failures.append(f"diff_clean should promote: rc={r.returncode} "
+                                f"stderr={r.stderr.strip()!r}")
+
+            # Scenario 18: a finding refuses, as before.
+            data, r = diff_pass("flagged", finder_out=json.dumps(
+                [{"path": "a.md", "line": 1, "text": "long", "findings": ["oversize"]}]))
+            if r.returncode == 0 or (data / "ready_called").exists():
+                failures.append(f"diff_flagged should refuse: stderr={r.stderr.strip()!r}")
+            elif "flagged 1 block(s)" not in r.stderr:
+                failures.append(f"diff_flagged did not count the block: {r.stderr!r}")
 
         except AssertionError as e:
             failures.append(f"unexpected assertion error: {e}")

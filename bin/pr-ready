@@ -199,8 +199,21 @@ fi
 if [ "$CONDENSE" -eq 1 ]; then
 	if [ -x "$FIND_PROSE" ]; then
 		echo "==> condense-prose" >&2
-		FLAGGED=$("$FIND_PROSE" --diff "$BASE_REF" --json 2>/dev/null | jq 'length')
-		if [ "${FLAGGED:-0}" -gt 0 ]; then
+		# Checked here, not left to set -e, which would end the script with
+		# the finder's status and no reason. Refuse as the body pass does.
+		DIFF_ERR=$(mktemp -t pr-ready-diff-err-XXXXXX)
+		if ! DIFF_JSON=$("$FIND_PROSE" --diff "$BASE_REF" --json 2>"$DIFF_ERR"); then
+			ERR=$(cat "$DIFF_ERR")
+			rm -f "$DIFF_ERR"
+			refuse "condense-prose finder failed on the diff: ${ERR:-$FIND_PROSE exited non-zero}"
+			report
+		fi
+		rm -f "$DIFF_ERR"
+		if ! FLAGGED=$(jq -e 'if type == "array" then length else error("not an array") end' <<<"$DIFF_JSON" 2>/dev/null); then
+			refuse "condense-prose finder printed something other than a JSON array on the diff"
+			report
+		fi
+		if [ "$FLAGGED" -gt 0 ]; then
 			"$FIND_PROSE" --diff "$BASE_REF" >&2 || true
 			refuse "condense-prose flagged $FLAGGED block(s); cut them or pass --no-condense"
 			report
