@@ -118,6 +118,11 @@ when = '^(gates\.toml|tests/test_gate_coverage\.py|bin/|tests/test_[^/]*\.py)'
 run = "python3 tests/test_gate_coverage.py"
 
 [[gates]]
+name = "review phase tests"
+when = '^(pipeline/(review|common|pick_lane)\.(sh|py)|lib/common\.sh|tests/test_review_phase\.py)$'
+run = "python3 tests/test_review_phase.py"
+
+[[gates]]
 name = "triage-on-merge tests"
 when = '^(pipeline/triage-on-merge\.sh|bin/hermes-triage|tests/test_triage_on_merge\.py)$'
 run = "python3 tests/test_triage_on_merge.py"
