@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+# One review round on an open pull request: hand a posted review to a lane,
+# check what came back, and push it to the PR's own branch.
+#
+# The coordinator reviewing the PR may sit on another host, so the review
+# travels as a GitHub review id rather than a file, and everything this run
+# decided is appended to a ledger the coordinator reads with --status.
+set -euo pipefail
+
+BIN_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+# shellcheck source=../lib/common.sh
+. "$BIN_DIR/../lib/common.sh"
+# The gates call this checkout's tools by name, and a detached round starts
+# with whatever PATH a non-login ssh session had.
+export PATH="$BIN_DIR:$PATH"
+
+VERIFY_BIN=${AGENT_FIX_PR_VERIFY:-$BIN_DIR/gate-verify}
+# Optional: a command taking <worktree> <start-epoch> and printing a JSON array
+# of the models that answered the lane, for agents that can fall back to a
+# model other than the one asked for.
+MODELS_CMD=${AGENT_FIX_PR_MODELS:-}
+STATE_DIR=${AGENT_STATE_DIR:-$HOME/.local/state/agent-tools}
+
+usage() {
+	cat <<'EOF'
+usage: agent-fix-pr --pr N --review ID [--repo OWNER/NAME] [--profile NAME]
+                     [--worktree PATH] [--extra TEXT] [--max-rounds N] [--detach]
+       agent-fix-pr --resume --pr N [--repo OWNER/NAME] [--worktree PATH] [--detach]
+       agent-fix-pr --status --pr N [--repo OWNER/NAME]
+
+Runs the implementer on the PR's branch with review ID as the work item, then
+refuses to push unless the lane added commits on top of the PR's head, left the
+tree clean, and the gate passes. Pushes fast-forward only. A lane that pushes
+back on every comment commits nothing; its replies are posted all the same.
+
+The implementer is $PIPELINE_IMPLEMENTER, required, called as `<implementer> --issue N --worktree PATH --repo OWNER/NAME
+--extra BRIEF [--profile NAME]`, printing its run directory, which holds
+HANDOVER.md, as the last line. --profile passes through unread.
+
+--worktree defaults to $PIPELINE_WT_ROOT/<head branch> (~/wt/<head branch>)
+and is created there when missing. An existing tree must sit at the PR's head
+with nothing uncommitted: anything else is someone's work. The one exception is
+the commit the last round left unpushed, which the next round builds on and
+pushes along with its own.
+
+--max-rounds (default 5) counts every round this ledger has recorded for the
+PR, pushed or not, and refuses the next one.
+
+--resume takes the last round again from its checks, without a lane: for a
+round that committed and was not pushed because something other than its work
+failed, such as a gate that could not start. The tree must still be at the
+commit that round left. It records its own ledger line, which the cap does
+not count.
+
+--detach returns at once and keeps running after the caller's ssh session
+ends. --status prints the ledger (one JSON object per round) and whether a
+round is running now.
+
+Exit: 0 pushed, or answered with replies alone, 1 the round ran and neither
+pushed nor answered, 2 misuse, 3 the worktree is not at the PR's head, 4 the round cap is reached, 5 a round is running.
+EOF
+}
+
+PR="" REVIEW="" REPO=${DEFAULT_GH_REPO:-} PROFILE="" WORKTREE="" EXTRA=""
+MAX_ROUNDS=5 DETACH=0 STATUS=0 RESUME=0
+ARGS=("$@")
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--pr) PR="$2"; shift 2 ;;
+	--review) REVIEW="$2"; shift 2 ;;
+	--repo) REPO="$2"; shift 2 ;;
+	--profile) PROFILE="$2"; shift 2 ;;
+	--worktree) WORKTREE="$2"; shift 2 ;;
+	--extra) EXTRA="$2"; shift 2 ;;
+	--max-rounds) MAX_ROUNDS="$2"; shift 2 ;;
+	--detach) DETACH=1; shift ;;
+	--status) STATUS=1; shift ;;
+	--resume) RESUME=1; shift ;;
+	-h | --help) usage; exit 0 ;;
+	*) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
+	esac
+done
+[[ -n "$PR" && -n "$REPO" ]] || { usage >&2; exit 2; }
+
+LEDGER_DIR="$STATE_DIR/fix-pr/${REPO//\//_}-$PR"
+LEDGER="$LEDGER_DIR/rounds.jsonl"
+RUNNING="$LEDGER_DIR/running"
+mkdir -p "$LEDGER_DIR"
+
+# A detached round finds its own pid here, written by the caller that forked it.
+running_pid() {
+	local pid
+	pid=$(cat "$RUNNING" 2>/dev/null) || return 1
+	[[ "$pid" != "$$" ]] && kill -0 "$pid" 2>/dev/null && echo "$pid"
+}
+
+if [[ $STATUS -eq 1 ]]; then
+	[[ -s "$LEDGER" ]] && cat "$LEDGER"
+	if pid=$(running_pid); then
+		echo "running: pid $pid, log $(cat "$LEDGER_DIR/current-log" 2>/dev/null)"
+		exit 5
+	fi
+	exit 0
+fi
+
+RESUMED=false RESUME_TAG="" CARRIED=""
+LAST=$( [[ -s "$LEDGER" ]] && tail -1 "$LEDGER" || true)
+if [[ $RESUME -eq 1 ]]; then
+	RESUMED=true RESUME_TAG=-resume
+	if [[ -z "$LAST" ]] || [[ $(jq -r '.pushed' <<<"$LAST") != false ]] ||
+		[[ $(jq -r '.start' <<<"$LAST") == $(jq -r '.end' <<<"$LAST") ]]; then
+		echo "PR #$PR's last round left nothing unpushed to resume" >&2
+		exit 2
+	fi
+	REVIEW=$(jq -r .review <<<"$LAST")
+else
+	[[ -n "$REVIEW" ]] || { usage >&2; exit 2; }
+	[[ -n "${PIPELINE_IMPLEMENTER:-}" ]] || { echo "set PIPELINE_IMPLEMENTER to the agent's driver" >&2; exit 2; }
+	# Word-split, as the pipeline's own PIPELINE_VERIFY is, so the operator can
+	# prefix the agent's own settings: `env SOME_AGENT_OPTION=x <driver>`.
+	read -ra IMPLEMENT <<<"$PIPELINE_IMPLEMENTER"
+fi
+
+if pid=$(running_pid); then
+	echo "PR #$PR already has a round running (pid $pid)" >&2
+	exit 5
+fi
+
+# A resumed line repeats its round's checks; only lanes count.
+ROUNDS_RUN=$( [[ -s "$LEDGER" ]] && jq -s 'map(select(.resumed != true)) | length' "$LEDGER" || echo 0)
+ROUND=$((ROUNDS_RUN + 1))
+if [[ $RESUME -eq 1 ]]; then ROUND=$(jq -r .round <<<"$LAST"); fi
+if [[ $RESUME -eq 0 ]] && (( ROUND > MAX_ROUNDS )); then
+	echo "PR #$PR has had $((ROUND - 1)) rounds; the cap is $MAX_ROUNDS" >&2
+	exit 4
+fi
+
+if [[ $DETACH -eq 1 ]]; then
+	LOG="$LEDGER_DIR/round-$ROUND$RESUME_TAG.log"
+	# setsid: the caller is usually an ssh session, and its hangup would take a
+	# backgrounded child with it.
+	filtered=()
+	for a in "${ARGS[@]}"; do [[ "$a" == --detach ]] || filtered+=("$a"); done
+	setsid nohup "$0" "${filtered[@]}" >"$LOG" 2>&1 </dev/null &
+	echo "$!" >"$RUNNING"
+	echo "$LOG" >"$LEDGER_DIR/current-log"
+	echo "round $ROUND of PR #$PR started: pid $!, log $LOG"
+	exit 0
+fi
+
+echo "$$" >"$RUNNING"
+trap 'rm -f "$RUNNING"' EXIT
+
+pr_json=$(gh pr view "$PR" --repo "$REPO" --json headRefName,headRefOid,body,state)
+HEAD_BRANCH=$(jq -r .headRefName <<<"$pr_json")
+PR_HEAD=$(jq -r .headRefOid <<<"$pr_json")
+[[ $(jq -r .state <<<"$pr_json") == OPEN ]] || { echo "PR #$PR is not open" >&2; exit 2; }
+# The implementer works an issue; the PR's own reference is the one it is for.
+ISSUE=$(jq -r .body <<<"$pr_json" | grep -oiE '(closes|fixes|resolves|part of) #[0-9]+' | head -1 | grep -oE '[0-9]+' || true)
+[[ -n "$ISSUE" ]] || { echo "PR #$PR names no issue (Closes #N or Part of #N)" >&2; exit 2; }
+
+: "${WORKTREE:=${PIPELINE_WT_ROOT:-$HOME/wt}/$HEAD_BRANCH}"
+if [[ ! -d "$WORKTREE" ]]; then
+	REPO_DIR=${PIPELINE_REPO:?set PIPELINE_REPO, or pass --worktree for an existing tree}
+	git -C "$REPO_DIR" fetch --quiet origin "$HEAD_BRANCH"
+	git -C "$REPO_DIR" worktree add --quiet "$WORKTREE" "$HEAD_BRANCH"
+fi
+git -C "$WORKTREE" fetch --quiet origin "$HEAD_BRANCH"
+START=$(git -C "$WORKTREE" rev-parse HEAD)
+if [[ $RESUME -eq 1 ]]; then
+	# The round's own record, compared exactly: a tree that moved since, or a
+	# PR head someone else pushed, is no longer the round being resumed.
+	if [[ "$START" != $(jq -r .end <<<"$LAST") || "$PR_HEAD" != $(jq -r '.pr_head // .start' <<<"$LAST") ]]; then
+		echo "$WORKTREE or PR #$PR moved since round $ROUND; nothing to resume" >&2
+		exit 3
+	fi
+	START=$PR_HEAD
+elif [[ "$START" != "$PR_HEAD" ]]; then
+	# A round whose gate failed leaves its commit here unpushed. Building on it
+	# is the next round's job, but only that exact commit on that exact PR
+	# head: anything else in the tree is someone else's work.
+	if [[ -z "$LAST" || $(jq -r .pushed <<<"$LAST") != false ||
+		"$START" != $(jq -r .end <<<"$LAST") ||
+		"$PR_HEAD" != $(jq -r '.pr_head // .start' <<<"$LAST") ]] ||
+		! git -C "$WORKTREE" merge-base --is-ancestor "$PR_HEAD" "$START"; then
+		echo "$WORKTREE is at ${START:0:7}, PR #$PR's head is ${PR_HEAD:0:7}" >&2
+		exit 3
+	fi
+	CARRIED=$(git -C "$WORKTREE" log --format='%h %s' "$PR_HEAD..$START")
+fi
+if [[ -n "$(git -C "$WORKTREE" status --porcelain)" ]]; then
+	echo "$WORKTREE has uncommitted changes" >&2
+	exit 3
+fi
+
+if [[ $RESUME -eq 1 ]]; then
+	WORK=$(jq -r .work <<<"$LAST")
+else
+	# The review as the lane will read it: the summary, then each inline comment at
+	# the line it was left on.
+	review=$(gh api "repos/$REPO/pulls/$PR/reviews/$REVIEW" --jq '"Review by \(.user.login) at \(.commit_id[:7]):\n\n\(.body)"')
+	comments=$(gh api "repos/$REPO/pulls/$PR/reviews/$REVIEW/comments" --paginate \
+		--jq '.[] | select(.in_reply_to_id == null) | "### comment \(.id) at \(.path):\(.line // .original_line)\n\n\(.body)\n"')
+
+	CARRIED_NOTE=""
+	if [[ -n "$CARRIED" ]]; then
+		CARRIED_NOTE="The branch also carries the last round's commits, unpushed because the
+gate failed on them. Build on them rather than starting over:
+$CARRIED
+"
+	fi
+	BRIEF=$(cat <<-EOF
+	This is review round $ROUND on pull request #$PR, branch $HEAD_BRANCH. The
+	work item is the review below, not the issue: the issue is already implemented
+	on this branch. Follow the swe-review-fix skill, and answer each comment in
+	replies.json in your run directory, beside HANDOVER.md, as it describes.
+
+	$CARRIED_NOTE
+	$review
+
+	$comments
+
+	$EXTRA
+	EOF
+	)
+
+	START_EPOCH=$(date +%s)
+	IMPL_ARGS=(--issue "$ISSUE" --worktree "$WORKTREE" --repo "$REPO" --extra "$BRIEF")
+	[[ -n "$PROFILE" ]] && IMPL_ARGS+=(--profile "$PROFILE")
+	IMPL_OUT="$LEDGER_DIR/round-$ROUND.implement.out"
+	# Backgrounded and waited on so a signal to this wrapper reaches the lane too:
+	# a lane outliving its round keeps editing a tree nothing will push.
+	"${IMPLEMENT[@]}" "${IMPL_ARGS[@]}" >"$IMPL_OUT" &
+	child=$!
+	trap 'kill -TERM "$child" 2>/dev/null; wait "$child"; exit 143' TERM INT HUP
+	wait "$child" || true
+	trap - TERM INT HUP
+	WORK=$(tail -1 "$IMPL_OUT")
+
+fi
+END=$(git -C "$WORKTREE" rev-parse HEAD)
+REPLIES="$WORK/replies.json"
+
+# Which models answered. A hosted model at its limits can hand the session to
+# another and carry on, and the transcript reads the same either way.
+models=null
+if [[ $RESUME -eq 1 ]]; then
+	models=$(jq -c .models <<<"$LAST")
+elif [[ -n "$MODELS_CMD" ]]; then
+	models=$($MODELS_CMD "$WORKTREE" "$START_EPOCH" 2>/dev/null | jq -c 'if type == "array" then . else null end' 2>/dev/null) || models=null
+	[[ -n "$models" ]] || models=null
+fi
+
+verdict="" pushed=false gate=skipped
+if [[ "$END" == "$START" ]]; then
+	# Pushing back on every comment is a finished round: there is nothing to
+	# push, and the replies are its whole answer.
+	if [[ -s "$REPLIES" ]]; then verdict=answered; else verdict="no commit"; fi
+elif ! git -C "$WORKTREE" merge-base --is-ancestor "$START" "$END"; then
+	verdict="history rewritten"
+elif [[ -n "$(git -C "$WORKTREE" status --porcelain)" ]]; then
+	verdict="uncommitted changes"
+elif ! "$VERIFY_BIN" "$WORKTREE" >"$LEDGER_DIR/round-$ROUND.gate.log" 2>&1; then
+	gate=fail verdict="gate failed"
+else
+	gate=pass
+	# Fast-forward only, and checked rather than left to `set -e`: a round that
+	# dies here writes no ledger line, and the cap stops counting it.
+	if git -C "$WORKTREE" push --quiet origin "HEAD:refs/heads/$HEAD_BRANCH"; then
+		pushed=true verdict=pushed
+	else
+		verdict="push refused"
+	fi
+fi
+
+# Only after the push, or with nothing to push: a reply naming a commit the PR
+# does not have yet sends the reviewer to a sha that 404s, and one that names a
+# commit the branch never got is skipped for the same reason. Each entry is
+# checked on its own, so one malformed reply cannot cost the others.
+names_missing_commit() { # body
+	local word
+	for word in $(grep -oiwE '[0-9a-f]{7,40}' <<<"$1" | grep -iE '[a-f]' | grep -E '[0-9]'); do
+		git -C "$WORKTREE" merge-base --is-ancestor "$word" "$END" 2>/dev/null || return 0
+	done
+	return 1
+}
+replied=0
+if [[ ("$pushed" == true || "$verdict" == answered) && -s "$REPLIES" ]]; then
+	while IFS= read -r entry; do
+		id=$(jq -r '.comment_id // empty | tostring' <<<"$entry" 2>/dev/null || true)
+		body=$(jq -r '.body // empty | strings' <<<"$entry" 2>/dev/null || true)
+		if [[ ! "$id" =~ ^[0-9]+$ || -z "$body" ]]; then
+			echo "skipped malformed reply: $entry" >&2
+			continue
+		fi
+		if names_missing_commit "$body"; then
+			echo "skipped reply to $id naming a commit the branch does not have: $body" >&2
+			continue
+		fi
+		gh api -X POST "repos/$REPO/pulls/$PR/comments/$id/replies" -f body="$body" >/dev/null &&
+			replied=$((replied + 1)) || echo "could not reply to comment $id" >&2
+	done < <(jq -c '.[]?' "$REPLIES" 2>/dev/null || echo '"unreadable replies file"')
+fi
+
+handover=""
+[[ -n "$WORK" && -s "$WORK/HANDOVER.md" ]] && handover=$(cat "$WORK/HANDOVER.md")
+gh pr comment "$PR" --repo "$REPO" --body "$(cat <<EOF
+Review round $ROUND${RESUME_TAG:+ (resumed)} (review $REVIEW): **$verdict**, ${START:0:7} → ${END:0:7}, gate $gate.
+
+${handover:-No handover was written.}
+EOF
+)" >/dev/null || echo "could not comment on PR #$PR" >&2
+
+jq -cn --argjson round "$ROUND" --arg review "$REVIEW" --arg start "$START" --arg end "$END" \
+	--arg verdict "$verdict" --arg gate "$gate" --argjson pushed "$pushed" --arg pr_head "$PR_HEAD" \
+	--argjson models "$models" --argjson replied "$replied" --arg work "$WORK" \
+	--argjson resumed "$RESUMED" --arg at "$(date -u +%FT%TZ)" \
+	'{round:$round, review:$review, pr_head:$pr_head, start:$start, end:$end, verdict:$verdict,
+	  gate:$gate, pushed:$pushed, replied:$replied, models:$models, work:$work,
+	  resumed:$resumed, at:$at}' >>"$LEDGER"
+tail -1 "$LEDGER"
+[[ "$pushed" == true || "$verdict" == answered ]]

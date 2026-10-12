@@ -233,3 +233,8 @@ run = "python3 tests/test_push_guard.py"
 name = "lane rustc tests"
 when = '^(lib/lane-rustc|lib/common\.sh|lib/manifest\.py|bin/hermes-implement|pipeline/implement\.sh|tests/test_lane_rustc\.py|tests/test_hermes_implement_tmp\.py)$'
 run = "python3 tests/test_lane_rustc.py"
+
+[[gates]]
+name = "agent-fix-pr tests"
+when = '^(bin/agent-fix-pr|tests/test_agent_fix_pr\.py)$'
+run = "python3 tests/test_agent_fix_pr.py"
