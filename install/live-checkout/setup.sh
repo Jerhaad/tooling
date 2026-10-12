@@ -21,7 +21,7 @@ COPY_DIR=${LIVE_COPY_DIR:-$HOME/.local/bin}
 SCRIPTS_DIR=${HERMES_SCRIPTS_DIR:-$HOME/.hermes/scripts}
 CLAUDE_SKILLS_DIR=${CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}
 # The skills a Claude session loads. The rest of skills/ belongs to the agent.
-CLAUDE_SKILLS=(condense-prose hermes-review)
+CLAUDE_SKILLS=(condense-prose hermes-review pr-review-coordinator)
 
 CHECK=0
 [ "${1:-}" = "--check" ] && CHECK=1
