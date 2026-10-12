@@ -131,14 +131,25 @@ def run(cmd: list[str]) -> str:
 
 
 def changed_lines(base: str, paths: list[str]) -> dict[str, set[int]]:
-    """path -> line numbers the diff touches. ``base`` may be ``BASE..HEAD``."""
-    revs = base.split("..") if ".." in base else [base]
+    """path -> line numbers the diff touches. ``base`` may be ``BASE..HEAD``.
+
+    A single ref is rewritten to its merge base so ``git diff`` against it
+    includes uncommitted working-tree edits; an explicit ``A..B`` is left.
+    """
+    if ".." in base:
+        revs = base.split("..")
+    else:
+        merge_base = run(["git", "merge-base", base, "HEAD"]).strip()
+        revs = [merge_base]
     out = run(["git", "diff", "-U0", "--no-color", *revs, "--", *paths])
     touched: dict[str, set[int]] = defaultdict(set)
     current = None
     for line in out.splitlines():
         if line.startswith("+++ b/"):
             current = line[6:]
+        # A deleted file: its hunks belong to no file in the tree.
+        elif line.startswith("+++ /dev/null"):
+            current = None
         elif line.startswith("@@") and current:
             match = re.search(r"\+(\d+)(?:,(\d+))?", line)
             if match:
