@@ -154,10 +154,12 @@ if [[ "$PHASE" == readback ]]; then
 	acquire_review_slot "$PROFILE"
 	DIFF=$(mktemp -t hermes-readback-XXXXXX.diff)
 	git -C "$WT" diff "origin/$BASE_REF...origin/$HEAD_REF" >"$DIFF"
-	# Under set -e a failed hermes would exit here, before the message below.
-	set +e
-	timeout "$TIMEOUT" "$HERMES" -m hermes_cli.main \
-		-p "$PROFILE" --yolo -z "You are about to review a proposed change to the repository at $WT. The diff is at $DIFF.
+	# The readback goes to a file inside the worktree, so the agent's reply
+	# is dropped into $WT/READBACK.md after the helper strips the
+	# `session_id:` line that `chat -Q` writes first. The previous code
+	# passed the prompt as one argv string (`-z`) and read the reply
+	# straight off stdout; here the helper writes to $WT/READBACK.md.
+	readback_prompt="You are about to review a proposed change to the repository at $WT. The diff is at $DIFF.
 
 Do NOT review it yet. Do not write findings. Write a readback first, so the person who briefed you can correct the brief before you spend the review.
 
@@ -168,7 +170,26 @@ Read the diff and whatever source you need, then answer four things:
 3. Out of scope: what you will NOT report on, and why you believe it is out of scope.
 4. Open questions: anything whose answer would change what you report, that you cannot settle from the repository alone.
 
-Be concrete under 3 and 4. A vague readback is worse than none. Do not write to any file; reply with the readback itself." >"$WT/READBACK.md" 9>&-
+Be concrete under 3 and 4. A vague readback is worse than none. Do not write to any file; reply with the readback itself."
+	# The prompt file lives next to the worktree, in the directory
+	# REVIEW_WT_ROOT the operator pointed at -- the sibling of every
+	# review-pr-* it contains. Leaving the file behind the readback means
+	# a post-mortem has the exact text that produced the answer, and the
+	# path matches the shape of every other caller in this script.
+	readback_dir=$(dirname "$WT")
+	mkdir -p "$readback_dir"
+	readback_prompt_file="$readback_dir/readback-$PR.prompt"
+	printf '%s' "$readback_prompt" >"$readback_prompt_file"
+	# Under set -e a failed hermes would exit here, before the message below.
+	set +e
+	timeout "$TIMEOUT" "$BASH" -c '
+		. "$1/lib/common.sh"
+		shift
+		hermes_query "$@" 8>&- 9>&-
+	' bash "$BIN_DIR/.." \
+		"$HERMES -m hermes_cli.main" "$readback_prompt_file" \
+		"$WT/READBACK.md" "$readback_dir/readback-$PR.stderr" \
+		-p "$PROFILE" -- --yolo 9>&-
 	RC=$?
 	set -e
 	exec 9>&-

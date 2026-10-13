@@ -14,19 +14,50 @@ SCRIPT = REPO_ROOT / "skills" / "hermes-review" / "scripts" / "hermes-scrutinize
 
 FAKE_AGENT = textwrap.dedent("""\
     #!/usr/bin/env python3
-    import re, sys, time
+    import hashlib, os, re, sys, time
     args = sys.argv[1:]
-    prompt = args[args.index("-z") + 1]
-    findings = re.search(r"Write your findings to (\\S+)", prompt).group(1)
-    profile = args[args.index("-p") + 1] if "-p" in args else "default"
+    # hermes-scrutinize.sh now passes the prompt through
+    # `--query-file PATH` rather than `-z "$prompt"`. The stub has to
+    # pull it from the file pointed at and write findings there. (The
+    # previous `-z` path is gone -- a stub that still expects `-z`
+    # would IndexError on its first call.)
+    has_query_file = "--query-file" in args
+    query_sha = ""
+    if has_query_file:
+        qf = args[args.index("--query-file") + 1]
+        with open(qf, "rb") as fh:
+            data = fh.read()
+        query_sha = hashlib.sha256(data).hexdigest()
+    findings = None
+    if has_query_file:
+        # `Write your findings to <path>` is in the prompt body.
+        with open(args[args.index("--query-file") + 1], "r") as fp:
+            prompt = fp.read()
+        m = re.search(r"Write your findings to (\\S+)", prompt)
+        if m:
+            findings = m.group(1)
+    profile = (args[args.index("-p") + 1] if "-p" in args else "default")
     log = sys.argv[0] + ".log"
+    # First three space-separated tokens are the fixed parse contract:
+    # `kind profile ts`. Extra attributes follow as a single token
+    # (no spaces inside the value) so the existing `line.split()`
+    # does not fragment them into separate cells. Commas separate the
+    # key=value pairs.
+    query_attrs = (f"has_query_file={has_query_file},"
+                   f"query_sha={query_sha}")
     with open(log, "a") as f:
-        f.write(f"start {profile} {time.monotonic()}\\n")
+        f.write(f"start {profile} {time.monotonic()} {query_attrs}\\n")
     time.sleep(1.5)
-    with open(findings, "w") as f:
-        f.write("no findings\\n")
+    if findings is not None:
+        with open(findings, "w") as f:
+            f.write("no findings\\n")
     with open(log, "a") as f:
         f.write(f"end {profile} {time.monotonic()}\\n")
+    # --query-file PATH --oneshot -Q: simulate -Q by writing the
+    # `session_id: <id>` line to stdout before the answer, the way the
+    # real agent does. The helper strips that line, so the script's
+    # caller never sees it.
+    print("session_id: stub-session-123")
     print("0 findings")
 """)
 
@@ -64,11 +95,19 @@ def run_pair(profiles: tuple[str, str]) -> list[tuple[str, str, float]]:
             out, err = p.communicate(timeout=30)
             assert p.returncode == 0, f"exit {p.returncode}: {err}"
             assert Path(out.strip()).name == "FINDINGS.md", out
-        events = []
-        for line in (tmp / "agent.log").read_text().splitlines():
-            kind, profile, ts = line.split()
-            events.append((kind, profile, float(ts)))
-        return events
+        # Log lines have the fixed shape `<kind> <profile> <ts>` followed
+            # by zero or more `key=value` attributes (no spaces inside). Split
+            # the line on whitespace with a 3-token cap so the trailing
+            # attributes stay in the third slot; the test only needs the kind
+            # and the timestamp.
+            def parse_line(line):
+                parts = line.split(None, 3)
+                return parts[0], parts[1], float(parts[2])
+            events = []
+            for line in (tmp / "agent.log").read_text().splitlines():
+                kind, profile, ts = parse_line(line)
+                events.append((kind, profile, ts))
+            return events
 
 
 def run_n(profiles: tuple[str, ...],
@@ -93,9 +132,13 @@ def run_n(profiles: tuple[str, ...],
             assert p.returncode == 0, f"exit {p.returncode}: {err}"
             assert Path(out.strip()).name == "FINDINGS.md", out
         events = []
+        # `<kind> <profile> <ts>` plus optional key=value attributes. Cap
+        # the split so trailing attributes stay grouped in a single
+        # trailing slot; only the first three fields matter.
         for line in (tmp / "agent.log").read_text().splitlines():
-            kind, profile, ts = line.split()
-            events.append((kind, profile, float(ts)))
+            parts = line.split(None, 3)
+            kind, profile, ts = parts[0], parts[1], float(parts[2])
+            events.append((kind, profile, ts))
         return events
 
 
@@ -320,9 +363,11 @@ def test_two_scrutinize_calls_on_same_gpu_group_serialize():
             assert p.returncode == 0, f"exit {p.returncode}: {err}"
             assert Path(out.strip()).name == "FINDINGS.md", out
         events = []
+        # See run_pair for the log format.
         for line in (tmp / "agent.log").read_text().splitlines():
-            kind, profile, ts = line.split()
-            events.append((kind, profile, float(ts)))
+            parts = line.split(None, 3)
+            kind, profile, ts = parts[0], parts[1], float(parts[2])
+            events.append((kind, profile, ts))
         # Two reviewers on one GPU group must not overlap: the second
         # `start` lands after the first `end`. The lock wait happens
         # *outside* the agent's sleep, so the second's `start` is at least
@@ -358,9 +403,19 @@ FAKE_GH = textwrap.dedent("""\
 # file; the readback's reply goes to stdout.
 FAKE_REVIEW_AGENT = textwrap.dedent("""\
     #!/usr/bin/env python3
-    import os, re, sys, time
+    import hashlib, os, re, sys, time
     args = sys.argv[1:]
-    prompt = args[args.index("-z") + 1]
+    # hermes-review-pr now passes the prompt through `--query-file PATH`
+    # rather than `-z "$prompt"`. Reading it via the helper-backed file
+    # path gives the stub the same content the real agent would see.
+    has_query_file = "--query-file" in args
+    qf = None
+    if has_query_file:
+        qf = args[args.index("--query-file") + 1]
+    prompt = ""
+    if qf and os.path.exists(qf):
+        with open(qf, "r") as f:
+            prompt = f.read()
     m = re.search(r"Write your findings to (\\S+)", prompt)
     if m:
         findings = m.group(1)
@@ -370,6 +425,9 @@ FAKE_REVIEW_AGENT = textwrap.dedent("""\
             # clock.
             f.write(f"no findings from pid {os.getpid()} at {time.monotonic()}\\n")
     time.sleep(0.2)
+    # -Q: prepend the session_id marker; the helper strips it on the
+    # way back, so the script's caller never sees it on stdout.
+    print("session_id: stub-session-123")
     print("0 findings")
 """)
 

@@ -85,14 +85,10 @@ for n in "${STRANDED[@]:0:${PIPELINE_RESUME_MAX:-2}}"; do
 		echo "  issue $n: fails the gate; attempting repair from the log"
 		# Only around this direct hermes call: hermes-implement below takes the
 		# GPU lock itself, and holding it here too would deadlock.
-		(
-			exec 9>"$LOCK"
-			flock 9
-			acquire_gpu_lock "$PROFILE"
-			export_lane_build_env "$wt"
-			timeout "${PIPELINE_REPAIR_TIMEOUT:-3600}" $HERMES_BIN \
-				-p "$PROFILE" --no-restore-cwd --yolo -z \
-"The work in $wt is committed and fails the project's gate. Fix it there.
+		# The repair prompt is one argv string under `-z`, capped at 128 KiB;
+		# it goes through a file the helper reads with `--query-file`, leaving
+		# the run with the exact text the agent saw.
+		REPAIR_PROMPT="The work in $wt is committed and fails the project's gate. Fix it there.
 
 Every file you touch and every git command you run belongs to $wt. Pass git's
 -C option and that path. Do not create, switch or push a branch, and do not
@@ -109,7 +105,22 @@ commit that is there, which it usually does.
 Its output from the last run is below. Fix what it names and nothing else: this
 is a repair, not a second attempt at the feature.
 
-$(tail -60 "/tmp/nightly-resume-$n.log")" >/dev/null 2>&1 || true
+$(tail -60 "/tmp/nightly-resume-$n.log")"
+		REPAIR_PROMPT_FILE="/tmp/nightly-repair-$n.prompt"
+		printf '%s' "$REPAIR_PROMPT" >"$REPAIR_PROMPT_FILE"
+		(
+			exec 9>"$LOCK"
+			flock 9
+			acquire_gpu_lock "$PROFILE"
+			export_lane_build_env "$wt"
+			timeout "${PIPELINE_REPAIR_TIMEOUT:-3600}" "$BASH" -c '
+				. "$1/lib/common.sh"
+				shift
+				hermes_query "$@" 8>&-
+			' bash "$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" \
+				"$HERMES_BIN" "$REPAIR_PROMPT_FILE" \
+				"/tmp/nightly-repair-$n.stdout" "/tmp/nightly-repair-$n.stderr" \
+				-p "$PROFILE" -- --no-restore-cwd --yolo >/dev/null 2>&1 || true
 			exec 8>&-
 		)
 

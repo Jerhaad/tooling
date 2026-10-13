@@ -33,8 +33,16 @@ STATE_DIR=${PIPELINE_STATE_DIR:-$HOME/.local/state/agent-pipeline}
 # fit to push. Whatever proves your project correct goes here.
 VERIFY=${PIPELINE_VERIFY:?set PIPELINE_VERIFY to a command taking a worktree path}
 
-# The agent. A command taking a prompt on stdin-equivalent argv; see the phases
-# for how it is called.
+# The agent. The phases call `hermes_query "$AGENT" ...` from
+# lib/common.sh, passing the prompt through `--query-file` rather than
+# `-z "PROMPT"`. The helper takes the agent as one command string
+# and word-splits it itself, so `$AGENT` is whatever program plus
+# arguments the operator wants to run -- a path plus `-m module`,
+# a wrapper script, or a plain interpreter. The helper does not
+# add anything to the agent's argv (no -m, no chat), which is what
+# makes `$PIPELINE_AGENT="…/python -m hermes_cli.main"` work without
+# the module being named twice. The bin/ tools compose their agent
+# the same way and pass `"$HERMES -m hermes_cli.main"`.
 AGENT=${PIPELINE_AGENT:?set PIPELINE_AGENT to the agent CLI}
 
 # Which issues the implement phase will take. It only dispatches work its gate

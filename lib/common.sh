@@ -192,3 +192,118 @@ review_timeout_for() {
 	fi
 	printf '%s\n' "${HERMES_REVIEW_TIMEOUT:-900}"
 }
+
+# `hermes_query <agent_cmd> <prompt_file> <out_stdout> <out_stderr> [args...]`
+# runs the agent CLI with `chat --query-file FILE --oneshot -Q` and writes
+# stdout/stderr to the given paths. The prompt is read from a file the
+# caller owns (never an argv string), so a 200 KB brief with quotes, $(...)
+# and backticks survives intact instead of bumping into MAX_ARG_STRLEN.
+#
+# Argument convention. `<agent_cmd>` is a single string the helper
+# word-splits itself; the helper adds nothing to the agent's argv
+# (no -m, no chat). The remaining args after the four positionals are
+# split on the `--` sentinel:
+#
+#   hermes_query "AGENT_CMD" PROMPT OUT ERR -p PROFILE -- --skills X --yolo
+#
+# Everything before `--` is pre-chat (profile / model overrides) and goes
+# before the literal `chat` subcommand. Everything after `--` is post-chat
+# (--skills, --yolo, --no-restore-cwd, --continue, --resume) and goes
+# after `--query-file FILE --oneshot -Q`. A single `--` with nothing on
+# either side is fine: an empty pre or post is allowed. The two sentinels
+# split each side, so the helper takes exactly the args the caller
+# composed in two arrays.
+#
+# Callers compose AGENT_CMD in the shape the agent itself expects:
+#
+#   - bin/ tools and hermes-scrutinize.sh: "$HERMES -m hermes_cli.main"
+#   - pipeline phases: "$PIPELINE_AGENT" (a path plus args, split as
+#     one command line by the helper the same way `$HERMES` was
+#     split before this PR).
+#
+# This contract means the helper never adds `-m hermes_cli.main`
+# itself. A previous shape did: the helper took a single program
+# name and added `-m hermes_cli.main` after it. That broke callers
+# whose agent is already a multi-word command (the pipeline's
+# $PIPELINE_AGENT is `…/python -m hermes_cli.main`), and combined
+# with the helper returning 0 unconditionally, the nightly review
+# and triage did nothing while reporting no error.
+#
+# `chat -Q` writes one `session_id: <id>` line to stdout before the answer.
+# Callers whose downstream code reads stdout must drop it -- a
+# parsed-as-json answer that suddenly starts with `session_id:` is a real
+# defect. This helper filters that line out on its way back to the file
+# the caller named.
+#
+# The helper does NOT close fd 8 (GPU group lock) or fd 9 (review slot):
+# callers that need those closed in the child add `8>&- 9>&-` to their
+# own invocation. hermes-implement keeps them open so the GPU lock spans
+# retries; the review scripts close them so the child cannot outlive its
+# slot.
+#
+# The helper returns the agent's exit status, so callers reading the
+# code (`local rc=$?`, `RC=$?`) see what the agent actually did --
+# a `timeout`-killed agent's 124, or a hermes crash's 1, rather
+# than the 0 the helper's last `case` would otherwise leave behind.
+hermes_query() {
+	local agent_cmd="$1" prompt_file="$2" out_stdout="$3" out_stderr="$4"
+	shift 4
+	# Word-split the agent command into argv. The command is what the
+	# caller wants the helper to run -- nothing is appended, so a
+	# pipeline that names `python -m hermes_cli.main` gets exactly
+	# that, and a bin/ tool that names `hermes -m hermes_cli.main`
+	# gets the module on its own -m. read -ra splits on $IFS (default
+	# whitespace), which matches the way `$HERMES -p ...` was split
+	# before this helper existed.
+	local -a agent_words
+	read -ra agent_words <<<"$agent_cmd"
+	local pre=() post=()
+	local phase=pre
+	for arg in "$@"; do
+		if [ "$phase" = pre ] && [ "$arg" = "--" ]; then
+			phase=post
+			continue
+		fi
+		if [ "$phase" = pre ]; then
+			pre+=("$arg")
+		else
+			post+=("$arg")
+		fi
+	done
+	# An unset agent is the caller's bug, not ours: refuse with a name so
+	# the fix is the line they wrote.
+	if [ "${#agent_words[@]}" -eq 0 ]; then
+		echo "hermes_query: agent command is empty" >&2
+		return 2
+	fi
+	if [ -z "$prompt_file" ] || [ ! -r "$prompt_file" ]; then
+		echo "hermes_query: prompt file not readable: $prompt_file" >&2
+		return 2
+	fi
+	"${agent_words[@]}" "${pre[@]}" chat \
+		--query-file "$prompt_file" --oneshot -Q \
+		"${post[@]}" \
+		>"$out_stdout" 2>"$out_stderr"
+	# Save the agent's status before anything else. The function would
+	# otherwise return the status of the final `case` below, which is
+	# always 0, and a failed agent (or one that `timeout` killed) would
+	# look like a success to every caller that reads the code: the
+	# retry loop and the 124 handling in bin/hermes-implement, the
+	# `RC=$?` checks in bin/hermes-review-pr and hermes-scrutinize.sh.
+	local rc=$?
+	# Drop the `session_id: <id>` line that `chat -Q` writes on its first stdout
+	# line, ahead of the answer. Read only the first line so the marker is
+	# identified by *position*, not by pattern match -- an answer whose own
+	# first line happens to start with `session_id:` would otherwise have its
+	# real content rewritten. head/tail keeps the rest of the file untouched.
+	local first
+	first=$(head -n 1 "$out_stdout" 2>/dev/null || true)
+	case "$first" in
+	'session_id: '*)
+		tail -n +2 "$out_stdout" >"$out_stdout.tmp"
+		cat "$out_stdout.tmp" >"$out_stdout"
+		rm -f "$out_stdout.tmp"
+		;;
+	esac
+	return "$rc"
+}

@@ -118,19 +118,32 @@ $EXTRA
 EOF
 )
 
+PROMPT_FILE="$WORK/prompt.txt"
+printf '%s' "$PROMPT" >"$PROMPT_FILE"
+
 PROFILE_NAME="${PROFILE:-default}"
 acquire_review_slot "$PROFILE_NAME"
 acquire_gpu_lock "$PROFILE_NAME"
 TIMEOUT=$(review_timeout_for "$PROFILE_NAME" "$TIMEOUT_OPT")
 
+# The helper writes the prompt to a file under $WORK instead of as one
+# argv string (-z). Anything over 128 KiB is otherwise unreachable; here
+# the prompt is short but the path is uniform with the rest of the code.
+# 8>&- 9>&-: a hermes child that holds these fds keeps the lock until it
+# itself exits, long after this script has moved on (the lock spans one
+# review only). timeout is the outermost wrapper because the helper is
+# a sourced shell function not visible to a fresh `timeout` invocation.
 set +e
-HERMES_ARGS=(-z "$PROMPT" --skills swe-reviewer --yolo)
-[[ -n "$PROFILE" ]] && HERMES_ARGS=(-p "$PROFILE" "${HERMES_ARGS[@]}")
-[[ -n "$MODEL" ]] && HERMES_ARGS+=(-m "$MODEL")
-# 9>&-: a process hermes leaves behind would otherwise hold the lock forever.
-# 8>&-: same for the GPU group lock; the parent holds fd 8 only for this
-# single review, and the child should not.
-timeout "$TIMEOUT" "$HERMES" -m hermes_cli.main "${HERMES_ARGS[@]}" >"$WORK/stdout.txt" 2>"$WORK/stderr.txt" 8>&- 9>&-
+HERMES_QUERY_ARGS=(-p "$PROFILE" -- --skills swe-reviewer --yolo)
+[[ -n "$MODEL" ]] && HERMES_QUERY_ARGS=(-m "$MODEL" "${HERMES_QUERY_ARGS[@]}")
+timeout "$TIMEOUT" "$BASH" -c '
+	. "$1/lib/common.sh"
+	shift
+	hermes_query "$@" 8>&- 9>&-
+' bash "$LIB/.." \
+	"$HERMES -m hermes_cli.main" "$PROMPT_FILE" \
+	"$WORK/stdout.txt" "$WORK/stderr.txt" \
+	"${HERMES_QUERY_ARGS[@]}"
 RC=$?
 # The 8>&- 9>&- above closed both for the child only; release them here too.
 exec 9>&-

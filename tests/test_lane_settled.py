@@ -151,7 +151,13 @@ def make_fake_hermes(bin_dir: Path, *, commit_on_first: bool) -> Path:
     depending on `commit_on_first`, either commits to the worktree on
     its first call or exits 124 (a `timeout(1)` death code) without
     touching the tree. The path of the worktree comes in via
-    $FAKE_HERMES_WT; the prompt log goes to $FAKE_HERMES_LOG."""
+    $FAKE_HERMES_WT; the prompt log goes to $FAKE_HERMES_LOG.
+
+    hermes-implement now hands the prompt through `--query-file PATH`
+    (the helper in lib/common.sh), so the fake reads the file
+    `--query-file` points at and records its content. Reading `-z`
+    here would silently record an empty string -- the test would
+    fail for the right reason in the wrong place."""
     if commit_on_first:
         body = r"""#!/usr/bin/env bash
 # Fake hermes used by tests/test_lane_settled.py.
@@ -163,7 +169,7 @@ wt="$FAKE_HERMES_WT"
 prompt=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -z) prompt="$2"; shift 2 ;;
+    --query-file) prompt=$(cat "$2"); shift 2 ;;
     *)  shift ;;
   esac
 done
@@ -189,13 +195,15 @@ exit 0
 # records its prompt to the log so the test can read what the
 # resume loop said. Exit 124 is what `timeout(1)` returns when it
 # kills the child -- the value the lane records when a timed-out
-# attempt ends without a commit.
+# attempt ends without a commit. The prompt is read from the file
+# `--query-file` points at, not from argv (`-z`), because hermes-
+# implement now goes through the helper in lib/common.sh.
 set -eu
 log="$FAKE_HERMES_LOG"
 prompt=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -z) prompt="$2"; shift 2 ;;
+    --query-file) prompt=$(cat "$2"); shift 2 ;;
     *)  shift ;;
   esac
 done
