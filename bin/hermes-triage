@@ -15,6 +15,16 @@ QUEUE=${HERMES_TRIAGE_QUEUE:-$HOME/queue}
 # profiles on one machine do not block each other.
 LOCK=${HERMES_TRIAGE_LOCK:-/tmp/hermes-triage-$PROFILE.lock}
 
+# Sourced rather than called as `bash path/to/common.sh`: a sourced
+# common.sh exports `hermes_query` into the calling shell. The triage
+# loop still needs a child shell to wrap `timeout` around the helper
+# (timeout cannot call a parent's shell function directly), so the
+# absolute project root is computed once and passed as `$1` to the
+# subshell.
+TOOLS_ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck source=lib/common.sh
+. "$TOOLS_ROOT/lib/common.sh"
+
 usage() {
 	cat <<'EOF'
 usage: hermes-triage --repo PATH (--issue N | --all-open | --since-merge REF)
@@ -85,10 +95,26 @@ EOF
 		[[ -s "$out" ]] && break
 		local nudge="$prompt"
 		[[ $i -gt 1 ]] && nudge="You have not written $out yet, so the task is unfinished. Resume it with tool calls: read the issue and the tree, then write the file."
-		flock "$LOCK" timeout "$TIMEOUT" "$HERMES" -m hermes_cli.main -p "$PROFILE" \
-			-z "$nudge" --skills swe-triage --yolo \
-			>"$work/attempt$i.stdout" 2>"$work/attempt$i.stderr" || true
-	done
+		# The prompt is written under the work directory and given to hermes
+		# via --query-file, not `-z`. A short triage prompt fits either way,
+		# but the file path is the same shape every other caller uses, and
+		# keeping it on disk means a post-mortem has the text the agent saw.
+		# The bash-c subshell re-sources lib/common.sh so `hermes_query` is
+		# in scope; `timeout` and `hermes_query` are not visible to each
+		# other otherwise (a function call from `timeout` runs in a fresh
+		# shell).
+		local prompt_file="$work/attempt$i.prompt"
+		printf '%s' "$nudge" >"$prompt_file"
+		flock "$LOCK" timeout "$TIMEOUT" "$BASH" -c '
+				. "$1/lib/common.sh"
+				shift
+				hermes_query "$@" 8>&- 9>&-
+			' bash "$TOOLS_ROOT" \
+				"$HERMES -m hermes_cli.main" "$prompt_file" \
+				"$work/attempt$i.stdout" "$work/attempt$i.stderr" \
+				-p "$PROFILE" -- \
+				--skills swe-triage --yolo || true
+			done
 
 	if [[ -s "$out" ]]; then
 		echo "$out"

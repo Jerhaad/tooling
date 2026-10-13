@@ -43,12 +43,16 @@ BODY
 """)
 
 # A fake hermes that times out (exits 124) on the first invocation and
-# succeeds on the second. Each call logs its PID, timestamp, and whether
-# fd 8 was inherited (proves hermes-implement passed the GPU lock fd to
-# its children).
+# succeeds on the second. Each call logs its PID, timestamp, whether fd 8
+# was inherited (proves hermes-implement passed the GPU lock fd to its
+# children), and the prompt it received via --query-file. The prompt's
+# sha256 is part of the test's assertion -- a hermes that was passed
+# `-z "PROMPT"` would get the prompt as argv, but the helper that
+# hermes-implement uses reads it from `--query-file PATH`, so a stub that
+# does not have `--query-file` on argv never sees the prompt at all.
 FAKE_HERMES = textwrap.dedent("""\
     #!/usr/bin/env python3
-    import os, sys, time
+    import hashlib, os, sys, time
     args = sys.argv[1:]
     log = os.environ.get("FAKE_HERMES_LOG", "/tmp/fake_hermes.log")
 
@@ -60,11 +64,30 @@ FAKE_HERMES = textwrap.dedent("""\
     # open through the child's lifetime.
     fd8_held = os.path.exists("/proc/self/fd/8")
 
+    # --query-file is the path of the prompt; the helper writes the
+    # prompt there and the stub reads it back. If hermes-implement had
+    # gone through `-z "$prompt"` instead, this index would never match
+    # and the stub would not know what to record.
+    query_path = None
+    has_query_file = "--query-file" in args
+    if has_query_file:
+        query_path = args[args.index("--query-file") + 1]
+    query_sha = ""
+    query_bytes = 0
+    if query_path and os.path.exists(query_path):
+        with open(query_path, "rb") as qf:
+            data = qf.read()
+        query_bytes = len(data)
+        query_sha = hashlib.sha256(data).hexdigest()
+
     is_continue = "--continue" in args
     pid = os.getpid()
     ts = time.monotonic()
     with open(log, "a") as f:
-        f.write(f"call pid={pid} continue={is_continue} fd8={fd8_held} t={ts:.6f}\\n")
+        f.write(f"call pid={pid} continue={is_continue} fd8={fd8_held} "
+                f"has_query_file={has_query_file} "
+                f"query_bytes={query_bytes} "
+                f"query_sha={query_sha} t={ts:.6f}\\n")
         f.flush()
 
     if not is_continue:
@@ -182,11 +205,24 @@ def test_hermes_implement_holds_gpu_lock_across_retry():
             f"expected 2 hermes invocations, got {len(calls)}: {calls!r}")
         # Both calls must have inherited fd 8 (the GPU lock).
         for line in calls:
-            m = re.match(r"call pid=(\d+) continue=(\S+) fd8=(\S+)", line)
+            m = re.match(r"call pid=(\d+) continue=(\S+) fd8=(\S+) "
+                         r"has_query_file=(\S+) query_bytes=(\d+) "
+                         r"query_sha=(\S*) t=(\S+)", line)
             assert m, f"unparseable log line: {line!r}"
             assert m.group(3) == "True", (
                 f"hermes child did not inherit fd 8 from hermes-implement: "
                 f"{line!r}")
+            # The agent must have been called with --query-file, and the
+            # prompt file must have been readable. A hermes-implement that
+            # passed the prompt as `-z "$prompt"` would fail this: the
+            # stub never sees `--query-file` and query_bytes stays 0.
+            assert m.group(4) == "True", (
+                f"hermes-implement should call agent with --query-file; "
+                f"this means the prompt went over argv (-z) instead: "
+                f"{line!r}")
+            assert int(m.group(5)) > 0, (
+                f"hermes-implement's --query-file pointed at an empty or "
+                f"missing file: {line!r}")
         # First call is attempt 1 (no --continue), second is attempt 2
         # (with --continue).
         assert "continue=False" in calls[0], calls[0]

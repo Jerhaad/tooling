@@ -223,8 +223,29 @@ run() {
 	# recorded, which for this agent is its bound project folder rather than the
 	# worktree it was handed. It has committed in the wrong repository that way.
 	# hermes inherits fd 8, the GPU group lock, which spans every retry.
-	timeout "$TIMEOUT" "$HERMES" -m hermes_cli.main ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} "$@" --no-restore-cwd -z "$prompt" --skills "${HERMES_IMPLEMENT_SKILLS:-swe-updater,swe-tester}" --yolo \
-		>"$WORK/$label.stdout" 2>"$WORK/$label.stderr"
+	#
+	# The prompt goes through a file in the run directory, never as argv:
+	# `-z "$prompt"` cap'd at MAX_ARG_STRLEN (128 KiB), and a long brief with
+	# `$(...)` or backticks survived shell interpretation badly. The file is
+	# kept after the run, alongside the transcripts.
+	local prompt_file="$WORK/$label.prompt"
+	printf '%s' "$prompt" >"$prompt_file"
+	# Heredoc-arr args: --skills lives after `chat`, --no-restore-cwd also,
+	# and `--continue` (passed via "$@" by the retry loop) is what resumes an
+	# earlier session. Pre-chat is `-p`. timeout wraps the whole call and the
+	# subshell re-sources the helper so `hermes_query` is in scope; timeout
+	# itself cannot call a parent's shell function directly.
+	PRE=("${PROFILE_ARGS[@]}")
+	POST=(--skills "${HERMES_IMPLEMENT_SKILLS:-swe-updater,swe-tester}"
+	      --yolo --no-restore-cwd "$@")
+	timeout "$TIMEOUT" "$BASH" -c '
+		. "$1/lib/common.sh"
+		shift
+		hermes_query "$@"
+	' bash "$BIN_DIR/.." \
+		"$HERMES -m hermes_cli.main" "$prompt_file" \
+		"$WORK/$label.stdout" "$WORK/$label.stderr" \
+		"${PRE[@]}" -- "${POST[@]}"
 	local rc=$?
 	set -e
 	echo "$label: hermes exited $rc" >&2

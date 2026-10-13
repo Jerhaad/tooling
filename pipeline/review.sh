@@ -87,13 +87,32 @@ survive -- a finding it cannot locate is a finding it will discard.
 
 $(if [ -n "$PREV_NOTES" ]; then printf 'The previous review is in %s. Carry every one of its findings forward\nverbatim, including the ones you believe are fixed.\n\nDo not re-check them against the tree. The next phase verifies every finding\nand files issues from its verdicts, so checking here is work done twice by two\nmodels that can disagree -- and the one that disagrees here is the one nobody\nreads. Dropping a finding you judge fixed is how a real one disappears without\nanything recording the decision.' "$CTX/previous-review.md"; fi)"
 
+# The agent prompt is itself one argv string under `-z`, capped at 128 KiB.
+# The previous review and the changed-file list already travel as files,
+# so the prompt itself does too: a `--query-file PATH` is uniform and
+# leaves the run with a record of exactly what was asked. A file, not
+# stdin: keeping the prompt as a file after the run gives the next phase
+# the same shape for "what did the previous run see".
+PROMPT_FILE="$CTX/prompt.txt"
+printf '%s' "$PROMPT" >"$PROMPT_FILE"
+
 # The GPU group lock is taken in addition to the review's own constraints:
 # this phase runs hermes, and hermes holds the GPUs. The wait sits outside
 # the timeout, so a swap queued behind a reviewer cannot drain the timeout.
 acquire_gpu_lock "$PROFILE"
 
-timeout "${PIPELINE_REVIEW_TIMEOUT:-5400}" $HERMES -p "$PROFILE" \
-	--no-restore-cwd -z "$PROMPT" --skills swe-reviewer --yolo >"$AGENT_OUT" 2>&1 || true
+# timeout wraps the call. PIPELINE_AGENT is the generic name the phases
+# share, and the helper takes the agent command as $1 so the same path
+# serves any agent the operator chooses.
+timeout "${PIPELINE_REVIEW_TIMEOUT:-5400}" "$BASH" -c '
+	. "$1/lib/common.sh"
+	shift
+	hermes_query "$@" 8>&- 9>&-
+' bash "$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" \
+	"$HERMES" "$PROMPT_FILE" \
+	"$AGENT_OUT" "$CTX/agent.stderr" \
+	-p "$PROFILE" -- \
+	--no-restore-cwd --skills swe-reviewer --yolo || true
 
 if [ ! -s "$WORK/REVIEW_NOTES.md" ]; then
 	# stdout, per common.sh: the job runs --no-agent, so stderr is dropped on

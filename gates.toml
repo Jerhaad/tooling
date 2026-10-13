@@ -122,6 +122,16 @@ name = "review phase tests"
 when = '^(pipeline/(review|common|pick_lane)\.(sh|py)|lib/common\.sh|tests/test_review_phase\.py)$'
 run = "python3 tests/test_review_phase.py"
 
+# A behaviour pin for pipeline/triage.sh: the prompt reaches the
+# agent via --query-file (so a 200 KB triage prompt does not hit
+# MAX_ARG_STRLEN), a non-zero agent exit is reported on stdout, and
+# a multi-word $PIPELINE_AGENT starts and runs end-to-end. `bash -n`
+# parses; the suite proves behaviour.
+[[gates]]
+name = "triage phase tests"
+when = '^(pipeline/(triage|common|pick_lane)\.(sh|py)|lib/common\.sh|tests/test_triage_phase\.py)$'
+run = "python3 tests/test_triage_phase.py"
+
 [[gates]]
 name = "triage-on-merge tests"
 when = '^(pipeline/triage-on-merge\.sh|bin/hermes-triage|tests/test_triage_on_merge\.py)$'
@@ -190,6 +200,17 @@ run = "python3 tests/test_hermes_scrutinize.py"
 name = "GPU group lock tests"
 when = '^(lib/common\.sh|tests/test_gpu_lock\.py|bin/hermes-implement|skills/hermes-review/scripts/hermes-scrutinize\.sh|pipeline/(common|triage|implement)\.sh)$'
 run = "python3 tests/test_gpu_lock.py"
+
+# hermes_query is the lib/common.sh helper every tool uses to hand hermes
+# its prompt as a file (`--query-file PATH`) instead of one argv string
+# (`-z "$prompt"`). The test pins: a 200 KB prompt with quotes/$()/
+# backticks reaches the agent byte-for-byte, the `session_id:` line that
+# `chat -Q` writes is dropped before callers see stdout, and fd 8 stays
+# open so the GPU lock spans retries.
+[[gates]]
+name = "hermes_query tests"
+when = '^(lib/common\.sh|tests/test_hermes_query\.py)$'
+run = "python3 tests/test_hermes_query.py"
 
 # hermes-implement takes the GPU group lock once and holds it across every
 # retry, so a flapping model cannot race itself across GPUs.
