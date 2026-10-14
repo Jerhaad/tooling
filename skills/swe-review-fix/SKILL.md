@@ -1,7 +1,7 @@
 ---
 name: swe-review-fix
-description: Answers one posted code review on a pull request branch the caller has checked out — fixes what each comment asks, adds the test that would have caught it, commits on top of the branch, and writes a reply per comment for the caller to post. Never pushes, rewrites history, or answers on GitHub itself.
-version: 1.0.0
+description: Answers one posted code review on a pull request branch — fixes each comment, adds the test, commits, writes a reply per comment. Never pushes, rewrites history, or answers on GitHub itself.
+version: 1.1.0
 ---
 
 # Review round (`swe-review-fix`)
@@ -11,22 +11,32 @@ comments. This round turns those comments into commits the reviewer can check
 one by one. The caller pushes, and posts your replies, only after its own gate
 passes, so a reply naming a commit is a claim the caller will test.
 
-## What each comment gets
+## What each item gets
 
-Every comment in the brief is headed `### comment <id> at <path>:<line>`.
-Answer every one, in one of two ways:
+The brief has two kinds of items:
 
-- **Fix it.** Make the change the comment asks for, by the mechanism it names
+- **Body items, headed `### review`.** The text under that heading is the
+  reviewer's summary or numbered list. Each numbered or distinct request in the
+  body is its own item; answer each one under `"comment_id": "review"`.
+- **Line comments, headed `### comment <id> at <path>:<line>`.** Each one is
+  its own item.
+
+Replies may only use `review` or a line-comment id from the brief; an id the
+lane invents is refused with a reason and skipped.
+
+For each item, answer in one of two ways:
+
+- **Fix it.** Make the change the item asks for, by the mechanism it names
   when it names one. Add or change a test that fails without the fix, at the
-  layer the comment talks about: a route's response is tested through the
-  route, not through the repo function under it. Commit the fix on its own,
-  so the reply can name one sha.
-- **Push back.** When the comment is wrong about the code, say why with the
+  layer the item talks about: a route's response is tested through the route,
+  not through the repo function under it. One commit per item, named by the
+  reply.
+- **Push back.** When the item is wrong about the code, say why with the
   evidence: the file and line that shows it, or the command and its output.
   Change nothing for it. A reviewer would rather read a correct refusal than
   a fix for a bug that is not there.
 
-A comment marked P3 can be answered with a reason it is left alone, when fixing
+An item marked P3 can be answered with a reason it is left alone, when fixing
 it would widen the PR.
 
 ## The rules of the branch
@@ -44,19 +54,26 @@ it would widen the PR.
 ## Replies
 
 Write the replies file the brief names, as a JSON array with one object per
-comment:
+item. Body items use `"comment_id": "review"`. Line comments use their numeric
+id from the brief's heading:
 
 ```json
 [
-  {"comment_id": 123, "body": "Fixed in 1a2b3c4: the retry now stops after the first refused connection, and `refused_connection_returns_at_once` covers it."},
-  {"comment_id": 124, "body": "Left as is: the caller already validates this field (`handler.rs:72`), so a second check would only repeat it."}
+  {"comment_id": "review", "body": "**Item 1**: fixed in 1a2b3c4 ..."},
+  {"comment_id": "review", "body": "**Item 2**: pushed back ..."},
+  {"comment_id": 123, "body": "Fixed in 4d5e6f7: ..."}
 ]
 ```
 
-`comment_id` is the number from the comment's heading. Name the short sha of
-the commit that fixes it. A reply naming a commit the branch does not have is
-not posted. The file is posted even when you commit nothing, so a round that
-only pushes back still answers. One or two sentences: the reviewer has the diff.
+Each reply names the short sha of the commit that fixes the item, or the
+reason it is left alone. The validator drops a reply whose sha the branch
+lacks. The file posts without commits, so a push-back round answers.
 
-Then write HANDOVER.md as `swe-updater` describes, listing each comment id
-with fixed or pushed back.
+One or two sentences: the reviewer has the diff.
+
+For body items, write one entry per item under `"comment_id": "review"`, and
+start each reply by quoting the item it answers. The driver joins them into a
+single PR comment, separated by blank lines.
+
+Then write HANDOVER.md as `swe-updater` describes, listing each item id with
+fixed or pushed back.

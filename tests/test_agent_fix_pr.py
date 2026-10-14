@@ -27,6 +27,24 @@ BIN = REPO_ROOT / "bin" / "agent-fix-pr"
 REPO = "owner/proj"
 BRANCH = "feature"
 
+# Driver env vars the operator's shell sets. Tests must not see them: a
+# prior round had the operator's MODELS command run inside a test, asserting
+# the operator's output as the ledger. Strip once per env builder.
+_DRIVER_ENV_PREFIXES = ("PIPELINE_", "AGENT_FIX_PR_", "HERMES_IMPLEMENT_")
+
+
+def _clean_env(**extra):
+    """Return os.environ with driver settings stripped, plus extra.
+
+    The driver's settings are the operator's, not the test's. A test
+    asserting "no MODELS command was run" needs the keys absent, not a
+    local copy that happens to unset them.
+    """
+    base = {k: v for k, v in os.environ.items()
+            if not any(k.startswith(p) for p in _DRIVER_ENV_PREFIXES)}
+    base.update(extra)
+    return base
+
 FAKE_GH = textwrap.dedent("""\
     #!/usr/bin/env python3
     import json, os, subprocess, sys
@@ -45,7 +63,12 @@ FAKE_GH = textwrap.dedent("""\
         emit(canned["pr"])
     elif args[0] == "api" and "-X" not in args:
         path = args[1]
-        emit(canned["comments"] if path.endswith("/comments") else canned["review"])
+        if path.endswith("/comments"):
+            emit(canned.get("comments", []))
+        elif "/reviews/" in path:
+            emit(canned["review"])
+        else:
+            print(json.dumps({"path": path}))
     sys.exit(0)
 """)
 
@@ -75,7 +98,45 @@ def git(cwd, *args):
                           capture_output=True, text=True).stdout.strip()
 
 
-def setup(tmp: Path, *, body="Closes #7.", lane="commit", gate_rc=0, replies=None):
+def make_clone(tmp: Path, slug: str) -> tuple:
+    """A bare origin at a path the driver's URL check accepts, plus a working
+    clone whose remote URL has the same shape. Returns (clone, head) where
+    head is the commit the bare origin publishes for BRANCH."""
+    # Put the bare origin at tmp/<owner>/<name>.git: the URL ends with
+    # /<slug>.git, mirroring the production path so the file:// URL is
+    # recognised as for <slug> the same way https://github.com/<slug> would.
+    owner, name = slug.split("/", 1)
+    origin_dir = tmp / owner
+    origin_dir.mkdir(exist_ok=True)
+    origin = origin_dir / f"{name}.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    # An initial commit on the test branch so the driver can fetch it. A
+    # throwaway local clone builds it once, then pushes to the bare origin.
+    seed = tmp / f"seed-{slug.replace('/', '_')}"
+    subprocess.run(["git", "init", "-q", str(seed)], check=True)
+    subprocess.run(["git", "-C", str(seed), "config", "user.email", "t@example"], check=True)
+    subprocess.run(["git", "-C", str(seed), "config", "user.name", "t"], check=True)
+    (seed / "file.txt").write_text("start\n")
+    subprocess.run(["git", "-C", str(seed), "add", "file.txt"], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "-qm", "start"], check=True)
+    subprocess.run(["git", "-C", str(seed), "push", "-q", str(origin),
+                    f"HEAD:refs/heads/{BRANCH}"], check=True)
+    head = subprocess.run(["git", "-C", str(seed), "rev-parse", "HEAD"],
+                           capture_output=True, text=True, check=True).stdout.strip()
+    # The actual clone the driver reads. It points at the bare origin via a
+    # file:// URL and has the test branch fetched but not checked out, so
+    # the driver's worktree add can claim it.
+    clone = tmp / f"clone-{slug.replace('/', '_')}"
+    subprocess.run(["git", "init", "-q", str(clone)], check=True)
+    subprocess.run(["git", "-C", str(clone), "remote", "add",
+                    "origin", f"file://{origin.resolve()}"], check=True)
+    subprocess.run(["git", "-C", str(clone), "fetch", "-q", "origin"], check=True)
+    return clone, head
+
+
+def setup(tmp: Path, *, body="Closes #7.", lane="commit", gate_rc=0,
+           replies=None, review_body="Please fix.", comments=None,
+           repo=REPO, pr="5"):
     origin = tmp / "origin.git"
     subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
     wt = tmp / "wt"
@@ -89,14 +150,16 @@ def setup(tmp: Path, *, body="Closes #7.", lane="commit", gate_rc=0, replies=Non
     git(wt, "push", "-q", "-u", "origin", BRANCH)
     head = git(wt, "rev-parse", "HEAD")
 
+    if comments is None:
+        comments = [
+            {"id": 11, "path": "file.txt", "line": 1, "body": "[P1] wrong", "in_reply_to_id": None},
+            {"id": 12, "path": "file.txt", "line": 1, "body": "an earlier reply", "in_reply_to_id": 11},
+        ]
     data = tmp / "gh.json"
     data.write_text(json.dumps({
         "pr": {"headRefName": BRANCH, "headRefOid": head, "body": body, "state": "OPEN"},
-        "review": {"user": {"login": "reviewer"}, "commit_id": head, "body": "Please fix."},
-        "comments": [
-            {"id": 11, "path": "file.txt", "line": 1, "body": "[P1] wrong", "in_reply_to_id": None},
-            {"id": 12, "path": "file.txt", "line": 1, "body": "an earlier reply", "in_reply_to_id": 11},
-        ],
+        "review": {"user": {"login": "reviewer"}, "commit_id": head, "body": review_body},
+        "comments": comments,
     }))
     fakebin = tmp / "fakebin"
     fakebin.mkdir()
@@ -108,27 +171,29 @@ def setup(tmp: Path, *, body="Closes #7.", lane="commit", gate_rc=0, replies=Non
     gate.chmod(0o755)
 
     state = tmp / "state"
-    ledger_dir = state / "fix-pr" / f"{REPO.replace('/', '_')}-5"
+    ledger_dir = state / "fix-pr" / f"{repo.replace('/', '_')}-{pr}"
     replies_src = tmp / "replies.json"
-    replies_src.write_text(json.dumps(replies if replies is not None else
-                                      [{"comment_id": 11, "body": "Fixed."}]))
-    env = dict(os.environ,
-               PATH=f"{fakebin}:{os.environ['PATH']}",
-               AGENT_STATE_DIR=str(state),
-               TOOLS_ENV=str(tmp / "no-env"),
-               PIPELINE_IMPLEMENTER=str(fakebin / "implementer"),
-               AGENT_FIX_PR_VERIFY=str(gate),
-               FAKE_GH_LOG=str(tmp / "gh.log"),
-               FAKE_GH_DATA=str(data),
-               FAKE_LANE=lane,
-               FAKE_REPLIES=str(replies_src))
+    if replies is None:
+        replies = [{"comment_id": 11, "body": "Fixed."}]
+    replies_src.write_text(json.dumps(replies))
+    env = _clean_env(
+        PATH=f"{fakebin}:{os.environ['PATH']}",
+        AGENT_STATE_DIR=str(state),
+        TOOLS_ENV=str(tmp / "no-env"),
+        PIPELINE_IMPLEMENTER=str(fakebin / "implementer"),
+        AGENT_FIX_PR_VERIFY=str(gate),
+        FAKE_GH_LOG=str(tmp / "gh.log"),
+        FAKE_GH_DATA=str(data),
+        FAKE_LANE=lane,
+        FAKE_REPLIES=str(replies_src))
     return wt, origin, head, env, ledger_dir
 
 
-def run(env, wt, *extra, review=True):
+def run(env, wt, *extra, review=True, repo=REPO, pr="5", worktree=True):
     args = ["--review", "99"] if review else []
-    return subprocess.run([str(BIN), "--repo", REPO, "--pr", "5", *args,
-                           "--worktree", str(wt), *extra],
+    if worktree:
+        args += ["--worktree", str(wt)]
+    return subprocess.run([str(BIN), "--repo", repo, "--pr", pr, *args, *extra],
                           env=env, capture_output=True, text=True)
 
 
@@ -288,6 +353,39 @@ def test_models_come_from_the_runtime_command_or_are_null():
             assert ledger(ld)[-1]["models"] == expected, (script, ledger(ld)[-1])
 
 
+def test_models_setting_in_the_parent_environment_is_stripped():
+    # Round 1 of this PR's review surfaced this: operator-set MODELS made
+    # the (None, None) branch above see the operator's models, not null.
+    # The plant below exercises setup()'s strip.
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        leak = tmp / "leak_models"
+        leak.write_text("#!/bin/sh\necho '[\"leak\"]'\n")
+        leak.chmod(0o755)
+        planted = "AGENT_FIX_PR_MODELS" not in os.environ
+        if planted:
+            os.environ["AGENT_FIX_PR_MODELS"] = str(leak)
+        try:
+            wt, _, _, env, ld = setup(tmp)
+            # Sanity: the strip happened. If a future edit reverts it,
+            # AGENT_FIX_PR_MODELS reappears here and the assertion below
+            # names the leak in the operator's terms.
+            assert "AGENT_FIX_PR_MODELS" not in env, (
+                "setup() leaked AGENT_FIX_PR_MODELS from os.environ",
+                sorted(k for k in env if "MODELS" in k))
+            r = run(env, wt)
+            assert r.returncode == 0, (r.stdout, r.stderr)
+            entry = ledger(ld)[-1]
+            assert entry["models"] is None, (
+                "operator's MODELS_CMD reached the driver via setup()",
+                entry)
+            assert "leak" not in json.dumps(entry), (
+                "ledger contains the leaked command's output", entry)
+        finally:
+            if planted:
+                os.environ.pop("AGENT_FIX_PR_MODELS", None)
+
+
 def test_implementer_setting_is_word_split():
     with tempfile.TemporaryDirectory() as t:
         tmp = Path(t)
@@ -351,6 +449,48 @@ def test_resume_refuses_a_tree_that_moved():
         assert run(env, wt, "--resume", review=False).returncode == 3
 
 
+def test_resume_accepts_replies_on_an_old_ledger_line_without_comment_ids():
+    # The new validator keeps the older permissive rule (any numeric id or
+    # "review") for ledger lines without comment_ids, so a --resume against
+    # them still posts line-comment replies and `replied` counts them.
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        # Plant a ledger line as an old round would: a gate that failed
+        # left the lane's commit unpushed, the round had at least one
+        # line-comment reply, and comment_ids is missing.
+        wt, _, head, env, ld = setup(tmp, gate_rc=1)
+        run(env, wt)
+        lane_commit = git(wt, "rev-parse", "HEAD")
+        line_comment_reply = [{"comment_id": 11,
+                               "body": "Left as is: file.txt:1 already says start."}]
+        work_dir = Path(ledger(ld)[-1]["work"])
+        (work_dir / "replies.json").write_text(json.dumps(line_comment_reply))
+        # Replace the existing ledger line with one in the older shape, so
+        # the resume validator cannot find comment_ids.
+        legacy = {
+            "round": 1, "review": "99", "pr_head": head,
+            "start": head, "end": lane_commit, "verdict": "gate failed",
+            "gate": "fail", "pushed": False,
+            "models": None, "replied": 0,
+            "work": str(work_dir), "resumed": False,
+            "at": "2026-01-01T00:00:00Z",
+        }
+        (ld / "rounds.jsonl").write_text(json.dumps(legacy) + "\n")
+        set_gate(tmp, "exit 0")
+        r = run(env, wt, "--resume", review=False)
+        assert r.returncode == 0, r.stderr
+        # The line-comment reply went through as a threaded post — the old
+        # rule kicked in via the comment_ids fallback, and `replied` counted it.
+        threaded = [c for c in gh_calls(tmp) if "-X" in c
+                    and c[3].endswith("/comments/11/replies")]
+        assert len(threaded) == 1, threaded
+        # The resume line still has the new comment_ids field, computed from
+        # the fallback, so a follow-up round reads the same validator.
+        resumed_line = ledger(ld)[-1]
+        assert resumed_line["replied"] == 1, resumed_line
+        assert resumed_line["comment_ids"] == ["review", "*"], resumed_line
+
+
 def test_gate_finds_this_checkouts_tools_by_name():
     with tempfile.TemporaryDirectory() as t:
         tmp = Path(t)
@@ -408,6 +548,194 @@ def test_next_round_refuses_work_on_top_of_an_unpushed_round():
         (wt / "file.txt").write_text("someone else\n")
         git(wt, "commit", "-qam", "someone's work")
         assert run(env, wt).returncode == 3
+
+
+def _issue_comment_posts(calls):
+    # POSTs to issues/$PR/comments, distinct from threaded /comments/$id/replies.
+    return [c for c in calls
+            if "-X" in c and len(c) > 3
+            and "/issues/" in c[3] and c[3].endswith("/comments")]
+
+
+def test_brief_carries_the_review_body_under_a_review_heading():
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        body = "Two things:\n1. Use `review` not `head`.\n2. Drop the `id` field."
+        wt, _, _, env, _ = setup(tmp, review_body=body)
+        spy = tmp / "fakebin" / "implementer"
+        spy.write_text("#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" >\"$SPY\"\nmktemp -d\n")
+        env["SPY"] = str(tmp / "args")
+        run(env, wt)
+        args = (tmp / "args").read_text()
+        assert "### review" in args, args
+        assert body in args, args
+
+
+def test_body_only_review_posts_each_reply_as_an_issue_comment():
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        body = "1. Item one.\n2. Item two."
+        # Body items are commit-less, so the replies quote the items
+        # without naming a sha — the sha-skipper has nothing to fire on.
+        replies = [
+            {"comment_id": "review", "body": "> 1. Item one.\n\nAlready correct in the brief."},
+            {"comment_id": "review", "body": "> 2. Item two.\n\nLeft as is: this is the wrong file."},
+        ]
+        wt, _, _, env, ld = setup(tmp, review_body=body, comments=[],
+                                  replies=replies, lane="answer")
+        r = run(env, wt)
+        assert r.returncode == 0, r.stderr
+        entry = ledger(ld)[-1]
+        assert entry["verdict"] == "answered" and entry["replied"] == 2, entry
+        posts = _issue_comment_posts(gh_calls(tmp))
+        # All body replies go out as one PR comment, joined with a blank line,
+        # in the order the lane wrote them — counted as two replied items.
+        assert len(posts) == 1, posts
+        post = posts[0]
+        assert post[1] == "-X" and post[2] == "POST", post
+        assert post[3].endswith("issues/5/comments"), post
+        body_arg = post[post.index("-f") + 1]
+        # Joined with a blank line; both replies present, the lane's quoting
+        # survives the join.
+        assert "> 1. Item one." in body_arg and "> 2. Item two." in body_arg
+        assert "\n\n" in body_arg, body_arg
+
+
+def test_mixed_review_uses_each_kind_only_for_its_kind():
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        body = "Body item."
+        comments = [
+            {"id": 11, "path": "file.txt", "line": 1, "body": "line item", "in_reply_to_id": None},
+        ]
+        replies = [
+            {"comment_id": "review", "body": "> Body item.\n\nFixed."},
+            {"comment_id": 11, "body": "Fixed."},
+        ]
+        wt, _, _, env, ld = setup(tmp, review_body=body, comments=comments,
+                                  replies=replies)
+        r = run(env, wt)
+        assert r.returncode == 0, r.stderr
+        assert ledger(ld)[-1]["replied"] == 2, ledger(ld)[-1]
+        threaded = [c for c in gh_calls(tmp) if "-X" in c
+                    and c[-1].startswith("body=") and c[-1] == "body=Fixed."]
+        issue_posts = _issue_comment_posts(gh_calls(tmp))
+        # Body reply goes to issues/<PR>/comments, not as a threaded reply.
+        assert any(c[3].endswith("issues/5/comments") and "> Body item." in c[c.index("-f") + 1]
+                   for c in issue_posts), issue_posts
+        # The line-comment reply keeps posting to /comments/<id>/replies.
+        assert any(c[3].endswith("/comments/11/replies") for c in threaded), threaded
+
+
+def test_unknown_comment_id_is_refused_with_a_reason_and_does_not_drop_the_rest():
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        replies = [
+            {"comment_id": 9999, "body": "Made-up id."},
+            {"comment_id": 11, "body": "Fixed."},
+        ]
+        wt, _, _, env, ld = setup(tmp, replies=replies)
+        r = run(env, wt)
+        assert r.returncode == 0, r.stderr
+        assert ledger(ld)[-1]["replied"] == 1, ledger(ld)[-1]
+        assert "refused reply to unknown comment id 9999" in r.stderr, r.stderr
+        # The real reply still posted, on its own endpoint.
+        threaded = [c for c in gh_calls(tmp) if "-X" in c
+                    and c[3].endswith("/comments/11/replies")]
+        assert len(threaded) == 1, threaded
+
+
+def _ledger_path(ledger_dir):
+    return ledger_dir / "rounds.jsonl"
+
+
+def test_refuses_when_no_clone_can_fetch_the_pr_branch():
+    # The script picks a clone itself when --worktree is missing. With
+    # nothing set, it refuses before a round is recorded.
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        wt, _, _, env, ld = setup(tmp)
+        env.pop("PIPELINE_REPO", None)
+        env.pop("PIPELINE_REPO_OWNER_PROJ", None)
+        # The default worktree path is ~/wt/<branch>; redirect HOME so that
+        # path is empty and the script must fall back on a clone.
+        empty_home = tmp / "home-empty"
+        empty_home.mkdir()
+        env["HOME"] = str(empty_home)
+        r = run(env, wt, worktree=False, repo="owner/proj", pr="5")
+        assert r.returncode == 2, r.stderr
+        assert not _ledger_path(ld).exists(), "no round should be recorded"
+        assert "no checkout" in r.stderr, r.stderr
+
+
+def test_clone_is_chosen_per_repo_via_PIPELINE_REPO_owner_name():
+    # Two clones. PIPELINE_REPO points at the wrong repo's checkout; the
+    # per-repo override PIPELINE_REPO_OWNER_PROJ points at the right one.
+    # Without --worktree, the script must pick the override.
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        clone_other, _ = make_clone(tmp, "other/thing")
+        clone_proj, head = make_clone(tmp, "owner/proj")
+        data = tmp / "gh.json"
+        data.write_text(json.dumps({
+            "pr": {"headRefName": BRANCH, "headRefOid": head, "body": "Closes #7.", "state": "OPEN"},
+            "review": {"user": {"login": "reviewer"}, "commit_id": head, "body": "Please fix."},
+            "comments": [],
+        }))
+        replies_src = tmp / "replies.json"
+        replies_src.write_text(json.dumps([{"comment_id": "review", "body": "Pushed back."}]))
+        state = tmp / "state"
+        ledger_dir = state / "fix-pr" / "owner_proj-5"
+        env = _clean_env(
+            PATH=f"{tmp/'fakebin'}:{os.environ['PATH']}",
+            AGENT_STATE_DIR=str(state),
+            TOOLS_ENV=str(tmp / "no-env"),
+            # The wrong clone as the default, the right clone as the
+            # per-repo override: the per-repo must win.
+            PIPELINE_REPO=str(clone_other),
+            PIPELINE_REPO_OWNER_PROJ=str(clone_proj),
+            PIPELINE_IMPLEMENTER=str(tmp / "fakebin" / "implementer"),
+            AGENT_FIX_PR_VERIFY=str(tmp / "fakebin" / "gate"),
+            FAKE_GH_LOG=str(tmp / "gh.log"),
+            FAKE_GH_DATA=str(data),
+            FAKE_LANE="answer",
+            FAKE_REPLIES=str(replies_src),
+            PIPELINE_WT_ROOT=str(tmp / "wt-root"))
+        # Implementer and gate stand-ins in the env.
+        fakebin = tmp / "fakebin"
+        fakebin.mkdir()
+        for name, text in (("gh", FAKE_GH), ("implementer", FAKE_IMPLEMENTER)):
+            (fakebin / name).write_text(text)
+            (fakebin / name).chmod(0o755)
+        gate = fakebin / "gate"
+        gate.write_text("#!/bin/sh\nexit 0\n")
+        gate.chmod(0o755)
+        r = subprocess.run([str(BIN), "--repo", "owner/proj", "--pr", "5",
+                            "--review", "99"], env=env, capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        # The per-repo clone was used: a worktree was added under it.
+        assert (clone_proj / ".git" ).exists()
+        # The round was recorded with the override path's head.
+        line = _ledger_path(ledger_dir).read_text().strip().splitlines()[-1]
+        rec = json.loads(line)
+        assert rec["verdict"] == "answered", rec
+
+
+def test_refuses_to_use_a_clone_pointing_at_a_different_repo():
+    # PIPELINE_REPO points at a clone whose remote is for a different repo.
+    # The driver must refuse before any round is recorded.
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        clone_other, _ = make_clone(tmp, "other/thing")
+        wt, _, _, env, ld = setup(tmp)
+        env["PIPELINE_REPO"] = str(clone_other)
+        env.pop("PIPELINE_REPO_OWNER_PROJ", None)
+        env["PIPELINE_WT_ROOT"] = str(tmp / "wt-root")
+        r = run(env, wt, worktree=False, repo="owner/proj", pr="5")
+        assert r.returncode == 2, r.stderr
+        assert not _ledger_path(ld).exists(), "no round should be recorded"
+        assert "not for owner/proj" in r.stderr, r.stderr
+
 
 if __name__ == "__main__":
     failed = 0
