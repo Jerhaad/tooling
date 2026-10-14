@@ -269,35 +269,79 @@ fi
 # Held across every attempt: retries are one run's worth of GPU work.
 acquire_gpu_lock "$PROFILE"
 
-run attempt1 "$PROMPT"
+# A run is finished when the worktree is clean and HANDOVER.md is
+# non-empty. A 124 (or any other non-zero exit) falls through to the
+# next iteration; the resume prompt is what tells that attempt
+# where to pick up.
+finished() {
+	[[ -z "$(git -C "$WORKTREE" status --porcelain)" ]] \
+		&& [[ -s "$WORK/HANDOVER.md" ]]
+}
 
-# Resuming asks for the whole remaining task, never just the commit: a nudge
-# that names committing as the goal gets an unverified commit, which is the one
-# outcome worse than no commit at all -- it satisfies every check the caller can
-# cheaply make.
-#
-# A fix round's branch already has commits, so "done when a commit is on the
-# branch" holds on entry: name the base and ask for a new commit on top of it.
-REMAINING=$(cat <<EOF
+i=1
+while (( i <= ATTEMPTS )); do
+	label="attempt$i"
+	if (( i == 1 )); then
+		run "$label" "$PROMPT"
+	else
+		# The resume prompt names the current state (commits since
+		# the base, uncommitted files, HANDOVER.md presence) so the
+		# next attempt resumes the work that was outstanding, not
+		# work it imagines. It must frame a clean tree as what
+		# follows from finishing the work: framing it as the
+		# deliverable invites `git checkout -- .` / `git stash` /
+		# `git clean`, which `finished()` cannot tell from a tree
+		# the lane actually finished.
+		committed=$(git -C "$WORKTREE" log --oneline "$BASE"..HEAD 2>/dev/null \
+			|| true)
+		if [[ -z "$committed" ]]; then committed="(none)"; fi
+		uncommitted=$(git -C "$WORKTREE" status --short 2>/dev/null \
+			|| true)
+		if [[ -z "$uncommitted" ]]; then uncommitted="(none)"; fi
+		if [[ -s "$WORK/HANDOVER.md" ]]; then
+			handover_state="present"
+		else
+			handover_state="missing"
+		fi
+		REMAINING=$(cat <<EOF
 The task is not finished. Resume it with tool calls, not with a plan.
-HEAD on $BRANCH is still $BASE_SHORT -- nothing has been committed for this
-task. The deliverable is a new commit on top of $BASE_SHORT whose tree passes
-'$VERIFY', plus $WORK/HANDOVER.md. The issue is #$ISSUE at $WORK/issue.txt
+
+Base on $BRANCH was $BASE_SHORT. State now:
+- Committed since base:
+$committed
+- Uncommitted files:
+$uncommitted
+- $WORK/HANDOVER.md: $handover_state
+
+Finish each uncommitted change, verify it with '$VERIFY', and commit it
+on $BRANCH. A change you cannot verify stays uncommitted and is named in
+$WORK/HANDOVER.md. Never discard, stash, or reset work to make the tree
+clean -- a clean tree is what follows from finishing the work, not the
+goal in itself. The issue is #$ISSUE at $WORK/issue.txt.
 $EXTRA
-Follow the same brief the first attempt got: implement the change, run the
-verification, commit on $BRANCH, write $WORK/HANDOVER.md, and stop.
+
+Follow the same brief the first attempt got.
 EOF
 )
-
-for ((i = 2; i <= ATTEMPTS; i++)); do
-	[[ "$(git rev-parse HEAD)" != "$BASE" ]] && break
-	run "attempt$i" "$REMAINING" --continue
+		run "$label" "$REMAINING" --continue
+	fi
+	finished && break
+	i=$((i + 1))
 done
 
 exec 8>&-
 
-if [[ "$(git rev-parse HEAD)" == "$BASE" ]]; then
-	echo "FAILED: $ATTEMPTS attempts left $BRANCH at $BASE" >&2
+# Name the missing piece on a line of its own: stranded uncommitted files,
+# a committed branch with no handover, or a no-commit nothing-tried. The
+# new dirty-tree branch keeps the message from being hidden in the
+# generic FAILED line.
+DIRTY=$(git -C "$WORKTREE" status --porcelain 2>/dev/null || true)
+HEAD=$(git -C "$WORKTREE" rev-parse HEAD 2>/dev/null || echo "")
+if [[ -n "$DIRTY" ]]; then
+	echo "FAILED: $ATTEMPTS attempts left $BRANCH with uncommitted files:" >&2
+	printf '%s\n' "$DIRTY" >&2
+elif [[ "$HEAD" == "$BASE" ]]; then
+	echo "FAILED: $ATTEMPTS attempts left $BRANCH at $BASE_SHORT" >&2
 elif [[ ! -s "$WORK/HANDOVER.md" ]]; then
 	echo "WARNING: $BRANCH has a commit but no handover was written" >&2
 fi

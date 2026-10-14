@@ -161,11 +161,15 @@ def make_fake_hermes(bin_dir: Path, *, commit_on_first: bool) -> Path:
     if commit_on_first:
         body = r"""#!/usr/bin/env bash
 # Fake hermes used by tests/test_lane_settled.py.
-# On call #1 it commits a marker file inside the worktree so the lane's
-# branch tip moves off BASE and the resume loop should not run again.
+# On call #1 it commits a marker file inside the worktree AND writes
+# $TMPDIR/HANDOVER.md so the lane's two-part "finished" check
+# (clean tree + non-empty HANDOVER.md) both turn true. Without the
+# handover the lane would retry the same successful first attempt,
+# which is the bug the rewrite exercises.
 set -eu
 log="$FAKE_HERMES_LOG"
 wt="$FAKE_HERMES_WT"
+work="${TMPDIR:-}"
 prompt=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -184,6 +188,9 @@ if ! [[ -f "$log.first_done" ]]; then
     git -C "$wt" add io_marker.txt 2>/dev/null || true
     git -C "$wt" -c user.email=fake@x -c user.name=fake \
         commit -m "fake commit" 2>/dev/null || true
+  fi
+  if [[ -n "$work" ]] && [[ -d "$work" ]]; then
+    echo "stub handover" >"$work/HANDOVER.md"
   fi
 fi
 exit 0
@@ -303,18 +310,11 @@ def parse_prompts(log_text: str) -> list[str]:
 
 def hermes_implement_resume_cases(failures: list) -> None:
     """Drive bin/hermes-implement with a fake hermes and pin the
-    resume prompt against the four things the issue demands:
-
-      - names BASE's short sha (so the resumed model cannot say "done"
-        and stop because the branch already has the feature commit);
-      - says nothing has been committed for this run;
-      - says a new commit is required (deliverable on top of BASE);
-      - carries the --extra text the operator supplied.
-
-    A second case makes the opposite point: when the first attempt
-    actually commits, the resume loop must not run at all -- exactly
-    one prompt must be recorded. A regression that always resumed
-    ("just in case") would record two prompts and flunk this check."""
+    resume prompt: the base short sha, the per-iteration state
+    summary (committed + uncommitted + HANDOVER.md presence), and
+    the --extra text the operator supplied. The second case makes
+    the opposite point: a finished attempt records exactly one
+    prompt."""
 
     def _timeout_then_resume(tmp: Path) -> None:
         wt = make_branch_worktree(tmp, "wt-timeout")
@@ -346,21 +346,34 @@ def hermes_implement_resume_cases(failures: list) -> None:
             return
         resume = prompts[1]
 
+        # Resume (prompts[1]) must tell the model what the previous
+        # attempt left: the base short sha, the empty 'Committed
+        # since base' section, the 'Uncommitted files' header, and
+        # the missing HANDOVER.md marker.
         assert_in("timeout case: resume names BASE short sha",
                   base_short, resume, failures)
-        assert_in("timeout case: resume says nothing has been committed",
-                  "nothing has been committed", resume, failures)
-        assert_in("timeout case: resume says new commit is required",
-                  "new commit on", resume, failures)
+        assert_in("timeout case: resume says nothing committed",
+                  "Committed since base:", resume, failures)
+        assert_in("timeout case: committed section is empty",
+                  "(none)", resume, failures)
+        assert_in("timeout case: resume names uncommitted files header",
+                  "Uncommitted files:", resume, failures)
+        assert_in("timeout case: resume marks HANDOVER.md missing",
+                  "HANDOVER.md: missing", resume, failures)
         assert_in("timeout case: resume carries the --extra text",
                   extra_text, resume, failures)
-        # Restates the issue reference -- the issue is part of the brief.
         assert_in("timeout case: resume names the issue",
                   "issue is #0", resume, failures)
-        # The compile-claim that used to live here was false on a
-        # timeout (no commit was made at all), so the rewrite drops it.
+        # The compile-claim the old prose carried was false on a
+        # timeout -- the rewrite drops it.
         assert_not_in("timeout case: resume omits the compile-claim",
                       "code that did not compile", resume, failures)
+        # The prompt must describe the work and forbid discarding it;
+        # rationale is in test_hermes_implement.py's central pin.
+        assert_in("timeout case: resume forbids discarding the work",
+                  "Never discard, stash, or reset work", resume, failures)
+        assert_not_in("timeout case: resume does not frame a clean tree as the deliverable",
+                      "deliverable is a clean tree", resume, failures)
 
     def _first_call_commits(tmp: Path) -> None:
         wt = make_branch_worktree(tmp, "wt-commit")
