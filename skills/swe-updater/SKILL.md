@@ -120,9 +120,14 @@ Commit last. A commit made before the verification passed is the failure this
 skill exists to prevent: it clears every check the caller can cheaply make while
 leaving the work undone, so it is worse than no commit.
 
-One commit per verified fix. The message says **why the change exists** — the
-reader has the diff and does not need it listed back. A message that enumerates
-renamed identifiers or files touched is restating what `git show` already prints.
+Commit each finished, verified item on its own before starting the next:
+a timeout on the current item then loses at most one item.
+
+One commit per verified fix. The message says **why the change exists** —
+the reader has the diff and does not need it listed back. A message that
+enumerates renamed identifiers or files touched is restating what
+`git show` already prints. Comments describe what the code does and why;
+history belongs in the commit message, not in the source.
 
 The handover carries what the commit cannot: the mechanism you rejected and why,
 the mutation evidence from Phase 5, what you could not verify, and **anything

@@ -31,6 +31,7 @@ it would widen the PR.
 
 ## The rules of the branch
 
+- Commit each finished, verified comment on its own before starting the next.
 - New commits on top of the branch's head. Never amend, rebase, reset or
   squash: the caller refuses to push a branch whose history moved, and the
   reviewer reads this round as the commits added since their review.
