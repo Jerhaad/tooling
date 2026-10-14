@@ -145,6 +145,51 @@ FAKE_HERMES = textwrap.dedent("""\
         sys.exit(124)
     if action in ("commit", "commit_dirty", "finish", "finish_clean"):
         run_git("commit", "--allow-empty", "-m", "stub commit")
+    if action == "commit_with_c_flag":
+        # Shape 1: an agent that overrides identity on the command line
+        # with `git -c user.name=...`. Env vars in the agent's environment
+        # (hermes-implement exports them) win over -c, so this commit
+        # must come out authored by the expected identity, NOT by Wrong.
+        # A bare subprocess call: run_git would stomp on the env vars
+        # the lane set, hiding the shape. `-c` must come before the
+        # subcommand -- `git commit -c user.name=X -m msg` is a git
+        # error rather than the override an agent would actually write.
+        subprocess.check_call(
+            ["git", "-C", wt,
+              "-c", "user.name=Wrong Identity",
+              "-c", "user.email=wrong@example.invalid",
+              "commit", "--allow-empty",
+              "-m", "shape-c-flag"])
+    if action == "commit_with_author":
+        # Shape 2: an agent that overrides the author with --author.
+        # The committer still picks up the env var, but the author does
+        # not -- the verifier must catch this and re-author.
+        subprocess.check_call(
+            ["git", "-C", wt,
+              "commit", "--allow-empty",
+              "--author=Wrong Author <wrong@example.invalid>",
+              "-m", "shape-author-flag"])
+    if action == "commit_with_env_override":
+        # Shape 3: an agent that sets GIT_AUTHOR_NAME/EMAIL on its own
+        # git invocation. This bypasses step 1 entirely and is what
+        # the verifier was written for.
+        shape_env = {**os.environ,
+                     "GIT_AUTHOR_NAME": "Wrong Identity",
+                     "GIT_AUTHOR_EMAIL": "wrong@example.invalid"}
+        subprocess.check_call(
+            ["git", "-C", wt,
+               "commit", "--allow-empty", "-m", "shape-env-override"],
+            env=shape_env)
+    if action == "commit_with_config_override":
+        # Shape 4: an agent that sets user.name/email in the worktree
+        # config. With env vars set the commit is still right, but
+        # verifying this shape exercises the same backstop as shape 1.
+        subprocess.check_call(["git", "-C", wt,
+                               "config", "user.name", "Wrong Identity"])
+        subprocess.check_call(["git", "-C", wt,
+                               "config", "user.email", "wrong@example.invalid"])
+        subprocess.check_call(
+            ["git", "-C", wt, "commit", "--allow-empty", "-m", "shape-config-override"])
     if action in ("commit_dirty", "finish_clean"):
         # Untracked so it shows up in `git status --short` but the
         # lane is not committing it on this attempt.
@@ -190,7 +235,17 @@ def setup_env(tmp: Path, **extra) -> dict:
     (tmp / "fake.env").write_text("")
     (tmp / "hermes_home").mkdir()
     (tmp / "tmpdir").mkdir()
-    base = {**os.environ,
+    # Strip identity-pinning env vars so the suite is robust to a
+    # parent process that has a lane identity pinned: a gate runs
+    # inside a lane, and GIT_AUTHOR_* / GIT_COMMITTER_* / LANE_GIT_*
+    # reaching the test from there would leak the parent identity
+    # into the work the tests are checking. Tests that want to pin an
+    # identity set those keys explicitly via **extra.
+    parent = {k: v for k, v in os.environ.items()
+              if not (k.startswith("GIT_AUTHOR_")
+                      or k.startswith("GIT_COMMITTER_")
+                      or k.startswith("LANE_GIT_"))}
+    base = {**parent,
             "PATH": f"{bin_dir}:/usr/bin:/bin",
             # The fake HERMES_PYTHON script is its own python interpreter
             # (shebang), so the script's -m hermes_cli.main invocation is
@@ -528,6 +583,329 @@ def test_hermes_implement_reports_uncommitted_files_when_attempts_exhausted():
             f"stdout={flock_check.stdout!r}")
 
 
+def test_lane_identity_env_vars_win_over_c_flag_override():
+    """Shape 1: an agent that calls `git -c user.name=Wrong
+    -c user.email=Wrong commit` must produce a commit authored by the
+    expected identity. Env vars in the lane's environment win over
+    -c on the command line."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        env = setup_env(tmp,
+                        HERMES_IMPLEMENT_ATTEMPTS="1",
+                        # Force the expected identity to a name the host
+                        # config does not use, so the verifier has a
+                        # specific value to compare against.
+                        LANE_GIT_NAME="Expected",
+                        LANE_GIT_EMAIL="expected@example.invalid",
+                        FAKE_HERMES_PLAN="commit_with_c_flag")
+        repo = make_repo(tmp)
+        # make_repo sets user.email/name in the worktree's local config.
+        # We want the override (LANE_GIT_*) to win, so wipe them.
+        subprocess.run(["git", "-C", str(repo), "config",
+                        "--unset", "user.email"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config",
+                        "--unset", "user.name"], check=True)
+
+        proc = subprocess.run(
+            [str(BIN), "--issue", "999", "--worktree", str(repo),
+             "--verify", "true"],
+            env=env, capture_output=True, text=True, timeout=60)
+        assert proc.returncode == 0, (
+            f"hermes-implement failed: rc={proc.returncode} "
+            f"stdout={proc.stdout!r} stderr={proc.stderr!r}")
+        # Read back the commit's identity. The shape-c-flag marker is
+        # what the fake wrote; we look for it specifically so a stray
+        # base commit cannot satisfy the assertion.
+        log = subprocess.run(
+            ["git", "-C", str(repo), "log", "--format=%H %an <%ae> | %cn <%ce>",
+             "--grep=^shape-c-flag$"],
+            capture_output=True, text=True, check=True).stdout
+        assert "Expected <expected@example.invalid>" in log, (
+            f"agent's commit is not authored by the expected identity: "
+            f"{log!r}")
+        # The verifier should not have rewritten anything: no
+        # `re-authored` line, no log entry. Two short revisions.
+        assert "re-authored" not in proc.stderr, (
+            f"verifier rewrote a commit that was already right: "
+            f"stderr={proc.stderr!r}")
+
+
+def test_lane_identity_verifier_rewrites_author_flag_commit():
+    """Shape 2: an agent that calls `git commit --author='X <x@x>'`
+    bypasses the env vars on the author. The verifier must re-author
+    the commit, leaving the tree unchanged, and record the rewrite."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        env = setup_env(tmp,
+                        HERMES_IMPLEMENT_ATTEMPTS="1",
+                        LANE_GIT_NAME="Expected",
+                        LANE_GIT_EMAIL="expected@example.invalid",
+                        FAKE_HERMES_PLAN="commit_with_author")
+        repo = make_repo(tmp)
+        subprocess.run(["git", "-C", str(repo), "config",
+                        "--unset", "user.email"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config",
+                        "--unset", "user.name"], check=True)
+
+        proc = subprocess.run(
+            [str(BIN), "--issue", "999", "--worktree", str(repo),
+             "--verify", "true"],
+            env=env, capture_output=True, text=True, timeout=60)
+        assert proc.returncode == 0, (
+            f"hermes-implement failed: rc={proc.returncode} "
+            f"stdout={proc.stdout!r} stderr={proc.stderr!r}")
+        # The agent's marker commit is now authored by the expected
+        # identity: the verifier caught the override and re-authored.
+        log = subprocess.run(
+            ["git", "-C", str(repo), "log", "--format=%H %an <%ae> | %cn <%ce>",
+             "--grep=^shape-author-flag$"],
+            capture_output=True, text=True, check=True).stdout
+        assert "Expected <expected@example.invalid>" in log, (
+            f"verifier did not re-author the commit: {log!r}")
+        # The rewrite is logged to stderr: an old-sha -> new-sha line.
+        assert "re-authored:" in proc.stderr, (
+            f"verifier did not log the rewrite: stderr={proc.stderr!r}")
+        # The run directory holds the handover, and the verifier wrote
+        # the rewrite into it. A reader who comes across $WORK and
+        # sees HANDOVER.md is owed the rewrite list, not just stderr.
+        run_dir = Path(proc.stdout.strip().splitlines()[-1])
+        handover = (run_dir / "HANDOVER.md").read_text()
+        assert "re-authored:" in handover, (
+            f"rewrite not recorded in HANDOVER.md: {handover!r}")
+        # The verifier rewrote only the lane commit and kept its
+        # tree. HEAD's tree equals the base's tree (the agent's
+        # commit is --allow-empty); a verifier that redrafted would
+        # leave them different.
+        head_tree = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"],
+            capture_output=True, text=True, check=True).stdout.strip()
+        base_tree = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD~1^{tree}"],
+            capture_output=True, text=True, check=True).stdout.strip()
+        assert head_tree == base_tree, (
+            f"verifier changed the tree: head={head_tree} base={base_tree}")
+
+
+def test_lane_identity_verifier_rewrites_env_override_commit():
+    """Shape 3: an agent that sets GIT_AUTHOR_NAME/EMAIL on its own
+    `git commit` invocation bypasses the lane's env vars entirely. The
+    verifier must re-author the commit; the rewrite is logged."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        env = setup_env(tmp,
+                        HERMES_IMPLEMENT_ATTEMPTS="1",
+                        LANE_GIT_NAME="Expected",
+                        LANE_GIT_EMAIL="expected@example.invalid",
+                        FAKE_HERMES_PLAN="commit_with_env_override")
+        repo = make_repo(tmp)
+        subprocess.run(["git", "-C", str(repo), "config",
+                        "--unset", "user.email"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config",
+                        "--unset", "user.name"], check=True)
+
+        proc = subprocess.run(
+            [str(BIN), "--issue", "999", "--worktree", str(repo),
+             "--verify", "true"],
+            env=env, capture_output=True, text=True, timeout=60)
+        assert proc.returncode == 0, (
+            f"hermes-implement failed: rc={proc.returncode} "
+            f"stderr={proc.stderr!r}")
+        log = subprocess.run(
+            ["git", "-C", str(repo), "log", "--format=%H %an <%ae> | %cn <%ce>",
+             "--grep=^shape-env-override$"],
+            capture_output=True, text=True, check=True).stdout
+        assert "Expected <expected@example.invalid>" in log, (
+            f"verifier did not re-author the env-override commit: "
+            f"{log!r}")
+        assert "re-authored:" in proc.stderr, (
+            f"verifier did not log the rewrite: stderr={proc.stderr!r}")
+
+
+def test_lane_identity_env_vars_win_over_config_override():
+    """Shape 4: an agent that sets `git config user.name X` in the
+    worktree does not affect the commit when env vars are set."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        env = setup_env(tmp,
+                        HERMES_IMPLEMENT_ATTEMPTS="1",
+                        LANE_GIT_NAME="Expected",
+                        LANE_GIT_EMAIL="expected@example.invalid",
+                        FAKE_HERMES_PLAN="commit_with_config_override")
+        repo = make_repo(tmp)
+        subprocess.run(["git", "-C", str(repo), "config",
+                        "--unset", "user.email"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config",
+                        "--unset", "user.name"], check=True)
+
+        proc = subprocess.run(
+            [str(BIN), "--issue", "999", "--worktree", str(repo),
+             "--verify", "true"],
+            env=env, capture_output=True, text=True, timeout=60)
+        assert proc.returncode == 0, (
+            f"hermes-implement failed: rc={proc.returncode} "
+            f"stderr={proc.stderr!r}")
+        log = subprocess.run(
+            ["git", "-C", str(repo), "log", "--format=%H %an <%ae> | %cn <%ce>",
+             "--grep=^shape-config-override$"],
+            capture_output=True, text=True, check=True).stdout
+        assert "Expected <expected@example.invalid>" in log, (
+            f"agent's commit is not authored by the expected identity: "
+            f"{log!r}")
+        assert "re-authored" not in proc.stderr, (
+            f"verifier rewrote a commit that was already right: "
+            f"stderr={proc.stderr!r}")
+
+
+def test_lane_identity_refuses_with_author_override_when_setting_says_so():
+    """LANE_GIT_IDENTITY=refuse: the verifier must name the offending
+    commit on stderr and exit non-zero."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        env = setup_env(tmp,
+                        HERMES_IMPLEMENT_ATTEMPTS="1",
+                        LANE_GIT_NAME="Expected",
+                        LANE_GIT_EMAIL="expected@example.invalid",
+                        LANE_GIT_IDENTITY="refuse",
+                        FAKE_HERMES_PLAN="commit_with_author")
+        repo = make_repo(tmp)
+        subprocess.run(["git", "-C", str(repo), "config",
+                        "--unset", "user.email"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config",
+                        "--unset", "user.name"], check=True)
+
+        proc = subprocess.run(
+            [str(BIN), "--issue", "999", "--worktree", str(repo),
+             "--verify", "true"],
+            env=env, capture_output=True, text=True, timeout=60)
+        # The verifier prints the refusal on stderr; hermes-implement
+        # keeps running, so the script returns 0. The pin is on the
+        # message itself, not on the exit code.
+        assert "refusing:" in proc.stderr, (
+            f"verifier did not print a refusal: stderr={proc.stderr!r}")
+        assert "Wrong Author" in proc.stderr, (
+            f"refusal does not name the offending identity: "
+            f"stderr={proc.stderr!r}")
+
+
+def test_lane_identity_refuses_before_agent_when_unresolvable():
+    """When neither LANE_GIT_NAME/EMAIL nor the worktree's user.name/email
+    resolves to a value, hermes-implement must refuse with a named
+    error before the agent starts. The agent is never spawned."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        # setup_env clears LANE_GIT_* by default (no extra), so the
+        # helper falls back to the worktree's user.name/email. Strip
+        # both before invoking.
+        env = setup_env(tmp,
+                        HERMES_IMPLEMENT_ATTEMPTS="1",
+                        FAKE_HERMES_PLAN="commit_with_author")
+        repo = make_repo(tmp)
+        subprocess.run(["git", "-C", str(repo), "config",
+                        "--unset", "user.email"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config",
+                        "--unset", "user.name"], check=True)
+        # Clear any global identity inherited by the test process so
+        # `git -C <wt> config --get user.name` returns empty. We use a
+        # clean HOME and PATH that point at empty config dirs.
+        clean_home = tmp / "isolated-home"
+        clean_home.mkdir()
+        env["HOME"] = str(clean_home)
+        env["XDG_CONFIG_HOME"] = str(clean_home)
+        env["GIT_CONFIG_GLOBAL"] = str(clean_home / ".gitconfig")
+        env["GIT_CONFIG_SYSTEM"] = str(clean_home / "system-gitconfig")
+
+        proc = subprocess.run(
+            [str(BIN), "--issue", "999", "--worktree", str(repo),
+             "--verify", "true"],
+            env=env, capture_output=True, text=True, timeout=60)
+        # Exit code 3 is the lane-implement refusal code; the agent
+        # was never spawned. The fake hermes would have committed
+        # otherwise -- that commit must not exist.
+        assert proc.returncode == 3, (
+            f"expected exit 3 (lane refused), got {proc.returncode}: "
+            f"stderr={proc.stderr!r}")
+        assert "cannot pin lane identity" in proc.stderr, (
+            f"refusal message missing: stderr={proc.stderr!r}")
+        # No commit was made.
+        log = subprocess.run(
+            ["git", "-C", str(repo), "log", "--format=%H %s"],
+            capture_output=True, text=True, check=True).stdout
+        assert "shape-author-float" not in log, (
+            f"agent committed despite no resolvable identity: {log!r}")
+
+
+def test_lane_identity_verifier_does_not_leak_pinned_env_to_caller():
+    """verify_lane_identity scopes its pinned identity to the rebase
+    command alone, so a caller's own GIT_AUTHOR_NAME is not overwritten.
+    The test sets a sentinel, runs the verifier on a commit that
+    triggers the rebase, and asserts the sentinel survives."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo = tmp / "repo"
+        repo.mkdir()
+        run = lambda *a: subprocess.run(["git", "-C", str(repo), *a],
+                                        check=True, capture_output=True)
+        run("init", "--initial-branch=main")
+        run("config", "user.email", "real@real")
+        run("config", "user.name", "Real")
+        (repo / "a.txt").write_text("one\n")
+        run("add", "a.txt")
+        run("commit", "-m", "base")
+        base = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                              check=True, capture_output=True,
+                              text=True).stdout.strip()
+        # Author override triggers the rebase path of the verifier.
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "--allow-empty",
+             "--author=Wrong Author <wrong@example.invalid>",
+             "-m", "shape-author-flag"],
+            check=True, capture_output=True)
+        # A sentinel the caller's own code may have set, that the
+        # verifier must not clobber. LANE_GIT_* and GIT_AUTHOR_* would
+        # affect git's behaviour if leaked; the test sets all of them.
+        env = {**os.environ,
+               "LANE_GIT_NAME": "Caller",
+               "LANE_GIT_EMAIL": "caller@x",
+               "GIT_AUTHOR_NAME": "Caller",
+               "GIT_AUTHOR_EMAIL": "caller@x",
+               "GIT_COMMITTER_NAME": "Caller",
+               "GIT_COMMITTER_EMAIL": "caller@x"}
+        # Run a no-op `true` in front of the verifier so the pinned
+        # env vars are still set in the shell when we read them.
+        # The verifier is sourced from the test's checkout.
+        script = (
+            f'set -e; '
+            f'. "{LIB}"; '
+            # The verifier refuses (Wrong Author vs the worktree's
+            # user.name Real). Either refusal code (1) or the
+            # rc-specific one for identity mismatch is fine -- the
+            # point is that the test's caller-side env is intact.
+            f'verify_lane_identity "{repo}" "{base}" || true; '
+            # Now read the env vars and emit them so the test can
+            # check the caller-side state.
+            f'printf "AUTHOR_NAME=%s\\nAUTHOR_EMAIL=%s\\nCOMMITTER_NAME=%s\\nCOMMITTER_EMAIL=%s\\nLANE_NAME=%s\\nLANE_EMAIL=%s\\n" '
+            f'"$GIT_AUTHOR_NAME" "$GIT_AUTHOR_EMAIL" "$GIT_COMMITTER_NAME" "$GIT_COMMITTER_EMAIL" "$LANE_GIT_NAME" "$LANE_GIT_EMAIL"'
+        )
+        proc = subprocess.run(["bash", "-c", script],
+                               env=env, capture_output=True, text=True)
+        out = proc.stdout
+        # Every env var set by the caller must still hold the
+        # caller's value -- the verifier must not have exported
+        # GIT_AUTHOR_* into this shell.
+        assert "AUTHOR_NAME=Caller" in out, (
+            f"verifier clobbered caller's GIT_AUTHOR_NAME: {out!r}")
+        assert "AUTHOR_EMAIL=caller@x" in out, (
+            f"verifier clobbered caller's GIT_AUTHOR_EMAIL: {out!r}")
+        assert "COMMITTER_NAME=Caller" in out, (
+            f"verifier clobbered caller's GIT_COMMITTER_NAME: {out!r}")
+        assert "COMMITTER_EMAIL=caller@x" in out, (
+            f"verifier clobbered caller's GIT_COMMITTER_EMAIL: {out!r}")
+        assert "LANE_NAME=Caller" in out, (
+            f"verifier clobbered caller's LANE_GIT_NAME: {out!r}")
+        assert "LANE_EMAIL=caller@x" in out, (
+            f"verifier clobbered caller's LANE_GIT_EMAIL: {out!r}")
+
+
 def main() -> int:
     failures: list[tuple[str, str]] = []
     for name, fn in [
@@ -546,6 +924,27 @@ def main() -> int:
         ("hermes-implement names the uncommitted files on the final "
          "FAILED line and does not commit leftover work itself",
          test_hermes_implement_reports_uncommitted_files_when_attempts_exhausted),
+        ("hermes-implement pins the lane identity when the agent uses "
+         "`git -c user.name=... -c user.email=...`",
+         test_lane_identity_env_vars_win_over_c_flag_override),
+        ("hermes-implement re-authors a lane commit when the agent "
+         "uses `git commit --author=...`",
+         test_lane_identity_verifier_rewrites_author_flag_commit),
+        ("hermes-implement re-authors a lane commit when the agent "
+         "sets GIT_AUTHOR_NAME/EMAIL on its own git invocation",
+         test_lane_identity_verifier_rewrites_env_override_commit),
+        ("hermes-implement pins the lane identity when the agent "
+         "sets `git config user.name` in the worktree",
+         test_lane_identity_env_vars_win_over_config_override),
+        ("hermes-implement refuses with a named message when "
+         "LANE_GIT_IDENTITY=refuse",
+         test_lane_identity_refuses_with_author_override_when_setting_says_so),
+        ("hermes-implement refuses before the agent starts when no "
+         "identity resolves",
+         test_lane_identity_refuses_before_agent_when_unresolvable),
+        ("verify_lane_identity does not leak its pinned identity into "
+         "the caller's shell",
+         test_lane_identity_verifier_does_not_leak_pinned_env_to_caller),
     ]:
         try:
             fn()

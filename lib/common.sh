@@ -124,6 +124,178 @@ tree_name() { basename "$1" | tr -c 'A-Za-z0-9_' '_' | tr -s '_' | sed 's/_$//';
 
 repo_root() { (cd "${1:-$PWD}" && git rev-parse --show-toplevel); }
 
+# The identity a lane's commits must carry. The caller override is
+# LANE_GIT_NAME / LANE_GIT_EMAIL. Setting either one selects it;
+# setting only one is incomplete and refuses rather than mixing in
+# the worktree's config. With neither set, fall back to `git -C
+# <worktree> config user.name` / user.email. Both fields must
+# resolve; either empty returns non-zero so the caller can refuse
+# before the agent starts. No host, account or project name is
+# interpolated -- the identity is the operator's, not ours.
+lane_expected_identity() { # <worktree>  -> stdout: "<name>|<email>"
+	local wt="$1" name="" email=""
+	if [ -n "${LANE_GIT_NAME:-}${LANE_GIT_EMAIL:-}" ]; then
+		name=${LANE_GIT_NAME:-}
+		email=${LANE_GIT_EMAIL:-}
+	else
+		name=$(git -C "$wt" config --get user.name 2>/dev/null || true)
+		email=$(git -C "$wt" config --get user.email 2>/dev/null || true)
+	fi
+	if [ -z "$name" ] || [ -z "$email" ]; then
+		echo "cannot pin lane identity: set LANE_GIT_NAME and LANE_GIT_EMAIL, or configure user.name and user.email in $wt" >&2
+		return 1
+	fi
+	printf '%s|%s\n' "$name" "$email"
+}
+
+# Resolve the lane identity and export it as the env vars git reads
+# before user.name / user.email. Env vars win over `-c user.name=...`
+# and the worktree config, so the common case lands authored by the
+# expected identity. `--author` and `GIT_AUTHOR_NAME=...` on the
+# agent's command line bypass this; the verifier is the backstop.
+export_lane_identity_env() { # <worktree>
+	local identity name email
+	identity=$(lane_expected_identity "$1") || return $?
+	name=${identity%%|*}
+	email=${identity##*|}
+	export GIT_AUTHOR_NAME="$name"
+	export GIT_AUTHOR_EMAIL="$email"
+	export GIT_COMMITTER_NAME="$name"
+	export GIT_COMMITTER_EMAIL="$email"
+}
+
+# For each commit the lane added between BASE and HEAD, check that the
+# author and committer match the expected identity. When they do,
+# return 0 silently. When they don't, rewrite with `git rebase --exec
+# 'git commit --amend --no-edit --reset-author'` (the identity is
+# scoped to the rebase alone), or refuse if LANE_GIT_IDENTITY=refuse.
+# Each rewrite is logged to stderr and, when a handover path is given,
+# appended to the handover.
+#
+# Returns 0 when every lane commit matches, otherwise non-zero:
+#   1  identity mismatch in refuse mode (a lane commit's author or
+#      committer did not match the expected identity);
+#   2  base the lane rewrote out of ancestry (HEAD no longer carries
+#      the base as an ancestor -- replaying onto the original base
+#      would launder the rewrite);
+#   3  base does not resolve in the worktree (a typo or a branch not
+#      pushed yet);
+#   4  the rebase changed the tree (the old head is restored);
+#   5  the rebase could not start (a real conflict the agent left).
+# BASE is read with `git -C`, not interpolated, so a sha is exact.
+#
+# The ancestry check is the first thing: a lane that amended the base
+# makes HEAD no longer carry BASE as an ancestor. Refusing is the only
+# safe answer; replaying onto the original base would look like a clean
+# fast-forward and the rewritten-history refusal the caller has would
+# not fire.
+verify_lane_identity() { # <worktree> <base> [handover_path]
+	local wt="$1" base="$2" handover="${3:-}"
+	local identity name email old_head new_head mismatch=0 rewrites=() rc=0 base_sha head_sha
+	# The base must resolve to a sha; refusing is the only safe answer
+	# when it does not (a typo, a branch not pushed yet).
+	if ! base_sha=$(git -C "$wt" rev-parse --verify "$base" 2>/dev/null); then
+		echo "refusing: base '$base' does not resolve in $wt" >&2
+		return 3
+	fi
+	head_sha=$(git -C "$wt" rev-parse HEAD)
+	# Nothing to check: a lane that exited at BASE did not commit.
+	# An empty range makes `git log` print an error, so the comparison
+	# below treats it as a no-op.
+	[ "$base_sha" = "$head_sha" ] && return 0
+	# A lane that amended or rebased the base is rewritten history.
+	# The verifier must not launder that into a clean fast-forward by
+	# replaying the rewritten commit onto the original base.
+	if ! git -C "$wt" merge-base --is-ancestor "$base_sha" HEAD; then
+		echo "refusing: base $base_sha is not an ancestor of $head_sha in $wt (history rewritten)" >&2
+		return 2
+	fi
+	identity=$(lane_expected_identity "$wt") || return 1
+	name=${identity%%|*}
+	email=${identity##*|}
+	# Format %x1f separates the four fields so the parsing below is
+	# straightforward; `name <email>` alone could collide with a name
+	# that contains ` <` in theory and we'd rather not depend on it.
+	while IFS=$'\x1f' read -r sha a_name a_email c_name c_email; do
+		[ -z "$sha" ] && continue
+		if [ "$a_name" != "$name" ] || [ "$a_email" != "$email" ] \
+			|| [ "$c_name" != "$name" ] || [ "$c_email" != "$email" ]; then
+			mismatch=1
+			if [ "${LANE_GIT_IDENTITY:-}" = refuse ]; then
+				echo "refusing: commit $sha has author '$a_name <$a_email>' / committer '$c_name <$c_email>', expected '$name <$email>'" >&2
+				return 1
+			fi
+			break
+		fi
+	done < <(git -C "$wt" log --format='%H%x1f%an%x1f%ae%x1f%cn%x1f%ce' "$base..HEAD")
+	if [ "$mismatch" = 0 ]; then return 0; fi
+	old_head=$(git -C "$wt" rev-parse HEAD)
+	# The pinned identity is scoped to the rebase command alone
+	# (`env GIT_AUTHOR_NAME=… git …`) rather than exported into this
+	# function's caller: exporting would leak into the calling shell
+	# and every subprocess that follows (the gate, the push).
+	#
+	# --exec fires the amend for each replayed commit. The rebase may
+	# fail (a real conflict, the agent left dirty files, etc.); if it
+	# did, the subsequent diff would run against a half-rewritten
+	# branch and report a tree change that is really a rebase failure.
+	#
+	# mktemp, not /tmp/verify-lane-identity.$$: the previous name was
+	# fixed, so two lanes on the same pid collided and a lane that
+	# set TMPDIR kept nothing under it. mktemp uses $TMPDIR, then we
+	# read its contents into the error message and remove it -- the
+	# message names what git said rather than pointing at a file that
+	# no longer exists.
+	err=$(mktemp)
+	if ! env GIT_AUTHOR_NAME="$name" GIT_AUTHOR_EMAIL="$email" \
+		GIT_COMMITTER_NAME="$name" GIT_COMMITTER_EMAIL="$email" \
+		git -C "$wt" -c rebase.missingCommitsCheck=ignore \
+		rebase --exec 'git -c user.name= -c user.email= commit --amend --no-edit --reset-author --allow-empty' \
+		"$base" 2>"$err"; then
+		git -C "$wt" rebase --abort 2>/dev/null || true
+		echo "refusing: could not re-author commits in $wt: $(tr '\n' ' ' <"$err")" >&2
+		rm -f "$err"
+		return 5
+	fi
+	rm -f "$err"
+	new_head=$(git -C "$wt" rev-parse HEAD)
+	# Trees must be byte-identical: the rewrite is a re-author, not
+	# a redraft. A non-empty diff means the agent did something we
+	# cannot safely hand the expected identity for; restore the old
+	# head and refuse.
+	if [ -n "$(git -C "$wt" diff "$old_head" "$new_head")" ]; then
+		git -C "$wt" reset --hard "$old_head" >/dev/null 2>&1 || true
+		echo "refusing: rebase in $wt changed the tree; restored $old_head" >&2
+		return 4
+	fi
+	# Record each rewritten commit (old sha -> new sha) so a reader of
+	# the run directory knows the branch was rewritten. The pair is
+	# by ordinal, not by content, because the rebased commit has new
+	# parents and is otherwise indistinguishable from the old.
+	local -a old_shas=() new_shas=()
+	while IFS= read -r sha; do old_shas+=("$sha"); done < <(git -C "$wt" log --format='%H' "$base..$old_head" | tac)
+	while IFS= read -r sha; do new_shas+=("$sha"); done < <(git -C "$wt" log --format='%H' "$base..$new_head" | tac)
+	local i
+	for ((i = 0; i < ${#old_shas[@]}; i++)); do
+		# Sanity: lengths must match; otherwise the rebase dropped a
+		# commit (an unlikely failure mode, but the cost of catching it
+		# is one line and the cost of missing it is a silent rebase
+		# that produced a different shape).
+		[ $i -lt ${#new_shas[@]} ] || break
+		rewrites+=("${old_shas[$i]} -> ${new_shas[$i]}")
+	done
+	for r in "${rewrites[@]}"; do
+		echo "re-authored: $r" >&2
+		if [ -n "$handover" ]; then
+			# Append: the handover may already exist with its own
+			# content, and the verifier writer who rotates through
+			# rounds must see every rewrite, not just the last.
+			printf '%s\n' "- re-authored: $r" >>"$handover"
+		fi
+	done
+	return 0
+}
+
 # Returns holding a review slot for PROFILE on fd 9, waiting for one first.
 # The wait sits outside the review's timeout, because a review queued inside a
 # single-slot model server spends its timeout waiting and dies having written

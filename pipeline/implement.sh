@@ -113,6 +113,12 @@ $(tail -60 "/tmp/nightly-resume-$n.log")"
 			flock 9
 			acquire_gpu_lock "$PROFILE"
 			export_lane_build_env "$wt"
+			# Pin the lane identity before the repair agent starts. The
+			# env vars reach the agent via the timeout subshell; the
+			# verifier before push is the backstop for one that overrode
+			# them. Refusing here makes a missing identity a named error
+			# rather than a repair that pushes as nobody.
+			export_lane_identity_env "$wt"
 			timeout "${PIPELINE_REPAIR_TIMEOUT:-3600}" "$BASH" -c '
 				. "$1/lib/common.sh"
 				shift
@@ -138,6 +144,29 @@ $(tail -60 "/tmp/nightly-resume-$n.log")"
 			continue
 		fi
 		echo "  issue $n: repaired"
+	fi
+	# Re-author lane commits before pushing: a repair agent that
+	# overrode the identity would otherwise push a commit pointing
+	# at nobody. A refusal skips the push and the PR: pushing what
+	# the verifier refused on would land the same wrong-author
+	# commit on main. The base is the actual fork sha (merge-base
+	# against origin/main), not the remote branch: this branch is
+	# being pushed for the first time below, so `origin/<branch>`
+	# does not exist yet, and a ref that fails to resolve makes the
+	# verifier refuse with exit 3 (base unresolved) on every first push.
+	#
+	# Resume trees have no recorded base: the lane was created by an
+	# earlier run that did not write one to disk, and we have no
+	# other way to recover its fork. Merge-base is the best we can
+	# do here; a resume tree that rewrote main's tip can still slip
+	# through this check -- it is a known gap on the resume path.
+	lane_base=$(git -C "$wt" merge-base origin/main HEAD) || {
+		echo "  issue $n: could not resolve base for $wt" >&2
+		continue
+	}
+	if ! verify_lane_identity "$wt" "$lane_base"; then
+		echo "  issue $n: identity verifier refused; skipping push and PR" >&2
+		continue
 	fi
 	git -C "$wt" push -q -u origin "${BRANCH_PREFIX}$n"
 	pr=$(gh pr create --repo "$GH_REPO" --draft \
@@ -192,6 +221,16 @@ fi
 # add leaves no claim, and inside the gitdir so a repair's `add -A` cannot
 # stage it.
 : >"$(git -C "$worktree" rev-parse --git-dir)/nightly-owned"
+# The lane's fork point as the script sees it: the sha at worktree creation,
+# not a merge-base computed later. A lane that amends main's tip in the
+# worktree rewrites the ancestry so that `merge-base origin/main HEAD`
+# returns the tip's parent, and the amended tip then looks like a lane
+# commit the verifier is free to re-author. Recording the base here means
+# the verifier is asked "is the recorded fork still reachable from HEAD?",
+# and an amended tip breaks that. The resume path below has no such record
+# (the tree it picks up is one an earlier run left behind) and stays
+# on merge-base, with a comment noting why.
+lane_base=$(git -C "$worktree" rev-parse HEAD)
 
 verify="$VERIFY $worktree"
 mechanisms=$(sed -n '/^## Candidate mechanisms/,/^## Verdict on scope/p' "$QUEUE/${BRANCH_PREFIX}$issue.md")
@@ -227,6 +266,21 @@ if ! $VERIFY "$worktree" >/tmp/nightly-bench-$issue.log 2>&1; then
 	exit 0
 fi
 
+# Re-author lane commits before pushing: the implementer pins env
+# vars, this catches the agent that bypassed them. The rebase must
+# leave the tree unchanged; if it doesn't, the verifier restores the
+# old head and refuses. A refusal skips the push and the PR.
+# The base is the lane's recorded fork (lane_base, set right after
+# the `worktree add` above) rather than a fresh `merge-base origin/main
+# HEAD`: a lane that amended main's tip in the worktree rewrites
+# ancestry so merge-base returns the tip's parent, and the amended
+# tip then looks like a lane commit the verifier is free to re-author.
+# The recorded sha survives the rewrite and the verifier's ancestry
+# check refuses instead.
+verify_lane_identity "$worktree" "$lane_base" || {
+	echo "issue $issue: identity verifier refused; skipping push and PR" >&2
+	exit 0
+}
 git -C "$worktree" push -q -u origin "$branch"
 
 # A branch nobody opens is where the last loop leaked: the work landed and the

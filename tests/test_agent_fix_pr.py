@@ -29,8 +29,11 @@ BRANCH = "feature"
 
 # Driver env vars the operator's shell sets. Tests must not see them: a
 # prior round had the operator's MODELS command run inside a test, asserting
-# the operator's output as the ledger. Strip once per env builder.
-_DRIVER_ENV_PREFIXES = ("PIPELINE_", "AGENT_FIX_PR_", "HERMES_IMPLEMENT_")
+# the operator's output as the ledger. A lane-pinned identity in the parent
+# env would leak into the tests, so the GIT_*/LANE_GIT_ prefixes are
+# stripped too. Strip once per env builder.
+_DRIVER_ENV_PREFIXES = ("PIPELINE_", "AGENT_FIX_PR_", "HERMES_IMPLEMENT_",
+                        "GIT_AUTHOR_", "GIT_COMMITTER_", "LANE_GIT_")
 
 
 def _clean_env(**extra):
@@ -82,6 +85,14 @@ FAKE_IMPLEMENTER = textwrap.dedent("""\
     case "$FAKE_LANE" in
     commit)
         echo fix >>file.txt; git commit -qam "Fix the thing"
+        cp "$FAKE_REPLIES" "$work/replies.json" ;;
+    commit_with_author)
+        # Shape 2 from the issue: an agent that overrides the author
+        # with --author. The committer still picks up the lane's env
+        # vars, but the author does not -- the verifier must catch
+        # this and re-author.
+        echo fix >>file.txt
+        git commit -q --author="Wrong Author <wrong@example.invalid>" -am "Fix the thing with wrong author"
         cp "$FAKE_REPLIES" "$work/replies.json" ;;
     amend)
         echo fix >>file.txt; git commit -q --amend -am "Rewritten" ;;
@@ -735,6 +746,91 @@ def test_refuses_to_use_a_clone_pointing_at_a_different_repo():
         assert r.returncode == 2, r.stderr
         assert not _ledger_path(ld).exists(), "no round should be recorded"
         assert "not for owner/proj" in r.stderr, r.stderr
+
+
+def test_author_override_is_reauthored_before_push():
+    """A lane commit made with `--author 'X <x@x>'` must be re-authored
+    before push: the gate sees the re-authored tree, the rewrite is
+    logged, and the pushed commit carries the expected identity."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        wt, origin, head, env, ld = setup(tmp, lane="commit_with_author")
+        # The expected identity comes from LANE_GIT_*; without those,
+        # the verifier falls back to the worktree's user.name=t.
+        # Set the override so the test names a specific expected
+        # identity that is neither t nor Wrong Author.
+        env["LANE_GIT_NAME"] = "Expected"
+        env["LANE_GIT_EMAIL"] = "expected@example.invalid"
+        r = run(env, wt)
+        assert r.returncode == 0, (
+            f"agent-fix-pr failed: rc={r.returncode} stderr={r.stderr!r}")
+        # The pushed branch has the re-authored commit: the verifier
+        # rewrote the lane's commit on top of $head before push.
+        pushed = git(origin, "rev-parse", BRANCH)
+        assert git(wt, "merge-base", "--is-ancestor", head, pushed) == "", (
+            f"push was not fast-forward: head={head} pushed={pushed}")
+        # Bare repos do not have HEAD checked out, so name the branch.
+        ident = git(origin, "log", "-1", "--format=%an <%ae> | %cn <%ce>",
+                    BRANCH)
+        assert "Expected <expected@example.invalid>" in ident, (
+            f"pushed commit does not carry the expected identity: {ident!r}")
+        assert "Wrong Author" not in ident, (
+            f"pushed commit still carries the wrong author: {ident!r}")
+        assert "re-authored:" in r.stderr, (
+            f"verifier did not log the rewrite: stderr={r.stderr!r}")
+
+
+def test_refuse_setting_refuses_with_commit_name_and_nothing_pushed():
+    """LANE_GIT_IDENTITY=refuse: a lane commit with the wrong author
+    must be refused before push, with a message naming the offending
+    commit. Nothing is pushed."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        wt, origin, head, env, ld = setup(tmp, lane="commit_with_author")
+        env["LANE_GIT_NAME"] = "Expected"
+        env["LANE_GIT_EMAIL"] = "expected@example.invalid"
+        env["LANE_GIT_IDENTITY"] = "refuse"
+        r = run(env, wt)
+        # The verifier refused; agent-fix-pr records the refusal as the verdict.
+        assert r.returncode != 0, (
+            f"agent-fix-pr accepted a refused lane commit: rc={r.returncode}")
+        assert git(origin, "rev-parse", BRANCH) == head, (
+            f"something was pushed despite a refused lane commit")
+        # The stderr names the offending commit and the wrong identity.
+        assert "refusing:" in r.stderr, (
+            f"refusal message missing: stderr={r.stderr!r}")
+        assert "Wrong Author" in r.stderr, (
+            f"refusal does not name the offending identity: "
+            f"stderr={r.stderr!r}")
+        entry = ledger(ld)[-1]
+        # The ledger line must record the refusal too: a round that
+        # refused because of identity should land in the ledger with
+        # a verdict that names the cause.
+        assert entry["pushed"] is False, entry
+
+
+def test_refuses_a_rewritten_history_in_agent_fix_pr():
+    """A lane that amended HEAD (no descendant-of-base) must be
+    refused by the verifier before the ancestry check below would
+    notice. Without the ancestry check, the verifier used to rebase
+    the rewritten commit onto the original base, which produced a
+    clean fast-forward and hid the rewrite from agent-fix-pr."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        wt, origin, head, env, ld = setup(tmp, lane="amend")
+        # Pin the lane identity in the parent env: the shape the
+        # gate runs under on every lane.
+        env["GIT_AUTHOR_NAME"] = "Pin"
+        env["GIT_AUTHOR_EMAIL"] = "p@x"
+        env["GIT_COMMITTER_NAME"] = "Pin"
+        env["GIT_COMMITTER_EMAIL"] = "p@x"
+        r = run(env, wt)
+        assert r.returncode == 1
+        assert git(origin, "rev-parse", BRANCH) == head
+        # The verdict names the cause: history rewritten, not a
+        # generic identity refusal.
+        assert ledger(ld)[-1]["verdict"] == "history rewritten"
+        assert "history rewritten" in r.stderr, r.stderr
 
 
 if __name__ == "__main__":

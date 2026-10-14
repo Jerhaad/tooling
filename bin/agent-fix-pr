@@ -289,6 +289,19 @@ $CARRIED
 
 fi
 END=$(git -C "$WORKTREE" rev-parse HEAD)
+# Re-author lane commits so the gated tree matches the expected identity.
+# The implementer pins env vars for the common case; this catches an
+# agent that bypassed them (--author, GIT_AUTHOR_* on its own command
+# line). With LANE_GIT_IDENTITY=refuse, the round refuses rather than
+# rewrites, so a reviewer can read the commit and decide. The branch's
+# tip may move here on a successful rewrite, so re-read END before the
+# gate sees it.
+# Capture the exit code: under `set -e` a non-zero return would
+# abort before the verdict is recorded, and `|| IDENTITY_RC=$?`
+# keeps the specific exit code rather than a boolean.
+IDENTITY_RC=0
+verify_lane_identity "$WORKTREE" "$START" "$WORK/HANDOVER.md" || IDENTITY_RC=$?
+END=$(git -C "$WORKTREE" rev-parse HEAD)
 REPLIES="$WORK/replies.json"
 
 # Which models answered. A hosted model at its limits can hand the session to
@@ -302,7 +315,25 @@ elif [[ -n "$MODELS_CMD" ]]; then
 fi
 
 verdict="" pushed=false gate=skipped
-if [[ "$END" == "$START" ]]; then
+# Map the verifier's exit code to a verdict. Code 1 is identity refusal;
+# codes 2-5 are other failures (rewritten history, unresolvable base,
+# tree-changing rebase, rebase could not start). A non-zero verifier
+# return skips the gate and the push; the verdict names the cause.
+case "$IDENTITY_RC" in
+0) ;;
+1) verdict="identity refused" ;;
+2) verdict="history rewritten" ;;
+3) verdict="base unresolved" ;;
+4) verdict="tree changed on rewrite" ;;
+5) verdict="rebase failed" ;;
+*) verdict="verifier refused ($IDENTITY_RC)" ;;
+esac
+if [[ -n "$verdict" ]]; then
+	# A verifier refusal is the round's verdict; nothing else needs
+	# to be checked, and the gate would only see a tree the verifier
+	# already refused on.
+	:
+elif [[ "$END" == "$START" ]]; then
 	# Pushing back on every comment is a finished round: there is nothing to
 	# push, and the replies are its whole answer.
 	if [[ -s "$REPLIES" ]]; then verdict=answered; else verdict="no commit"; fi
