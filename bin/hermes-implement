@@ -139,6 +139,14 @@ EOF
 
 BASE=$(git rev-parse HEAD)
 BASE_SHORT=$(git rev-parse --short HEAD)
+# Pin the lane identity before the agent starts. An honest agent
+# inherits the env vars and commits as the expected identity; the
+# verifier below is the backstop for one that overrides them. Refusing
+# up front makes a missing setting a named error rather than a commit
+# that points at nobody.
+if ! export_lane_identity_env "$WORKTREE"; then
+	exit 3
+fi
 # UTC, matching how hermes stamps last_edit_at, so the stray-write check below
 # sees only this run.
 START_ISO=$(date -u +%Y-%m-%dT%H:%M:%S)
@@ -331,10 +339,17 @@ done
 
 exec 8>&-
 
-# Name the missing piece on a line of its own: stranded uncommitted files,
-# a committed branch with no handover, or a no-commit nothing-tried. The
-# new dirty-tree branch keeps the message from being hidden in the
-# generic FAILED line.
+# Re-author lane commits whose identity does not match the expected
+# one, so a lane that overrode GIT_AUTHOR_* or used --author still
+# pushes with the right identity. The exit code names the refusal
+# (1 identity, 2 rewritten history, 3 base unresolved, 4 tree
+# changed, 5 rebase failed).
+verify_lane_identity "$WORKTREE" "$BASE" "$WORK/HANDOVER.md" || IDENTITY_RC=$?
+IDENTITY_RC=${IDENTITY_RC:-0}
+
+# Name the missing piece on a line of its own: stranded uncommitted
+# files, a committed branch with no handover, a no-commit nothing-tried,
+# or a lane the identity verifier refused.
 DIRTY=$(git -C "$WORKTREE" status --porcelain 2>/dev/null || true)
 HEAD=$(git -C "$WORKTREE" rev-parse HEAD 2>/dev/null || echo "")
 if [[ -n "$DIRTY" ]]; then
@@ -344,6 +359,17 @@ elif [[ "$HEAD" == "$BASE" ]]; then
 	echo "FAILED: $ATTEMPTS attempts left $BRANCH at $BASE_SHORT" >&2
 elif [[ ! -s "$WORK/HANDOVER.md" ]]; then
 	echo "WARNING: $BRANCH has a commit but no handover was written" >&2
+elif [[ "$IDENTITY_RC" -ne 0 ]]; then
+	# The verifier refused. Map its code to a one-line verdict next
+	# to the other named outcomes; the same code list is in agent-fix-pr.
+	case "$IDENTITY_RC" in
+	1) echo "IDENTITY: refused (wrong author / committer on a lane commit)" >&2 ;;
+	2) echo "IDENTITY: refused (lane rewrote the base out of ancestry)" >&2 ;;
+	3) echo "IDENTITY: refused (base does not resolve in the worktree)" >&2 ;;
+	4) echo "IDENTITY: refused (rebase changed the tree; old head restored)" >&2 ;;
+	5) echo "IDENTITY: refused (rebase could not start)" >&2 ;;
+	*) echo "IDENTITY: refused (verifier rc=$IDENTITY_RC)" >&2 ;;
+	esac
 fi
 
 # What the run actually wrote, which the handover is not a complete account of:
