@@ -41,7 +41,9 @@ HANDOVER.md, as the last line. --profile passes through unread.
 and is created there when missing. An existing tree must sit at the PR's head
 with nothing uncommitted: anything else is someone's work. The one exception is
 the commit the last round left unpushed, which the next round builds on and
-pushes along with its own.
+pushes along with its own. When the worktree is missing it is created from the
+clone named by PIPELINE_REPO_<OWNER>_<NAME> (using env_name on the repo slug),
+or else PIPELINE_REPO, and that clone's origin must be the PR's repo.
 
 --max-rounds (default 5) counts every round this ledger has recorded for the
 PR, pushed or not, and refuses the next one.
@@ -160,9 +162,36 @@ ISSUE=$(jq -r .body <<<"$pr_json" | grep -oiE '(closes|fixes|resolves|part of) #
 [[ -n "$ISSUE" ]] || { echo "PR #$PR names no issue (Closes #N or Part of #N)" >&2; exit 2; }
 
 : "${WORKTREE:=${PIPELINE_WT_ROOT:-$HOME/wt}/$HEAD_BRANCH}"
+# Choose a clone of the PR's repo that can fetch the head branch. A
+# repo-scoped override (PIPELINE_REPO_<OWNER>_<NAME>) wins; PIPELINE_REPO is
+# the fallback. A clone that cannot fetch the head refuses before any
+# ledger line is written.
+repo_clone() {
+	local var="PIPELINE_REPO_$(env_name "$REPO")"
+	local dir="${!var:-${PIPELINE_REPO:-}}"
+	if [[ -z "$dir" || ! -d "$dir" ]]; then
+		echo "no checkout for $REPO: set ${var}, or PIPELINE_REPO, or pass --worktree" >&2
+		return 1
+	fi
+	# Match the clone's origin URL against the PR's repo slug.
+	local url
+	url=$(git -C "$dir" remote get-url origin 2>/dev/null \
+		| sed -E 's#^[a-z]+://[^/]+/|:#/#; s#^file://##; s#\.git$##') \
+		|| { echo "checkout $dir has no origin remote" >&2; return 1; }
+	if [[ "$url" != *"/$REPO" ]]; then
+		echo "checkout $dir remote is $url, not for $REPO" >&2
+		return 1
+	fi
+	if ! git -C "$dir" fetch --quiet origin "$HEAD_BRANCH"; then
+		echo "checkout $dir could not fetch origin/$HEAD_BRANCH for $REPO" >&2
+		return 1
+	fi
+	printf '%s' "$dir"
+}
 if [[ ! -d "$WORKTREE" ]]; then
-	REPO_DIR=${PIPELINE_REPO:?set PIPELINE_REPO, or pass --worktree for an existing tree}
-	git -C "$REPO_DIR" fetch --quiet origin "$HEAD_BRANCH"
+	# Any clone the script can't use here — missing, wrong origin, or
+	# unable to fetch the head — is a settings problem (misuse, exit 2).
+	REPO_DIR=$(repo_clone) || exit 2
 	git -C "$REPO_DIR" worktree add --quiet "$WORKTREE" "$HEAD_BRANCH"
 fi
 git -C "$WORKTREE" fetch --quiet origin "$HEAD_BRANCH"
@@ -195,12 +224,28 @@ fi
 
 if [[ $RESUME -eq 1 ]]; then
 	WORK=$(jq -r .work <<<"$LAST")
+	# Older ledger lines have no comment_ids. The old reply loop accepted any
+	# numeric id or "review"; reproduce that so --resume still posts
+	# line-comment replies. "*" means "any numeric id" — the validator
+	# below recognises it; the lane never sees it.
+	if jq -e 'has("comment_ids") and (.comment_ids | length > 0)' <<<"$LAST" >/dev/null 2>&1; then
+		KNOWN_IDS=$(jq -c '.comment_ids' <<<"$LAST")
+	else
+		KNOWN_IDS='["review","*"]'
+	fi
 else
-	# The review as the lane will read it: the summary, then each inline comment at
-	# the line it was left on.
+	# The review as the lane will read it: the body under a `### review`
+	# heading the lane can answer, then each top-level comment at its line.
+	# The body items are the lane's to count; the driver only names them.
 	review=$(gh api "repos/$REPO/pulls/$PR/reviews/$REVIEW" --jq '"Review by \(.user.login) at \(.commit_id[:7]):\n\n\(.body)"')
-	comments=$(gh api "repos/$REPO/pulls/$PR/reviews/$REVIEW/comments" --paginate \
-		--jq '.[] | select(.in_reply_to_id == null) | "### comment \(.id) at \(.path):\(.line // .original_line)\n\n\(.body)\n"')
+	comments_json=$(gh api "repos/$REPO/pulls/$PR/reviews/$REVIEW/comments" --paginate \
+		--jq '[.[] | select(.in_reply_to_id == null)]')
+	comments=$(jq -r '.[] | "### comment \(.id) at \(.path):\(.line // .original_line)\n\n\(.body)\n"' <<<"$comments_json")
+	# The ids the lane may answer: "review" for body items, every top-level
+	# comment id for line items. Stored in the ledger so the resume path can
+	# use the same set without re-fetching the review.
+	KNOWN_IDS=$(jq -nc --argjson ids "$(jq -c 'map(.id)' <<<"$comments_json" 2>/dev/null || echo '[]')" \
+		'(["review"] + ($ids | map(tostring)))')
 
 	CARRIED_NOTE=""
 	if [[ -n "$CARRIED" ]]; then
@@ -212,10 +257,15 @@ $CARRIED
 	BRIEF=$(cat <<-EOF
 	This is review round $ROUND on pull request #$PR, branch $HEAD_BRANCH. The
 	work item is the review below, not the issue: the issue is already implemented
-	on this branch. Follow the swe-review-fix skill, and answer each comment in
+	on this branch. Follow the swe-review-fix skill, and answer each item in
 	replies.json in your run directory, beside HANDOVER.md, as it describes.
+	Items under \`### review\` are parts of the review body; answer them under
+	\`"comment_id": "review"\`. Items under \`### comment N\` are line comments;
+	answer them under their number.
 
 	$CARRIED_NOTE
+	### review
+
 	$review
 
 	$comments
@@ -284,22 +334,58 @@ names_missing_commit() { # body
 	done
 	return 1
 }
+# Body items reply under "review"; every reply becomes one quote in a single
+# PR comment. The lane's one-reply-per-item format stays intact — joining is
+# the driver's, so a reader sees one update, not five small comments.
+reply_threaded() { # id body
+	local id=$1 reply_body=$2
+	gh api -X POST "repos/$REPO/pulls/$PR/comments/$id/replies" -f body="$reply_body" >/dev/null &&
+		replied=$((replied + 1)) || echo "could not reply to comment $id" >&2
+}
 replied=0
+known_ids=${KNOWN_IDS:-["review"]}
+body_bodies=()
 if [[ ("$pushed" == true || "$verdict" == answered) && -s "$REPLIES" ]]; then
 	while IFS= read -r entry; do
 		id=$(jq -r '.comment_id // empty | tostring' <<<"$entry" 2>/dev/null || true)
 		body=$(jq -r '.body // empty | strings' <<<"$entry" 2>/dev/null || true)
-		if [[ ! "$id" =~ ^[0-9]+$ || -z "$body" ]]; then
+		if [[ -z "$id" || -z "$body" ]]; then
 			echo "skipped malformed reply: $entry" >&2
+			continue
+		fi
+		# comment_id must be one of the ids the driver gave the lane, or
+		# the validator refuses before posting. A "*" in the set is the
+		# permissive fallback for --resume on older ledger lines, where
+		# any numeric id counts.
+		if ! jq -e --arg id "$id" --arg any "*" \
+			'if index($id) != null then true
+			 elif index($any) != null and ($id | test("^[0-9]+$")) then true
+			 else false end' <<<"$known_ids" >/dev/null 2>&1; then
+			echo "refused reply to unknown comment id $id" >&2
 			continue
 		fi
 		if names_missing_commit "$body"; then
 			echo "skipped reply to $id naming a commit the branch does not have: $body" >&2
 			continue
 		fi
-		gh api -X POST "repos/$REPO/pulls/$PR/comments/$id/replies" -f body="$body" >/dev/null &&
-			replied=$((replied + 1)) || echo "could not reply to comment $id" >&2
+		if [[ "$id" == "review" ]]; then
+			body_bodies+=("$body")
+		else
+			reply_threaded "$id" "$body"
+		fi
 	done < <(jq -c '.[]?' "$REPLIES" 2>/dev/null || echo '"unreadable replies file"')
+fi
+# All body replies go out in one comment, in the order the lane wrote them.
+# A failed post is a failed update of every item in it; count each as
+# unanswered so the ledger reports what the round actually achieved.
+if [[ ${#body_bodies[@]} -gt 0 ]]; then
+	body_comment=$(printf '%s\n\n' "${body_bodies[@]}")
+	body_comment=${body_comment%$'\n\n'}
+	if gh api -X POST "repos/$REPO/issues/$PR/comments" -f body="$body_comment" >/dev/null; then
+		replied=$((replied + ${#body_bodies[@]}))
+	else
+		echo "could not reply to ${#body_bodies[@]} review-body item(s)" >&2
+	fi
 fi
 
 handover=""
@@ -311,12 +397,14 @@ ${handover:-No handover was written.}
 EOF
 )" >/dev/null || echo "could not comment on PR #$PR" >&2
 
+# Coalesced for a single append.
 jq -cn --argjson round "$ROUND" --arg review "$REVIEW" --arg start "$START" --arg end "$END" \
 	--arg verdict "$verdict" --arg gate "$gate" --argjson pushed "$pushed" --arg pr_head "$PR_HEAD" \
 	--argjson models "$models" --argjson replied "$replied" --arg work "$WORK" \
 	--argjson resumed "$RESUMED" --arg at "$(date -u +%FT%TZ)" \
+	--argjson comment_ids "$known_ids" \
 	'{round:$round, review:$review, pr_head:$pr_head, start:$start, end:$end, verdict:$verdict,
 	  gate:$gate, pushed:$pushed, replied:$replied, models:$models, work:$work,
-	  resumed:$resumed, at:$at}' >>"$LEDGER"
+	  resumed:$resumed, comment_ids:$comment_ids, at:$at}' >>"$LEDGER"
 tail -1 "$LEDGER"
 [[ "$pushed" == true || "$verdict" == answered ]]

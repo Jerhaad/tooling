@@ -27,7 +27,10 @@ TOOLS_LIB=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # fatal, which is the right outcome for a gate that would otherwise guess.
 manifest() { python3 "$TOOLS_LIB/manifest.py" "$@"; }
 
-env_name() { printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_'; }
+# Turn any string into a portable env-var suffix: upper case, with every
+# non-alphanumeric collapsed to a single underscore. A repo like "owner/name"
+# becomes OWNER_NAME, matching what an env var holding a path expects.
+env_name() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]' | tr -c '[:alnum:]' '_' | tr -s '_'; }
 
 # Roles are named for what a host can do, so a project asks for `cluster` and
 # never for anyone's hostname.
